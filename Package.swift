@@ -12,12 +12,11 @@ let package = Package(
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
     ],
     dependencies: [
-        // workers-swift PR #12 provides the native WebSocket transport. Pinned to
-        // PR #13's commit, which lets the native client receive replies over 16 KiB;
-        // move back to a merge commit on main once #13 lands.
+        // workers-swift's native WebSocket transport (PR #12) with the client
+        // frame-size fix (PR #13), pinned at its merge commit on main.
         .package(
             url: "https://github.com/sevki/workers-swift.git",
-            revision: "0094ea55669aafa2cad7ed252ae5582aafaf9997"
+            revision: "aaad96f185eaf30e74f8e817d683c10511de7a7b"
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
     ],

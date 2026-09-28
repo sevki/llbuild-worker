@@ -1,6 +1,6 @@
 # workers-swift transport spike
 
-This repository consumes the `WorkersDistributed` product from workers-swift: the native transport merged in PR #12 plus [PR #13](https://github.com/sevki/workers-swift/pull/13)'s client frame-size fix, pinned at revision `0094ea55669aafa2cad7ed252ae5582aafaf9997`.
+This repository consumes the `WorkersDistributed` product from workers-swift: the native transport merged in PR #12 plus [PR #13](https://github.com/sevki/workers-swift/pull/13)'s client frame-size fix, pinned at its merge commit `aaad96f185eaf30e74f8e817d683c10511de7a7b`.
 
 ## What this branch proves
 
@@ -15,7 +15,7 @@ This repository consumes the `WorkersDistributed` product from workers-swift: th
 
 ## Transport limits found while building this
 
-- The native client's WebSocket frame limit defaulted to 16 KiB, so any reply over about 12 KB of payload closed the connection with 1009 even though the message limit was 1 MiB. Fixed in [workers-swift#13](https://github.com/sevki/workers-swift/pull/13); this repository pins that commit until it lands.
+- The native client's WebSocket frame limit defaulted to 16 KiB, so any reply over about 12 KB of payload closed the connection with 1009 even though the message limit was 1 MiB. Fixed in [workers-swift#13](https://github.com/sevki/workers-swift/pull/13), which this repository now pins.
 - With that fixed, the practical ceiling is the 1 MiB message limit. Base64 inflates payloads by a third, so `CASLimits.maxObjectBytes` is 512 KiB.
 - `WorkersActorSystem` hosts one actor per system, so the service is one actor (objects and action cache together) and the sharding actors sit behind it.
 
