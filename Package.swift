@@ -10,10 +10,10 @@ let package = Package(
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
     ],
     dependencies: [
-        // PR #12 adds the native WebSocket transport and RPCGateway used by casctl.
+        // Merged workers-swift PR #12 provides the native WebSocket transport and RPCGateway.
         .package(
             url: "https://github.com/sevki/workers-swift.git",
-            revision: "69f99e254b096d140be335dd764d9be2743d56d4"
+            revision: "2db5bab408d8a2aeae720cd123a92b32e2d73c43"
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
     ],
