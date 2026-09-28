@@ -1,0 +1,4 @@
+module CLLCAS {
+    header "PluginAPI_types.h"
+    export *
+}

@@ -24,6 +24,9 @@ jobs:
       - name: Build casctl
         run: swift build --product casctl
 
+      - name: Compilation caching through CASPlugin
+        run: Scripts/test-compilation-cache.sh
+
   worker:
     name: Build Cloudflare Worker WebAssembly bundle
     runs-on: ubuntu-24.04

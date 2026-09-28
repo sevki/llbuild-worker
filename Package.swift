@@ -7,6 +7,8 @@ let package = Package(
     products: [
         .library(name: "CASProtocol", targets: ["CASProtocol"]),
         .executable(name: "casctl", targets: ["casctl"]),
+        // Loaded by swift-frontend via -cas-plugin-path for compilation caching.
+        .library(name: "CASPlugin", type: .dynamic, targets: ["CASPlugin"]),
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
     ],
     dependencies: [
@@ -31,6 +33,11 @@ let package = Package(
                 .product(name: "WorkersDistributed", package: "workers-swift")
             ]
         ),
+        .target(name: "CLLCAS"),
+        .target(
+            name: "CASPlugin",
+            dependencies: ["CASProtocol", "CLLCAS"]
+        ),
         .target(
             name: "CASWorker",
             dependencies: [
@@ -47,5 +54,6 @@ let package = Package(
             ]
         ),
         .testTarget(name: "CASProtocolTests", dependencies: ["CASProtocol"]),
+        .testTarget(name: "CASPluginTests", dependencies: ["CASPlugin", "CASProtocol"]),
     ]
 )
