@@ -1,4 +1,5 @@
 import Distributed
+import Foundation
 
 /// CAS identity in llbuild2's Codable string form.
 ///
