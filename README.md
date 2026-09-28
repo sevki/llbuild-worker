@@ -33,7 +33,9 @@ swiftc -c main.swift -explicit-module-build -cache-compile-job \
 - Without `remote-url` the plugin is a plain local CAS.
 - Object identity is this service's own SHA-256 scheme (`CASIdentity`), and the Worker recomputes it on every store. It is not llbuild2's identity; see [docs/design.md](docs/design.md).
 
-**Limit:** objects over 512 KiB stay in the local cache only. The JSON/WebSocket control plane is not a bulk data channel; the design describes the streaming path that will lift this.
+**Large objects.** Module artifacts are megabytes, so objects over 512 KiB are sent as 256 KiB chunk objects plus a manifest object, all ordinary CAS objects, and then registered; the Worker reassembles the object and recomputes its identity before accepting it. Objects up to 64 MiB are shared; anything larger stays in the local cache. Chunk bodies live in Durable Object SQLite for now, with R2 the intended home for them (workers-swift does not wrap R2 yet).
+
+**Build the plugin in release for real use.** The debug build hashes tens of megabytes of module data unoptimized: a compile that takes about 0.3 s with `swift build -c release --product CASPlugin` takes about 10 s with the debug build.
 
 ## `casctl`
 

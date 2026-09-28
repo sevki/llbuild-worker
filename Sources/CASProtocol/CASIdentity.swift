@@ -146,33 +146,36 @@ public struct SHA256: Sendable {
     }
 
     private mutating func compress(_ block: [UInt8], at start: Int) {
-        var w = [UInt32](repeating: 0, count: 64)
-        for i in 0..<16 {
-            let j = start + i * 4
-            w[i] = UInt32(block[j]) << 24 | UInt32(block[j + 1]) << 16
-                | UInt32(block[j + 2]) << 8 | UInt32(block[j + 3])
+        // A scratch schedule on the stack: this runs once per 64 bytes, over
+        // megabytes of data inside the Worker, so it must not allocate.
+        withUnsafeTemporaryAllocation(of: UInt32.self, capacity: 64) { w in
+            for i in 0..<16 {
+                let j = start + i * 4
+                w[i] = UInt32(block[j]) << 24 | UInt32(block[j + 1]) << 16
+                    | UInt32(block[j + 2]) << 8 | UInt32(block[j + 3])
+            }
+            for i in 16..<64 {
+                let s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3)
+                let s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10)
+                w[i] = w[i - 16] &+ s0 &+ w[i - 7] &+ s1
+            }
+            var a = state[0], b = state[1], c = state[2], d = state[3]
+            var e = state[4], f = state[5], g = state[6], h = state[7]
+            for i in 0..<64 {
+                let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
+                let ch = (e & f) ^ (~e & g)
+                let t1 = h &+ s1 &+ ch &+ Self.k[i] &+ w[i]
+                let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
+                let maj = (a & b) ^ (a & c) ^ (b & c)
+                let t2 = s0 &+ maj
+                h = g; g = f; f = e; e = d &+ t1
+                d = c; c = b; b = a; a = t1 &+ t2
+            }
+            state[0] = state[0] &+ a; state[1] = state[1] &+ b
+            state[2] = state[2] &+ c; state[3] = state[3] &+ d
+            state[4] = state[4] &+ e; state[5] = state[5] &+ f
+            state[6] = state[6] &+ g; state[7] = state[7] &+ h
         }
-        for i in 16..<64 {
-            let s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3)
-            let s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10)
-            w[i] = w[i - 16] &+ s0 &+ w[i - 7] &+ s1
-        }
-        var a = state[0], b = state[1], c = state[2], d = state[3]
-        var e = state[4], f = state[5], g = state[6], h = state[7]
-        for i in 0..<64 {
-            let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
-            let ch = (e & f) ^ (~e & g)
-            let t1 = h &+ s1 &+ ch &+ Self.k[i] &+ w[i]
-            let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
-            let maj = (a & b) ^ (a & c) ^ (b & c)
-            let t2 = s0 &+ maj
-            h = g; g = f; f = e; e = d &+ t1
-            d = c; c = b; b = a; a = t1 &+ t2
-        }
-        state[0] = state[0] &+ a; state[1] = state[1] &+ b
-        state[2] = state[2] &+ c; state[3] = state[3] &+ d
-        state[4] = state[4] &+ e; state[5] = state[5] &+ f
-        state[6] = state[6] &+ g; state[7] = state[7] &+ h
     }
 
     private func rotr(_ x: UInt32, _ n: UInt32) -> UInt32 {
@@ -192,5 +195,35 @@ public struct CASBlob: Sendable, Equatable {
 
     public var digest: CASDigest {
         CASIdentity.identify(refs: refs, data: data)
+    }
+}
+
+/// Large objects are stored as chunk objects plus a manifest object, all
+/// ordinary CAS objects: each chunk has no references and at most
+/// `CASLimits.chunkBytes` of data; the manifest's references are the chunks,
+/// in order, and its data records the total size. The service keeps one extra
+/// entry mapping the logical object's digest to its manifest.
+public enum CASChunking {
+    static let manifestTag = Array("llbuild-worker.chunked.v1\u{0}".utf8)
+
+    public static func chunks(of data: [UInt8]) -> [[UInt8]] {
+        stride(from: 0, to: data.count, by: CASLimits.chunkBytes).map {
+            Array(data[$0..<min($0 + CASLimits.chunkBytes, data.count)])
+        }
+    }
+
+    public static func manifestData(size: Int) -> [UInt8] {
+        manifestTag + (0..<8).map { UInt8(truncatingIfNeeded: UInt64(size) >> (8 * UInt64($0))) }
+    }
+
+    /// The total size a manifest records, or nil if `data` is not a manifest.
+    public static func size(ofManifestData data: [UInt8]) -> Int? {
+        guard data.count == manifestTag.count + 8, Array(data[0..<manifestTag.count]) == manifestTag else {
+            return nil
+        }
+        let value = (0..<8).reduce(UInt64(0)) {
+            $0 | UInt64(data[manifestTag.count + $1]) << (8 * UInt64($1))
+        }
+        return Int(exactly: value)
     }
 }

@@ -54,6 +54,7 @@ public struct CASObjectPayload: Codable, Sendable, Equatable {
 
 public enum CASServiceError: Error, Codable, Equatable, CustomStringConvertible {
     case objectTooLarge(size: Int, limit: Int)
+    case invalidManifest(String)
     case invalidDigest(String)
     case invalidData
     case storageNotConfigured
@@ -62,6 +63,8 @@ public enum CASServiceError: Error, Codable, Equatable, CustomStringConvertible 
         switch self {
         case .objectTooLarge(let size, let limit):
             return "object of \(size) bytes exceeds the \(limit) byte control-plane limit"
+        case .invalidManifest(let reason):
+            return "invalid chunk manifest: \(reason)"
         case .invalidDigest(let value):
             return "invalid digest: \(value)"
         case .invalidData:
@@ -73,23 +76,49 @@ public enum CASServiceError: Error, Codable, Equatable, CustomStringConvertible 
 }
 
 public enum CASLimits {
-    /// Largest object accepted over the JSON/WebSocket control plane. The
-    /// native client caps inbound WebSocket messages at 1 MiB and base64
-    /// inflates by a third, so this leaves room for the envelope. Larger
-    /// objects need the streaming data path described in docs/design.md.
+    /// Largest single object accepted over the JSON/WebSocket control plane.
+    /// The native client caps inbound WebSocket messages at 1 MiB and base64
+    /// inflates by a third, so this leaves room for the envelope.
     public static let maxObjectBytes = 512 * 1024
+
+    /// Size of each chunk of a large object.
+    public static let chunkBytes = 256 * 1024
+
+    /// Largest logical object. The Worker reassembles a large object in
+    /// memory to verify its identity, so this is bounded by its isolate.
+    public static let maxLargeObjectBytes = 64 * 1024 * 1024
+}
+
+/// A large object's entry: its references, the manifest object that lists its
+/// chunks, and its total size.
+public struct CASLargeObject: Codable, Sendable, Equatable {
+    public var refs: [String]
+    public var manifest: String
+    public var size: Int
+
+    public init(refs: [String], manifest: String, size: Int) {
+        self.refs = refs
+        self.manifest = manifest
+        self.size = size
+    }
 }
 
 /// Storage behind a `CASService`. The Worker implements it with shard actors;
 /// it is a protocol so the service actor stays a stateless façade.
 public protocol CASBackend: Sendable {
     func contains(digest: String) async throws -> Bool
-    /// Stores the object under the identity the backend computes itself and
-    /// returns that digest; a client never gets to name its own key.
-    func put(refs: [String], data: [UInt8]) async throws -> String
+    /// Stores an object under `digest`, which the shard that holds it
+    /// recomputes and rejects on a mismatch, so a client can name a key but
+    /// never put content under the wrong one. `data` is base64, passed
+    /// through untouched so the front-end does no per-byte work.
+    func put(digest: String, refs: [String], data: String) async throws
     func get(digest: String) async throws -> CASObjectPayload?
     func actionGet(key: String) async throws -> String?
     func actionPut(key: String, value: String) async throws
+    /// Records a large object after verifying that its manifest's chunks
+    /// reassemble to content with exactly this identity.
+    func putLarge(digest: String, refs: [String], manifest: String) async throws
+    func getLarge(digest: String) async throws -> CASLargeObject?
 }
 
 /// The llbuild-worker CAS: the distributed actor a Worker hosts and a native
@@ -110,7 +139,7 @@ public distributed actor CASService {
     public distributed func status() -> CASServiceStatus {
         CASServiceStatus(
             service: "llbuild-worker",
-            protocolVersion: "0.2.0",
+            protocolVersion: "0.3.0",
             storageConfigured: backend != nil
         )
     }
@@ -119,15 +148,27 @@ public distributed actor CASService {
         try await requireBackend().contains(digest: try Self.validated(digest))
     }
 
-    /// Stores an object and returns its digest, computed by the service with
-    /// `CASIdentity`. Rejects objects over `CASLimits.maxObjectBytes`.
-    public distributed func put(refs: [String], data: String) async throws -> String {
-        guard let bytes = Data(base64Encoded: data) else { throw CASServiceError.invalidData }
-        guard bytes.count <= CASLimits.maxObjectBytes else {
-            throw CASServiceError.objectTooLarge(size: bytes.count, limit: CASLimits.maxObjectBytes)
+    /// Stores an object under `digest`. Rejects objects over
+    /// `CASLimits.maxObjectBytes`; the shard holding it verifies the digest.
+    public distributed func put(digest: String, refs: [String], data: String) async throws {
+        let size = Self.decodedSize(ofBase64: data)
+        guard size <= CASLimits.maxObjectBytes else {
+            throw CASServiceError.objectTooLarge(size: size, limit: CASLimits.maxObjectBytes)
         }
-        return try await requireBackend().put(
-            refs: try refs.map(Self.validated), data: [UInt8](bytes))
+        try await requireBackend().put(
+            digest: try Self.validated(digest), refs: try refs.map(Self.validated), data: data)
+    }
+
+    /// Registers `digest` as the object whose chunks `manifest` lists. The
+    /// service reassembles it and refuses unless it has that identity.
+    public distributed func putLarge(digest: String, refs: [String], manifest: String) async throws {
+        try await requireBackend().putLarge(
+            digest: try Self.validated(digest), refs: try refs.map(Self.validated),
+            manifest: try Self.validated(manifest))
+    }
+
+    public distributed func getLarge(digest: String) async throws -> CASLargeObject? {
+        try await requireBackend().getLarge(digest: try Self.validated(digest))
     }
 
     public distributed func get(digest: String) async throws -> CASObjectPayload? {
@@ -146,6 +187,14 @@ public distributed actor CASService {
     private func requireBackend() throws -> any CASBackend {
         guard let backend else { throw CASServiceError.storageNotConfigured }
         return backend
+    }
+
+    /// Bytes a base64 string decodes to, from its length alone: the front-end
+    /// must bound the size without decoding the data.
+    private static func decodedSize(ofBase64 text: String) -> Int {
+        let utf8 = text.utf8
+        let padding = utf8.reversed().prefix(2).filter { $0 == UInt8(ascii: "=") }.count
+        return max(0, utf8.count / 4 * 3 - padding)
     }
 
     private static func validated(_ digest: String) throws -> String {

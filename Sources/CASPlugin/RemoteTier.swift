@@ -108,8 +108,8 @@ final class RemoteTier: @unchecked Sendable {
         for ref in blob.refs where !ensureUploaded(ref, from: store) {
             return false
         }
-        guard blob.data.count <= CASLimits.maxObjectBytes else {
-            log("not uploading \(digest.hex): \(blob.data.count) bytes is over the \(CASLimits.maxObjectBytes) byte limit")
+        guard blob.data.count <= CASLimits.maxLargeObjectBytes else {
+            log("not uploading \(digest.hex): \(blob.data.count) bytes is over the \(CASLimits.maxLargeObjectBytes) byte limit")
             return false
         }
         if contains(digest) != true {

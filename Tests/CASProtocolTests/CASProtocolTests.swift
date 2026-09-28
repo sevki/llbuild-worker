@@ -77,3 +77,22 @@ final class CASIdentityTests: XCTestCase {
         XCTAssertNil(CASDigest(hex: "abc"))
     }
 }
+
+final class CASChunkingTests: XCTestCase {
+    func testChunksCoverTheDataInOrder() {
+        let data = (0..<(CASLimits.chunkBytes * 2 + 17)).map { UInt8(truncatingIfNeeded: $0) }
+        let chunks = CASChunking.chunks(of: data)
+        XCTAssertEqual(chunks.map(\.count), [CASLimits.chunkBytes, CASLimits.chunkBytes, 17])
+        XCTAssertEqual(Array(chunks.joined()), data)
+        XCTAssertEqual(CASChunking.chunks(of: []).count, 0)
+    }
+
+    func testManifestRoundTripAndRejection() {
+        XCTAssertEqual(CASChunking.size(ofManifestData: CASChunking.manifestData(size: 123_456_789)), 123_456_789)
+        XCTAssertNil(CASChunking.size(ofManifestData: []))
+        XCTAssertNil(CASChunking.size(ofManifestData: Array("not a manifest at all".utf8)))
+        var truncated = CASChunking.manifestData(size: 5)
+        truncated.removeLast()
+        XCTAssertNil(CASChunking.size(ofManifestData: truncated))
+    }
+}

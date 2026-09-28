@@ -46,7 +46,7 @@ echo "Worker at $url"
 "$casctl" "$url" status | grep -q '"storageConfigured" : true' || fail "storage not configured"
 echo "ok: CASService reports storage configured"
 
-for size in 1000 200000 524288; do
+for size in 1000 200000 524288 524289 3000000; do
     head -c "$size" /dev/urandom > "$work/blob-$size"
     digest="$("$casctl" "$url" put "$work/blob-$size")"
     "$casctl" "$url" has "$digest" || fail "has $size-byte object"
@@ -54,13 +54,16 @@ for size in 1000 200000 524288; do
     cmp "$work/blob-$size" "$work/out-$size" || fail "$size-byte round trip differs"
     echo "ok: $size-byte object round-trips through the shard actors"
 done
+echo "ok: objects over 512 KiB go up as chunks and come back verified"
 
-head -c 524289 /dev/urandom > "$work/too-big"
+# The largest logical object is 64 MiB; the client refuses more before uploading.
+head -c 67108865 /dev/urandom > "$work/too-big"
 if "$casctl" "$url" put "$work/too-big" 2> "$work/too-big.err"; then
     fail "object over the limit was accepted"
 fi
 grep -q "exceeds" "$work/too-big.err" || fail "over-limit error not reported: $(cat "$work/too-big.err")"
-echo "ok: object over the limit is rejected"
+rm "$work/too-big"
+echo "ok: object over the maximum size is rejected"
 
 if "$casctl" "$url" has "$(printf '%064d' 0)"; then fail "missing object reported present"; fi
 echo "ok: missing object is not found"
@@ -80,11 +83,14 @@ compile() { # <cas dir> <output>
 first="$(compile "$work/casA" a.o)"
 grep -q "cache miss" <<<"$first" || fail "developer A should miss: $first"
 grep -q "shared action" <<<"$first" || fail "developer A should publish: $first"
+# Module artifacts are megabytes; none of the results may be kept local.
+if grep -q "kept action" <<<"$first"; then fail "developer A kept a result local: $first"; fi
 echo "ok: developer A misses and publishes to the Worker"
 
 second="$(compile "$work/casB" b.o)"
 grep -q "cache hit" <<<"$second" || fail "developer B should hit from the Worker: $second"
 grep -q "fetched" <<<"$second" || fail "developer B should fetch from the Worker: $second"
+if grep -q "cache miss" <<<"$second"; then fail "developer B rebuilt something: $second"; fi
 cmp a.o b.o || fail "replayed object differs"
 echo "ok: developer B, with an empty local cache, hits from the Worker"
 

@@ -28,6 +28,9 @@ distributed actor CASShard {
                 "CREATE TABLE IF NOT EXISTS objects (digest TEXT PRIMARY KEY, refs TEXT NOT NULL, data TEXT NOT NULL)")
             try storage.exec(
                 "CREATE TABLE IF NOT EXISTS actions (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            // A large object's entry: the manifest object listing its chunks.
+            try storage.exec(
+                "CREATE TABLE IF NOT EXISTS large (digest TEXT PRIMARY KEY, refs TEXT NOT NULL, manifest TEXT NOT NULL, size INTEGER NOT NULL)")
             schemaReady = true
         }
         return storage
@@ -58,7 +61,28 @@ distributed actor CASShard {
     }
 
     distributed func containsObject(digest: String) throws -> Bool {
-        try !database().exec("SELECT 1 AS present FROM objects WHERE digest = ?", digest).rows().isEmpty
+        let db = try database()
+        if try !db.exec("SELECT 1 AS present FROM objects WHERE digest = ?", digest).rows().isEmpty {
+            return true
+        }
+        return try !db.exec("SELECT 1 AS present FROM large WHERE digest = ?", digest).rows().isEmpty
+    }
+
+    /// Records a large object whose content the caller has already verified.
+    distributed func putLarge(digest: String, refs: [String], manifest: String, size: Int) throws {
+        try database().exec(
+            "INSERT INTO large (digest, refs, manifest, size) VALUES (?, ?, ?, ?) ON CONFLICT(digest) DO NOTHING",
+            digest, refs.joined(separator: ","), manifest, size)
+    }
+
+    distributed func getLarge(digest: String) throws -> CASLargeObject? {
+        let rows = try database().exec("SELECT refs, manifest, size FROM large WHERE digest = ?", digest).rows()
+        guard let row = rows.first, let refs = row["refs", as: String.self],
+              let manifest = row["manifest", as: String.self],
+              let size = row["size", as: Int.self] else { return nil }
+        return CASLargeObject(
+            refs: refs.isEmpty ? [] : refs.split(separator: ",").map(String.init),
+            manifest: manifest, size: size)
     }
 
     /// An action key always maps to one value; writing a different one is a
@@ -111,12 +135,8 @@ struct ShardBackend: CASBackend {
         try await shard(for: digest).containsObject(digest: digest)
     }
 
-    func put(refs: [String], data: [UInt8]) async throws -> String {
-        let refDigests = refs.compactMap { CASDigest(hex: $0) }
-        let digest = CASIdentity.identify(refs: refDigests, data: data).hex
-        try await shard(for: digest).putObject(
-            digest: digest, refs: refs, data: Data(data).base64EncodedString())
-        return digest
+    func put(digest: String, refs: [String], data: String) async throws {
+        try await shard(for: digest).putObject(digest: digest, refs: refs, data: data)
     }
 
     func get(digest: String) async throws -> CASObjectPayload? {
@@ -129,6 +149,45 @@ struct ShardBackend: CASBackend {
 
     func actionPut(key: String, value: String) async throws {
         try await shard(for: key).putAction(key: key, value: value)
+    }
+
+    /// Reassembles the object from its manifest's chunks and refuses unless
+    /// it has exactly the claimed identity, so a client can never register
+    /// content under a digest it does not have.
+    func putLarge(digest: String, refs: [String], manifest: String) async throws {
+        guard let manifestObject = try await shard(for: manifest).getObject(digest: manifest),
+              let manifestBytes = Data(base64Encoded: manifestObject.data),
+              let size = CASChunking.size(ofManifestData: [UInt8](manifestBytes)) else {
+            throw CASServiceError.invalidManifest("manifest \(manifest) is missing or malformed")
+        }
+        guard size > CASLimits.maxObjectBytes, size <= CASLimits.maxLargeObjectBytes else {
+            throw CASServiceError.objectTooLarge(size: size, limit: CASLimits.maxLargeObjectBytes)
+        }
+        var assembled = [UInt8]()
+        assembled.reserveCapacity(size)
+        for chunk in manifestObject.refs {
+            guard let object = try await shard(for: chunk).getObject(digest: chunk),
+                  object.refs.isEmpty, let bytes = Data(base64Encoded: object.data),
+                  bytes.count <= CASLimits.chunkBytes else {
+                throw CASServiceError.invalidManifest("chunk \(chunk) is missing or malformed")
+            }
+            assembled.append(contentsOf: bytes)
+        }
+        guard assembled.count == size else {
+            throw CASServiceError.invalidManifest("chunks total \(assembled.count) bytes, manifest says \(size)")
+        }
+        let refDigests = try refs.map { ref -> CASDigest in
+            guard let parsed = CASDigest(hex: ref) else { throw CASServiceError.invalidDigest(ref) }
+            return parsed
+        }
+        guard CASIdentity.identify(refs: refDigests, data: assembled).hex == digest else {
+            throw CASServiceError.invalidDigest(digest)
+        }
+        try await shard(for: digest).putLarge(digest: digest, refs: refs, manifest: manifest, size: size)
+    }
+
+    func getLarge(digest: String) async throws -> CASLargeObject? {
+        try await shard(for: digest).getLarge(digest: digest)
     }
 }
 
