@@ -1,10 +1,7 @@
 import CASProtocol
 import Foundation
 
-struct StoredObject: Sendable {
-    var refs: [CASDigest]
-    var data: [UInt8]
-}
+typealias StoredObject = CASBlob
 
 struct StoreError: Error, CustomStringConvertible {
     var description: String

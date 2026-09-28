@@ -12,10 +12,12 @@ let package = Package(
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
     ],
     dependencies: [
-        // Merged workers-swift PR #12 provides the native WebSocket transport and RPCGateway.
+        // workers-swift PR #12 provides the native WebSocket transport. Pinned to
+        // PR #13's commit, which lets the native client receive replies over 16 KiB;
+        // move back to a merge commit on main once #13 lands.
         .package(
             url: "https://github.com/sevki/workers-swift.git",
-            revision: "2db5bab408d8a2aeae720cd123a92b32e2d73c43"
+            revision: "0094ea55669aafa2cad7ed252ae5582aafaf9997"
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
     ],
@@ -30,13 +32,22 @@ let package = Package(
             name: "casctl",
             dependencies: [
                 "CASProtocol",
+                "CASClient",
                 .product(name: "WorkersDistributed", package: "workers-swift")
             ]
         ),
         .target(name: "CLLCAS"),
+        // Native-only client for the CAS service; shared by casctl and the plugin.
+        .target(
+            name: "CASClient",
+            dependencies: [
+                "CASProtocol",
+                .product(name: "WorkersDistributed", package: "workers-swift")
+            ]
+        ),
         .target(
             name: "CASPlugin",
-            dependencies: ["CASProtocol", "CLLCAS"]
+            dependencies: ["CASProtocol", "CASClient", "CLLCAS"]
         ),
         .target(
             name: "CASWorker",

@@ -1,22 +1,26 @@
 # workers-swift transport spike
 
-This repository consumes the `WorkersDistributed` product from the merged workers-swift PR #12 at revision `2db5bab408d8a2aeae720cd123a92b32e2d73c43`.
+This repository consumes the `WorkersDistributed` product from workers-swift: the native transport merged in PR #12 plus [PR #13](https://github.com/sevki/workers-swift/pull/13)'s client frame-size fix, pinned at revision `0094ea55669aafa2cad7ed252ae5582aafaf9997`.
 
 ## What this branch proves
 
 - A distributed actor declaration can be shared by a native executable and a Worker Wasm target.
-- The Worker can host that actor at the `__workersSwiftDistributedCall` entry point.
-- A native executable can resolve the actor and call it through `WorkersActorSystem(worker:)`, the per-connection `RPCGateway`, and the Worker `SELF` binding.
-- CI is configured to build the native client, run protocol type tests, and compile the Worker bundle.
+- A Durable Object can host that actor locally (`CASGateway`) and reach per-shard actors in other Durable Objects.
+- A native executable can resolve the actor and call it through `WorkersActorSystem(worker:)` over the WebSocket gateway.
+- CI builds and tests all of it, including a workerd end-to-end run.
 
-`casctl status` deliberately reports that storage is not configured and exits with code 2. That is the honest result for this slice: it validates the service route and CLI without pretending volatile Worker memory is durable CAS storage.
+## How storage reaches the actor
 
-## Why CAS operations are not in this transport slice
+`RPCGateway` relays each call to the Worker's `@RPC` entry point, which has no `env`, so an actor hosted there cannot reach a Durable Object namespace. This repository therefore uses its own gateway, `CASGateway`, a Durable Object that accepts the WebSocket itself and hosts the `CASService` locally through `WorkersActorSystem.receiveJSON(_:)`. Being a Durable Object it receives `env`, so the service can call the per-shard `CASShard` actors (`WorkersActorSystem(durableObjects:)`, one actor per Durable Object id, the pattern workers-swift's Fork/Philosopher example uses).
 
-The native transport is JSON over WebSocket and its gateway relays to a Worker-hosted actor. It is well suited to control calls, but large CAS payloads need a streaming data path. More importantly, an actor hosted as a Worker singleton cannot directly capture a Durable Object namespace binding from the gateway's `@RPC` entry point. Durable storage must be designed with the Worker request and Durable Object routing model in mind.
+## Transport limits found while building this
 
-The next service increment should add a Worker HTTP data plane that routes by CAS ID to durable shard objects, with the actor protocol coordinating status and bounded metadata calls. Before implementing `putKnown`, pin llbuild2 and add identity conformance vectors. The adapter must implement `FXTypedCASDatabase<DataID, CASObject>` (or `FXCASDatabase` for `FXDataID` / `FXCASObject`), including `supportedFeatures`, `contains`, `get`, `identify`, `put`, and `put(knownID:)`.
+- The native client's WebSocket frame limit defaulted to 16 KiB, so any reply over about 12 KB of payload closed the connection with 1009 even though the message limit was 1 MiB. Fixed in [workers-swift#13](https://github.com/sevki/workers-swift/pull/13); this repository pins that commit until it lands.
+- With that fixed, the practical ceiling is the 1 MiB message limit. Base64 inflates payloads by a third, so `CASLimits.maxObjectBytes` is 512 KiB.
+- `WorkersActorSystem` hosts one actor per system, so the service is one actor (objects and action cache together) and the sharding actors sit behind it.
+
+Before implementing llbuild2's `putKnown`, pin llbuild2 and add identity conformance vectors. An llbuild2 adapter must implement `FXTypedCASDatabase<DataID, CASObject>` (or `FXCASDatabase` for `FXDataID` / `FXCASObject`), including `supportedFeatures`, `contains`, `get`, `identify`, `put`, and `put(knownID:)`.
 
 ## CI
 
-The workflow has separate native and Worker Wasm jobs. Native tests cover Codable wire types and the CLI is compiled. The Worker job installs the matching Swift Wasm SDK and runs workers-swift's command plugin. There is not yet an end-to-end deployment test because this slice does not implement object storage.
+The workflow has separate native and Worker Wasm jobs. The native job runs the tests and `Scripts/test-compilation-cache.sh` (real swiftc miss/hit/replay through the plugin). The Worker job installs the matching Swift Wasm SDK, builds the bundle, and runs `Scripts/test-remote-cache.sh`, which serves it in workerd and exercises `casctl` and two developers sharing a compile cache.

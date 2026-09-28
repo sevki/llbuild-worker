@@ -5,13 +5,11 @@
   "compatibility_date": "2026-01-01",
   "durable_objects": {
     "bindings": [
-      { "name": "RPCGATEWAY", "class_name": "RPCGateway" }
+      { "name": "CASGATEWAY", "class_name": "CASGateway" },
+      { "name": "CASSHARD", "class_name": "CASShardObject" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["RPCGateway"] }
-  ],
-  "services": [
-    { "binding": "SELF", "service": "llbuild-worker" }
+    { "tag": "v2", "new_sqlite_classes": ["CASGateway", "CASShardObject"] }
   ]
 }

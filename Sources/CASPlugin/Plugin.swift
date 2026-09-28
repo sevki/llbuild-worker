@@ -12,17 +12,20 @@ final class Plugin: @unchecked Sendable {
     }
 
     let store: LocalStore
+    let remote: RemoteTier?
     private let lock = NSLock()
     private var digests: [CASDigest] = []
     private var digestBuffers: [UnsafeMutablePointer<UInt8>] = []
     private var indexByDigest: [CASDigest: Int] = [:]
     private var loaded: [Loaded] = []
 
-    init(store: LocalStore) {
+    init(store: LocalStore, remote: RemoteTier?) {
         self.store = store
+        self.remote = remote
     }
 
     deinit {
+        remote?.close()
         for buffer in digestBuffers { buffer.deallocate() }
         for object in loaded { free(object.data) }
     }

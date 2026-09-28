@@ -179,3 +179,18 @@ public struct SHA256: Sendable {
         (x >> n) | (x << (32 - n))
     }
 }
+
+/// An object's content: what identity is computed over.
+public struct CASBlob: Sendable, Equatable {
+    public var refs: [CASDigest]
+    public var data: [UInt8]
+
+    public init(refs: [CASDigest], data: [UInt8]) {
+        self.refs = refs
+        self.data = data
+    }
+
+    public var digest: CASDigest {
+        CASIdentity.identify(refs: refs, data: data)
+    }
+}

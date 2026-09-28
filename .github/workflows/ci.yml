@@ -53,3 +53,11 @@ jobs:
           swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm --configuration release
           test -s build/worker/worker.mjs
           test -s build/worker/WorkersSwift.wasm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Distributed CAS end to end (workerd, casctl, swiftc plugin)
+        run: Scripts/test-remote-cache.sh

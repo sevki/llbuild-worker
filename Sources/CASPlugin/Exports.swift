@@ -99,7 +99,20 @@ public func llcas_cas_create(_ opts: llcas_cas_options_t?, _ error: ErrorOut) ->
         setError(error, "cannot create \(path): \(failure)")
         return nil
     }
-    return OpaquePointer(Unmanaged.passRetained(Plugin(store: store)).toOpaque())
+    var remote: RemoteTier?
+    if let value = configured.options["remote-url"] {
+        guard let url = URL(string: value), ["http", "https"].contains(url.scheme ?? "") else {
+            setError(error, "remote-url must be an http(s) URL: \(value)")
+            return nil
+        }
+        do {
+            remote = try RemoteTier(url: url)
+        } catch let failure {
+            setError(error, "cannot set up the remote CAS at \(value): \(failure)")
+            return nil
+        }
+    }
+    return OpaquePointer(Unmanaged.passRetained(Plugin(store: store, remote: remote)).toOpaque())
 }
 
 @_cdecl("llcas_cas_dispose")
@@ -200,7 +213,11 @@ public func llcas_cas_contains_object(
         setError(error, "unknown object id")
         return LLCAS_LOOKUP_RESULT_ERROR
     }
-    return instance.store.contains(digest) ? LLCAS_LOOKUP_RESULT_SUCCESS : LLCAS_LOOKUP_RESULT_NOTFOUND
+    if instance.store.contains(digest) { return LLCAS_LOOKUP_RESULT_SUCCESS }
+    if globally, let remote = instance.remote, remote.contains(digest) == true {
+        return LLCAS_LOOKUP_RESULT_SUCCESS
+    }
+    return LLCAS_LOOKUP_RESULT_NOTFOUND
 }
 
 private func load(
@@ -211,10 +228,16 @@ private func load(
         return (LLCAS_LOOKUP_RESULT_ERROR, none, "unknown object id")
     }
     do {
-        guard let stored = try instance.store.get(digest) else {
-            return (LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
+        if let stored = try instance.store.get(digest) {
+            return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.addLoaded(stored), nil)
         }
-        return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.addLoaded(stored), nil)
+        // Local miss: try the shared tier, keeping what it returns.
+        if let remote = instance.remote, let fetched = remote.get(digest), let blob = fetched {
+            try instance.store.put(blob, digest: digest)
+            remote.log("fetched \(digest.hex) (\(blob.data.count) bytes)")
+            return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.addLoaded(blob), nil)
+        }
+        return (LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
     } catch {
         return (LLCAS_LOOKUP_RESULT_ERROR, none, "\(error)")
     }
@@ -341,14 +364,21 @@ public func llcas_loaded_object_export_data_to_filepath(
 // MARK: - Action cache
 
 private func actionGet(
-    _ instance: Plugin, _ key: llcas_digest_t
+    _ instance: Plugin, _ key: llcas_digest_t, globally: Bool
 ) -> (result: llcas_lookup_result_t, value: llcas_objectid_t, message: String?) {
     let none = llcas_objectid_t(opaque: 0)
+    let keyDigest = digest(key)
     do {
-        guard let value = try instance.store.actionGet(digest(key)) else {
-            return (LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
+        if let value = try instance.store.actionGet(keyDigest) {
+            return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
         }
-        return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
+        if globally, let remote = instance.remote, let fetched = remote.actionGet(keyDigest),
+           let value = fetched {
+            try instance.store.actionPut(keyDigest, value: value)
+            remote.log("action \(keyDigest.hex) hit remotely")
+            return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
+        }
+        return (LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
     } catch {
         return (LLCAS_LOOKUP_RESULT_ERROR, none, "\(error)")
     }
@@ -359,7 +389,7 @@ public func llcas_actioncache_get_for_digest(
     _ cas: llcas_cas_t?, _ key: llcas_digest_t, _ out: UnsafeMutablePointer<llcas_objectid_t>?,
     _ globally: Bool, _ error: ErrorOut
 ) -> llcas_lookup_result_t {
-    let found = actionGet(plugin(cas), key)
+    let found = actionGet(plugin(cas), key, globally: globally)
     if let message = found.message { setError(error, message) }
     if found.result == LLCAS_LOOKUP_RESULT_SUCCESS { out?.pointee = found.value }
     return found.result
@@ -371,16 +401,27 @@ public func llcas_actioncache_get_for_digest_async(
     _ callback: llcas_actioncache_get_cb?, _ cancel: UnsafeMutablePointer<llcas_cancellable_t?>?
 ) {
     cancel?.pointee = nil
-    let found = actionGet(plugin(cas), key)
+    let found = actionGet(plugin(cas), key, globally: globally)
     callback?(context, found.result, found.value, found.message.flatMap { strdup($0) })
 }
 
 private func actionPut(
-    _ instance: Plugin, _ key: llcas_digest_t, _ value: llcas_objectid_t
+    _ instance: Plugin, _ key: llcas_digest_t, _ value: llcas_objectid_t, globally: Bool
 ) -> String? {
     guard let valueDigest = instance.digest(of: value) else { return "unknown object id" }
+    let keyDigest = digest(key)
     do {
-        try instance.store.actionPut(digest(key), value: valueDigest)
+        try instance.store.actionPut(keyDigest, value: valueDigest)
+        // Share the result only if all of it can be shared: the action entry
+        // must never point at an object another machine cannot fetch.
+        if globally, let remote = instance.remote, remote.isEnabled {
+            if remote.ensureUploaded(valueDigest, from: instance.store),
+               remote.actionPut(keyDigest, value: valueDigest) {
+                remote.log("shared action \(keyDigest.hex)")
+            } else {
+                remote.log("kept action \(keyDigest.hex) local")
+            }
+        }
         return nil
     } catch {
         return "\(error)"
@@ -392,7 +433,7 @@ public func llcas_actioncache_put_for_digest(
     _ cas: llcas_cas_t?, _ key: llcas_digest_t, _ value: llcas_objectid_t, _ globally: Bool,
     _ error: ErrorOut
 ) -> Bool {
-    if let message = actionPut(plugin(cas), key, value) {
+    if let message = actionPut(plugin(cas), key, value, globally: globally) {
         setError(error, message)
         return true
     }
@@ -406,6 +447,6 @@ public func llcas_actioncache_put_for_digest_async(
     _ cancel: UnsafeMutablePointer<llcas_cancellable_t?>?
 ) {
     cancel?.pointee = nil
-    let message = actionPut(plugin(cas), key, value)
+    let message = actionPut(plugin(cas), key, value, globally: globally)
     callback?(context, message != nil, message.flatMap { strdup($0) })
 }

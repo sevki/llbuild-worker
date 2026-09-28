@@ -133,3 +133,17 @@ Define retention and garbage collection separately. CAS objects are immutable, b
 - Claiming ID preservation before the exact identity encoding is verified.
 - Unbounded object transfer through PR #12's JSON gateway.
 - Defining GC without a root and lease model.
+
+
+## Compilation caching (swiftc CAS plugin)
+
+The first client is not llbuild2 but swiftc's compilation caching. `swift-frontend` loads a dynamic library through `-cas-plugin-path` and drives it through the LLVM CAS plugin C API (`llcas_*`: object store and load, and an action cache keyed by digest). `CASPlugin` implements that API, so the same service that will back llbuild2 also lets separate machines share compile results.
+
+- **Identity is this service's own.** The plugin API lets the plugin choose its hash: `CASIdentity` is SHA-256 over a domain tag, the reference digests and the data, with lengths. Server and client compute it identically; the Worker recomputes it on every store, and the client re-verifies every object it fetches. This is deliberately not llbuild2's `identify(refs:data:)`, which remains the blocking question above for the llbuild2 adapter.
+- **Two tiers.** The local store (`-cas-path`) answers first. The compiler passes a `globally` flag on lookups and action puts; only then does the plugin use the Worker (`-cas-plugin-option remote-url=...`).
+- **Publishing is transitive.** An action's result object is uploaded together with every object it references, children first, and the action entry is written last, so no reader can see an entry pointing at a missing object. If any part cannot be uploaded (for example it is over the size limit), the entry stays local.
+- **Never fail the build.** Any remote error or timeout disables the remote for that process and compilation continues against the local cache.
+- **Size.** Objects over `CASLimits.maxObjectBytes` (512 KiB) are not shared, because the control plane is JSON over a WebSocket with a 1 MiB message limit. Object files and module artifacts are routinely larger than that, so the streaming data path described above is what turns this from a working prototype into a useful cache.
+- **Sharding.** 16 shards by the first hex digit of the digest. That is fixed for now; changing it needs a resharding plan.
+
+The plugin targets the API version the toolchain was built against (`LLCAS_VERSION` 0.2, vendored from swiftlang/llvm-project as `CLLCAS`). The API is marked experimental upstream.
