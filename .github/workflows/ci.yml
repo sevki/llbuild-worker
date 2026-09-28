@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native Swift build and tests
+    runs-on: ubuntu-24.04
+    container: swift:6.4-noble
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build casctl
+        run: swift build --product casctl
+
+  worker:
+    name: Build Cloudflare Worker WebAssembly bundle
+    runs-on: ubuntu-24.04
+    container: swift:6.4-noble
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Swift WebAssembly SDK for this toolchain
+        env:
+          SWIFT_RELEASE_TAG: swift-6.4.0-RELEASE
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends curl ca-certificates
+          tag="$SWIFT_RELEASE_TAG"
+          lower="$(echo "$tag" | tr '[:upper:]' '[:lower:]')"
+          curl -fsSL -o /tmp/wasm-sdk.artifactbundle.tar.gz \
+            "https://download.swift.org/${lower}/wasm-sdk/${tag}/${tag}_wasm.artifactbundle.tar.gz"
+          swift sdk install /tmp/wasm-sdk.artifactbundle.tar.gz
+
+      - name: Build Worker bundle
+        run: |
+          swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm --configuration release
+          test -s build/worker/worker.mjs
+          test -s build/worker/WorkersSwift.wasm
