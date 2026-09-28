@@ -1,5 +1,6 @@
 import Distributed
 import Foundation
+import WorkersDistributed
 
 /// CAS identity in llbuild2's Codable string form.
 ///
