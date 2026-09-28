@@ -1,0 +1,17 @@
+{
+  "name": "llbuild-worker",
+  "main": "build/worker/worker.mjs",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "RPCGATEWAY", "class_name": "RPCGateway" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RPCGateway"] }
+  ],
+  "services": [
+    { "binding": "SELF", "service": "llbuild-worker" }
+  ]
+}
