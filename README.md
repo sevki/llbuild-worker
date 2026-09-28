@@ -19,10 +19,10 @@ Requires Swift 6.4 for the pinned workers-swift PR revision.
 ```sh
 swift test
 swift build --product casctl
-swift package worker-build --product CASWorkerWasm
+swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm
 ```
 
-For local Worker development, install the matching Swift WebAssembly SDK, run the worker build, then use `wrangler dev` with `wrangler.jsonc`:
+For local Worker development, install the matching Swift WebAssembly SDK, run the Worker build, then use `wrangler dev` with `wrangler.jsonc`:
 
 ```sh
 swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm
@@ -32,4 +32,4 @@ casctl http://127.0.0.1:8787 status
 
 ## Design
 
-See [docs/design.md](docs/design.md) for the storage architecture, llbuild2 identity requirements, large-object transfer path, and implementation milestones.
+See [docs/design.md](docs/design.md) for the storage architecture and [docs/pr12-spike.md](docs/pr12-spike.md) for the scope of this transport prototype.
