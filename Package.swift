@@ -44,9 +44,6 @@ let package = Package(
             name: "CASWorkerWasm",
             dependencies: [
                 .target(name: "CASWorker", condition: .when(platforms: [.wasi]))
-            ],
-            plugins: [
-                .plugin(name: "WorkerBuild", package: "workers-swift")
             ]
         ),
         .testTarget(name: "CASProtocolTests", dependencies: ["CASProtocol"]),
