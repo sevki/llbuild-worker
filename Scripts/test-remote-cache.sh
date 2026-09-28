@@ -14,7 +14,9 @@ cd "$root"
 [ -f build/worker/worker.mjs ] || swift package --allow-writing-to-package-directory \
     worker-build --product CASWorkerWasm --configuration release
 [ -d node_modules/workerd ] || npm ci --no-audit --no-fund
-swift build --product CASPlugin --product casctl
+# SwiftPM honors only the last --product flag, so build each on its own.
+swift build --product CASPlugin
+swift build --product casctl
 bin="$(swift build --show-bin-path)"
 plugin="$bin/libCASPlugin.so"
 casctl="$bin/casctl"
