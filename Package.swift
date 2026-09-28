@@ -15,6 +15,7 @@ let package = Package(
             url: "https://github.com/sevki/workers-swift.git",
             revision: "69f99e254b096d140be335dd764d9be2743d56d4"
         ),
+        .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
     ],
     targets: [
         .target(
