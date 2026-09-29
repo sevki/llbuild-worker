@@ -314,7 +314,10 @@ private let statsStyle: StaticString = """
     body { max-width: 720px; }
     table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
     th, td { text-align: right; padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--border); }
-    th:first-child, td:first-child { text-align: left; }
+    th:first-child, td:first-child { text-align: left; white-space: nowrap; }
+    /* A table wider than the screen scrolls inside its own box; without this it
+       widens the whole page and a phone shows it scrolled off to one side. */
+    #live-days, #live-stored { overflow-x: auto; }
     .tiles { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
     .tile { flex: 1; min-width: 140px; background: var(--panel); padding: 1rem; }
     .tile strong { display: block; font-size: 1.6rem; }
@@ -325,6 +328,19 @@ private let statsStyle: StaticString = """
     }
     @media (prefers-reduced-motion: reduce) {
         .flash { animation: none; }
+    }
+    @media (max-width: 480px) {
+        body { padding: 1rem; }
+        th, td { padding: 0.3rem 0.35rem; font-size: 0.9rem; }
+        .tile { min-width: 120px; }
+        .tile strong { font-size: 1.4rem; }
+        /* By day: drop Lookups and Connections (the tiles above total them) so
+           the Uploaded and Downloaded columns fit on a phone. */
+        #live-days th:nth-child(3), #live-days td:nth-child(3),
+        #live-days th:nth-child(4), #live-days td:nth-child(4) { display: none; }
+    }
+    @media (max-width: 360px) {
+        th, td { padding: 0.3rem 0.25rem; font-size: 0.85rem; }
     }
     """
 
