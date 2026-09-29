@@ -82,7 +82,9 @@ echo "Compiling Swift through $remote with $dir/$lib"
 #    too (a target that includes another's header, like swift-nio-ssl's
 #    CNIOBoringSSLShims, otherwise fails loading the include tree); these are
 #    plain C targets, and the object file does not depend on modules. Objective-C, which may @import,
-#    is left alone, and so are WebAssembly compiles (the Worker build).
+#    is left alone (by file extension and -x, not by -fobjc-* flags: macOS
+#    SwiftPM adds -fobjc-arc to every C compile, and a first version skipped
+#    them all on that), and so are WebAssembly compiles (the Worker build).
 clang="$(command -v clang || true)"
 wrapper="$RUNNER_TEMP/clang-cached"
 if [ -z "$clang" ]; then
@@ -109,7 +111,7 @@ compile=0
 for arg in "\$@"; do
     case "\$arg" in
         -c) compile=1 ;;
-        *.S|*.s|*.sx|*.m|*.mm|-E|-S|-M|-MM|-emit-ast|-###|objective-c*|-fobjc*|*wasm*) exec "$clang" "\$@" ;;
+        *.S|*.s|*.sx|*.m|*.mm|-E|-S|-M|-MM|-emit-ast|-###|objective-c*|*wasm*) exec "$clang" "\$@" ;;
     esac
 done
 [ "\$compile" = 1 ] || exec "$clang" "\$@"
