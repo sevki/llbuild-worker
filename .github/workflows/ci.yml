@@ -15,15 +15,27 @@ jobs:
     # -noble matches the ubuntu-24.04 host's glibc. setup-swift@v2 does not
     # know Swift 6.4.0, so use the official image instead.
     container: swift:6.4-noble
+    env:
+      # This repo's own compile cache, https://xcache.devtoo.ls: the compiles
+      # below go through it (see Scripts/ci-compile-cache.sh). A fork's pull
+      # request gets no secret and builds without it.
+      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Enable the compile cache
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends curl ca-certificates
+          Scripts/ci-compile-cache.sh
+
       - name: Run tests
-        run: swift test
+        run: swift test ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
       - name: Build castool
-        run: swift build --product castool
+        run: swift build --product castool ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
+      # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
 
@@ -36,6 +48,8 @@ jobs:
       # code needs a newer SDK). The native backend honors the wasi-only
       # dependency conditions.
       BUILD_FLAGS: --build-system native
+      # See the native job.
+      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,12 +59,16 @@ jobs:
           sudo xcode-select -s "$xcode"
           swift --version
 
+      - name: Enable the compile cache
+        run: Scripts/ci-compile-cache.sh
+
       - name: Run tests
-        run: swift test $BUILD_FLAGS
+        run: swift test $BUILD_FLAGS $SWIFT_CACHE_FLAGS
 
       - name: Build castool
-        run: swift build $BUILD_FLAGS --product castool
+        run: swift build $BUILD_FLAGS --product castool $SWIFT_CACHE_FLAGS
 
+      # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
 
@@ -60,6 +78,9 @@ jobs:
     # -noble matches the ubuntu-24.04 host's glibc. setup-swift@v2 does not
     # know Swift 6.4.0, so use the official image instead.
     container: swift:6.4-noble
+    env:
+      # See the native job.
+      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -75,9 +96,14 @@ jobs:
             "https://download.swift.org/${lower}/wasm-sdk/${tag}/${tag}_wasm.artifactbundle.tar.gz"
           swift sdk install /tmp/wasm-sdk.artifactbundle.tar.gz
 
+      # After the SDK step, which installs curl.
+      - name: Enable the compile cache
+        run: Scripts/ci-compile-cache.sh
+
+      # Everything after `--` goes to worker-build's nested `swift build`.
       - name: Build Worker bundle
         run: |
-          swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm --configuration release
+          swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm --configuration release -- ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
           test -s build/worker/worker.mjs
           test -s build/worker/WorkerKit.wasm
 

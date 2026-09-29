@@ -12,6 +12,10 @@ jobs:
   build-macos:
     name: Build CASPlugin (macOS arm64)
     runs-on: macos-latest
+    env:
+      # Builds through the previous release's plugin and the live cache; see
+      # Scripts/ci-compile-cache.sh.
+      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,9 +25,12 @@ jobs:
           sudo xcode-select -s "$xcode"
           swift --version
 
+      - name: Enable the compile cache
+        run: Scripts/ci-compile-cache.sh
+
       - name: Build CASPlugin
         # The native backend honors the wasi-only dependency conditions; see ci.yml.
-        run: swift build -c release --build-system native --product CASPlugin
+        run: swift build -c release --build-system native --product CASPlugin $SWIFT_CACHE_FLAGS
 
       - name: Package
         run: |
@@ -40,15 +47,26 @@ jobs:
     runs-on: ubuntu-24.04
     # -noble matches the ubuntu-24.04 host's glibc.
     container: swift:6.4-noble
+    env:
+      # See the macOS job.
+      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Enable the compile cache
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends curl ca-certificates
+          Scripts/ci-compile-cache.sh
+
+      # The bin path depends on the build backend, so the build and the path
+      # lookup below must agree: native when the cache is on, else the default.
       - name: Build CASPlugin
-        run: swift build -c release --product CASPlugin
+        run: swift build -c release --product CASPlugin ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
       - name: Package
         run: |
-          bin=$(swift build -c release --show-bin-path)
+          bin=$(swift build -c release ${SWIFT_CACHE_FLAGS:+--build-system native} --show-bin-path)
           tar -C "$bin" -czf CASPlugin-linux-x86_64.tar.gz libCASPlugin.so
 
       - uses: actions/upload-artifact@v4
