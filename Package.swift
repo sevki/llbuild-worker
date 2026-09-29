@@ -2,6 +2,15 @@
 
 import PackageDescription
 
+// Everything is built through the compile cache in CI, including test
+// targets' dependencies, but not the test targets' own compiles: SwiftPM finds
+// tests through the index store, and a compile replayed from the cache does not
+// write index data ("index store path does not exist" / "Failed opening
+// .../index/store/.../units/X.swift.o-..."). -cache-disable-replay makes these
+// compiles run even on a hit, so they write it; it does nothing without the
+// cache flags.
+let testSwiftSettings: [SwiftSetting] = [.unsafeFlags(["-Xfrontend", "-cache-disable-replay"])]
+
 let package = Package(
     name: "llbuild-worker",
     platforms: [.macOS(.v15)],
@@ -78,7 +87,7 @@ let package = Package(
         .testTarget(name: "CASProtocolTests", dependencies: [
             "CASProtocol", "CASClient",
             .product(name: "WorkerKitDistributed", package: "WorkerKit"),
-        ]),
-        .testTarget(name: "CASPluginTests", dependencies: ["CASPlugin", "CASProtocol"]),
+        ], swiftSettings: testSwiftSettings),
+        .testTarget(name: "CASPluginTests", dependencies: ["CASPlugin", "CASProtocol"], swiftSettings: testSwiftSettings),
     ]
 )
