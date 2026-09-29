@@ -36,7 +36,9 @@ expect() { # <output> <pattern> <label>
 
 expect "$(compile a.swift first.o)" "cache miss" "first compile misses"
 second="$(compile a.swift second.o)"
-expect "$second" "cache hit" "second compile hits"
+# Apple's compiler words a hit as "replay output file"; the open-source one
+# also says "cache hit". Either way the object below must match the first.
+expect "$second" "cache hit\|replay output file" "second compile hits"
 cmp first.o second.o && echo "ok: replayed object is identical"
 
 printf 'public func add(_ a: Int, _ b: Int) -> Int { a + b + 0 }\n' > a.swift
