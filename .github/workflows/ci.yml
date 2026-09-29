@@ -29,13 +29,8 @@ jobs:
           apt-get install -y -q --no-install-recommends curl ca-certificates
           Scripts/ci-compile-cache.sh
 
-      # Not through the compile cache: SwiftPM finds the tests through the index
-      # store, and a replayed Swift compile does not recreate its index data, so
-      # a cache hit on a test target fails the build ("Failed opening .../index/
-      # store/.../units/LocalStoreTests.swift.o-..."). Builds without test
-      # targets, below, are fine.
       - name: Run tests
-        run: swift test
+        run: swift test ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
       - name: Build castool
         run: swift build --product castool ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
@@ -67,13 +62,8 @@ jobs:
       - name: Enable the compile cache
         run: Scripts/ci-compile-cache.sh
 
-      # Not through the compile cache: SwiftPM finds the tests through the index
-      # store, and a replayed Swift compile does not recreate its index data, so
-      # a cache hit on a test target fails the build ("Failed opening .../index/
-      # store/.../units/LocalStoreTests.swift.o-..."). Builds without test
-      # targets, below, are fine.
       - name: Run tests
-        run: swift test $BUILD_FLAGS
+        run: swift test $BUILD_FLAGS $SWIFT_CACHE_FLAGS
 
       - name: Build castool
         run: swift build $BUILD_FLAGS --product castool $SWIFT_CACHE_FLAGS
