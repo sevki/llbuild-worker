@@ -1,6 +1,6 @@
 import JavaScriptKit
-import WorkersDistributed
-import WorkersSwift
+import WorkerKitDistributed
+import WorkerKit
 
 /// Native clients connect to `/__rpc` over a WebSocket. Each connection gets
 /// its own `CASGateway`, which hosts a stateless `CASService` in front of the

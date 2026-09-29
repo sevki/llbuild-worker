@@ -1,6 +1,6 @@
 // A minimal in-memory stand-in for R2, used only to test locally in raw
 // workerd, which has no R2 emulator. Speaks workerd's r2Bucket wire protocol
-// (adapted from workers-swift's e2e harness).
+// (adapted from WorkerKit's e2e harness).
 const entries = new Map();
 
 function notFound() {

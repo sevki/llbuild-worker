@@ -2,8 +2,8 @@ import CASProtocol
 import Distributed
 import Foundation
 import JavaScriptKit
-import WorkersDistributed
-import WorkersSwift
+import WorkerKitDistributed
+import WorkerKit
 
 /// Objects at or above this size keep their body in R2 (when a bucket is
 /// bound) instead of SQLite, so the Durable Object holds only metadata for
@@ -128,7 +128,7 @@ distributed actor CASShard {
     }
 }
 
-/// The Durable Object that hosts one `CASShard`, mirroring workers-swift's
+/// The Durable Object that hosts one `CASShard`, mirroring WorkerKit's
 /// per-Durable-Object actor hosting: the actor's id is the object's own id.
 @DurableObject
 final class CASShardObject {
@@ -227,7 +227,7 @@ struct ShardBackend: CASBackend {
     }
 }
 
-/// One WebSocket connection's gateway. Unlike workers-swift's `RPCGateway`,
+/// One WebSocket connection's gateway. Unlike WorkerKit's `RPCGateway`,
 /// which relays to a Worker entry point that has no `env`, this Durable Object
 /// hosts the `CASService` itself so the service can reach the shard namespace.
 @DurableObject

@@ -2,9 +2,9 @@
 
 ## Goal
 
-Provide a remote backend for Apple llbuild2's content-addressable storage (CAS), with a native Swift client and a Cloudflare Worker implementation written using [workers-swift](https://github.com/sevki/workers-swift).
+Provide a remote backend for Apple llbuild2's content-addressable storage (CAS), with a native Swift client and a Cloudflare Worker implementation written using [WorkerKit](https://github.com/sevki/WorkerKit).
 
-The transport starting point is [workers-swift PR #12](https://github.com/sevki/workers-swift/pull/12): native Swift can call a distributed actor hosted by a Worker through `WorkersActorSystem` and `RPCGateway`. This gives the client a typed Swift interface. It does not make llbuild2's `CASProtocol` protobuf definition into a network protocol.
+The transport starting point is [WorkerKit PR #12](https://github.com/sevki/WorkerKit/pull/12): native Swift can call a distributed actor hosted by a Worker through `WorkersActorSystem` and `RPCGateway`. This gives the client a typed Swift interface. It does not make llbuild2's `CASProtocol` protobuf definition into a network protocol.
 
 ## Proposed shape
 
@@ -29,7 +29,7 @@ flowchart TD
     F --> H["R2 blob store"]
 ```
 
-PR #12's gateway relays calls to a distributed actor hosted by the Worker via the `SELF` service binding. It does not dispatch calls directly to a Durable Object actor. Keep the shard boundary behind the service actor unless workers-swift adds explicit actor routing to Durable Objects.
+PR #12's gateway relays calls to a distributed actor hosted by the Worker via the `SELF` service binding. It does not dispatch calls directly to a Durable Object actor. Keep the shard boundary behind the service actor unless WorkerKit adds explicit actor routing to Durable Objects.
 
 ## Service contract (proposal)
 

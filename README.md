@@ -1,6 +1,6 @@
 # llbuild-worker
 
-A remote content-addressable store on Cloudflare Workers, written in Swift with [workers-swift](https://github.com/sevki/workers-swift). Its first client is **swiftc's compilation caching**: a CAS plugin that lets separate machines share compile results through the Worker.
+A remote content-addressable store on Cloudflare Workers, written in Swift with [WorkerKit](https://github.com/sevki/WorkerKit). Its first client is **swiftc's compilation caching**: a CAS plugin that lets separate machines share compile results through the Worker.
 
 Everything in the service is a distributed actor:
 
@@ -86,4 +86,4 @@ Scripts/test-with-swift-build.sh    # optional, slow: Xcode's build engine again
 
 ## Design
 
-See [docs/design.md](docs/design.md) for the storage architecture and [docs/pr12-spike.md](docs/pr12-spike.md) for the workers-swift transport notes.
+See [docs/design.md](docs/design.md) for the storage architecture and [docs/pr12-spike.md](docs/pr12-spike.md) for the WorkerKit transport notes.

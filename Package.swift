@@ -4,6 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "llbuild-worker",
+    platforms: [.macOS(.v15)],
     products: [
         .library(name: "CASProtocol", targets: ["CASProtocol"]),
         .executable(name: "castool", targets: ["castool"]),
@@ -12,11 +13,11 @@ let package = Package(
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
     ],
     dependencies: [
-        // workers-swift's native WebSocket transport (PR #12) with the client
+        // WorkerKit's native WebSocket transport (PR #12) with the client
         // frame-size fix (PR #13) and R2 bindings (PR #14), pinned at its merge commit on main.
         .package(
-            url: "https://github.com/sevki/workers-swift.git",
-            revision: "d84154d87e3c3c023ea73cccc38b3fd93afa7ceb"
+            url: "https://github.com/sevki/WorkerKit.git",
+            revision: "564ada3494f7a24df5b232831907c1fce3704de2"
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
     ],
@@ -24,7 +25,7 @@ let package = Package(
         .target(
             name: "CASProtocol",
             dependencies: [
-                .product(name: "WorkersDistributed", package: "workers-swift")
+                .product(name: "WorkerKitDistributed", package: "WorkerKit")
             ]
         ),
         .executableTarget(
@@ -32,7 +33,7 @@ let package = Package(
             dependencies: [
                 "CASProtocol",
                 "CASClient",
-                .product(name: "WorkersDistributed", package: "workers-swift")
+                .product(name: "WorkerKitDistributed", package: "WorkerKit")
             ]
         ),
         .target(name: "CLLCAS"),
@@ -41,7 +42,7 @@ let package = Package(
             name: "CASClient",
             dependencies: [
                 "CASProtocol",
-                .product(name: "WorkersDistributed", package: "workers-swift")
+                .product(name: "WorkerKitDistributed", package: "WorkerKit")
             ]
         ),
         .target(
@@ -52,9 +53,9 @@ let package = Package(
             name: "CASWorker",
             dependencies: [
                 "CASProtocol",
-                .product(name: "WorkersSwift", package: "workers-swift"),
-                .product(name: "WorkersDistributed", package: "workers-swift"),
-                .product(name: "JavaScriptKit", package: "JavaScriptKit")
+                .product(name: "WorkerKit", package: "WorkerKit", condition: .when(platforms: [.wasi])),
+                .product(name: "WorkerKitDistributed", package: "WorkerKit"),
+                .product(name: "JavaScriptKit", package: "JavaScriptKit", condition: .when(platforms: [.wasi]))
             ]
         ),
         .executableTarget(

@@ -35,7 +35,7 @@ const port = portFlag > 0 ? Number(process.argv[portFlag + 1]) : await freePort(
 const directory = await mkdtemp(join(tmpdir(), "llbuild-worker-"));
 await mkdir(join(directory, "disk"));
 await copyFile(join(root, "Scripts", "r2-service.mjs"), join(directory, "r2-service.mjs"));
-for (const file of ["worker.mjs", "WorkersSwift.wasm"]) {
+for (const file of ["worker.mjs", "WorkerKit.wasm"]) {
   await copyFile(join(workerDir, file), join(directory, file));
 }
 
@@ -62,7 +62,7 @@ const config :Workerd.Config = (
 const worker :Workerd.Worker = (
   modules = [
     (name = "worker.mjs", esModule = embed "worker.mjs"),
-    (name = "WorkersSwift.wasm", wasm = embed "WorkersSwift.wasm"),
+    (name = "WorkerKit.wasm", wasm = embed "WorkerKit.wasm"),
   ],
   bindings = [${bindings}, (name = ${JSON.stringify(r2Binding)}, r2Bucket = "r2")],
   durableObjectNamespaces = [${namespaces}],

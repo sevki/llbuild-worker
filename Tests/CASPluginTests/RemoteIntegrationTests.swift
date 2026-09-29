@@ -3,7 +3,7 @@ import CASProtocol
 import CLLCAS
 import Distributed
 import Foundation
-import WorkersDistributed
+import WorkerKitDistributed
 import XCTest
 
 @testable import CASPlugin

@@ -1,7 +1,7 @@
 import CASProtocol
 import Distributed
 import Foundation
-import WorkersDistributed
+import WorkerKitDistributed
 
 public struct CASClientError: Error, CustomStringConvertible {
     public var description: String
