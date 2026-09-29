@@ -170,6 +170,17 @@ final class ByteSizeTests: XCTestCase {
         XCTAssertEqual(ByteSize.format(3_000_000_000_000), "3.0 TB")
     }
 
+    func testEveryUnitIsOneStepAboveTheLast() {
+        // The step is derived from the first two prefixes; this is what makes
+        // that valid: each later unit begins exactly one step further up.
+        XCTAssertEqual(ByteSize.step, 1000)
+        var size = ByteSize.step
+        for symbol in ByteSize.unitSymbols.dropFirst() {
+            XCTAssertEqual(ByteSize.format(size), "1.0 \(symbol)")
+            size *= ByteSize.step
+        }
+    }
+
     func testRoundingNeverShowsAThousandOfTheSmallerUnit() {
         XCTAssertEqual(ByteSize.format(999_949), "999.9 kB")
         XCTAssertEqual(ByteSize.format(999_950), "1.0 MB")

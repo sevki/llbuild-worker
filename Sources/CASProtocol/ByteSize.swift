@@ -14,6 +14,14 @@ public enum ByteSize {
         (Tera.symbol, Tera.scale.exponent),
     ]
 
+    /// How much bigger each unit is than the one before: the gap between two
+    /// prefixes' powers of ten (k to M is 10^3), so 1000, not written out here.
+    public static let step: Int64 = scale(exponent: prefixes[1].exponent - prefixes[0].exponent)
+
+    /// Digits after the decimal point; `tenthsFactor` scales a size to them.
+    private static let fractionDigits = 1
+    private static let tenthsFactor: Int64 = scale(exponent: fractionDigits)
+
     /// Unit symbols from one byte upward: B, kB, MB, GB, TB.
     public static let unitSymbols: [String] = ["B"] + prefixes.map { $0.symbol + "B" }
 
@@ -26,18 +34,20 @@ public enum ByteSize {
     /// WebAssembly, where `Int` overflows at 2.1 GB and 10^12 (a terabyte)
     /// does not fit, which trapped the stats page.
     public static func format(_ bytes: Int64) -> String {
-        guard bytes >= 1000 else { return "\(bytes) B" }
+        guard bytes >= step else { return "\(bytes) B" }
         var index = 0
         for candidate in prefixes.indices where bytes >= scale(exponent: prefixes[candidate].exponent) {
             index = candidate
         }
         var tenths = roundedTenths(bytes, exponent: prefixes[index].exponent)
         // 999.95 kB rounds to 1000.0 kB; that reads better as 1.0 MB.
-        if tenths >= 10_000, index + 1 < prefixes.count {
+        if tenths >= step * tenthsFactor, index + 1 < prefixes.count {
             index += 1
             tenths = roundedTenths(bytes, exponent: prefixes[index].exponent)
         }
-        return "\(tenths / 10).\(tenths % 10) \(unitSymbols[index + 1])"
+        let fraction = String(tenths % tenthsFactor)
+        let padded = String(repeating: "0", count: fractionDigits - fraction.count) + fraction
+        return "\(tenths / tenthsFactor).\(padded) \(unitSymbols[index + 1])"
     }
 
     private static func scale(exponent: Int) -> Int64 {
@@ -48,6 +58,6 @@ public enum ByteSize {
 
     private static func roundedTenths(_ bytes: Int64, exponent: Int) -> Int64 {
         let unit = scale(exponent: exponent)
-        return (bytes * 10 + unit / 2) / unit
+        return (bytes * tenthsFactor + unit / 2) / unit
     }
 }

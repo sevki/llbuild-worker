@@ -311,16 +311,23 @@ func formatPercent(_ part: Int, of total: Int) -> String {
 // MARK: - Page
 
 private let statsStyle: StaticString = """
-    body { max-width: 720px; }
+    body { max-width: 720px; padding: clamp(1rem, 4vw, 2rem); }
     table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
-    th, td { text-align: right; padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--border); }
-    th:first-child, td:first-child { text-align: left; white-space: nowrap; }
-    /* A table wider than the screen scrolls inside its own box; without this it
-       widens the whole page and a phone shows it scrolled off to one side. */
-    #live-days, #live-stored { overflow-x: auto; }
+    th, td { text-align: right; padding: 0.3rem clamp(0.35rem, 1.5vw, 0.6rem); border-bottom: 1px solid var(--border); }
+    th:first-child, td:first-child { text-align: left; }
+    #live-stored { overflow-x: auto; }
     .tiles { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
-    .tile { flex: 1; min-width: 140px; background: var(--panel); padding: 1rem; }
-    .tile strong { display: block; font-size: 1.6rem; }
+    .tile { flex: 1; min-width: 7.5rem; background: var(--panel); padding: 1rem; }
+    .tile strong { display: block; font-size: clamp(1.4rem, 5vw, 1.6rem); }
+    /* One card per day, as many per row as fit: a card is a fixed set of
+       figures, so no column of a table can be pushed off a narrow screen. */
+    .days { display: grid; gap: 1rem; margin-bottom: 1.5rem;
+            grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr)); }
+    .day { background: var(--panel); padding: 1rem; }
+    .day h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+    .metric { display: flex; justify-content: space-between; gap: 1rem; padding: 0.25rem 0;
+              border-bottom: 1px solid var(--border); }
+    .metric:last-child { border-bottom: 0; }
     .flash { animation: flash 1.5s ease-out; }
     @keyframes flash {
         from { background-color: var(--flash); }
@@ -329,31 +336,26 @@ private let statsStyle: StaticString = """
     @media (prefers-reduced-motion: reduce) {
         .flash { animation: none; }
     }
-    @media (max-width: 480px) {
-        body { padding: 1rem; }
-        th, td { padding: 0.3rem 0.35rem; font-size: 0.9rem; }
-        .tile { min-width: 120px; }
-        .tile strong { font-size: 1.4rem; }
-        /* By day: drop Lookups and Connections (the tiles above total them) so
-           the Uploaded and Downloaded columns fit on a phone. */
-        #live-days th:nth-child(3), #live-days td:nth-child(3),
-        #live-days th:nth-child(4), #live-days td:nth-child(4) { display: none; }
-    }
-    @media (max-width: 360px) {
-        th, td { padding: 0.3rem 0.25rem; font-size: 0.85rem; }
-    }
     """
 
-private func dayRow(_ day: DayStats) -> ChildOf<Tag.Table> {
+/// One day's figures as label and value pairs, the rows of its card.
+private func dayFigures(_ day: DayStats) -> [(label: String, value: String)] {
     let lookups = day.hits + day.misses
-    let rate = formatPercent(day.hits, of: lookups)
-    return .tr(
-        .td(.text(day.date)),
-        .td(.text(rate)),
-        .td(.text(String(lookups))),
-        .td(.text(String(day.connections))),
-        .td(.text(formatBytes(day.bytesUp))),
-        .td(.text(formatBytes(day.bytesDown))))
+    return [
+        ("Hit rate", formatPercent(day.hits, of: lookups)),
+        ("Lookups", String(lookups)),
+        ("Connections", String(day.connections)),
+        ("Uploaded", formatBytes(day.bytesUp)),
+        ("Downloaded", formatBytes(day.bytesDown)),
+    ]
+}
+
+private func dayCard(_ day: DayStats) -> Node {
+    .div(attributes: [.class("day")],
+        .h3(.text(day.date)),
+        .fragment(dayFigures(day).map { figure in
+            .div(attributes: [.class("metric")], .span(.text(figure.label)), .strong(.text(figure.value)))
+        }))
 }
 
 private func statRow(_ label: String, _ value: String) -> ChildOf<Tag.Table> {
@@ -379,19 +381,28 @@ private let statsScript: StaticString = """
     (function () {
       var report = null;
       var fields = ['hits', 'misses', 'actionsPut', 'objectsPut', 'objectsGot', 'bytesUp', 'bytesDown', 'connections'];
-      // SI units, powers of 1000; the symbols are the server's (data-byte-units).
-      var units = document.getElementById('live-tiles').getAttribute('data-byte-units').split(',');
+      // The unit symbols and the step between them come from the server.
+      var tiles = document.getElementById('live-tiles');
+      var units = tiles.getAttribute('data-byte-units').split(',');
+      var step = Number(tiles.getAttribute('data-byte-step'));
       function bytes(n) {
-        if (n < 1000) return n + ' B';
+        if (n < step) return n + ' B';
         var u = 0, v = n;
-        while (v >= 1000 && u < units.length - 1) { v /= 1000; u++; }
-        var t = Math.round(v * 10);
-        if (t >= 10000 && u < units.length - 1) { v /= 1000; u++; t = Math.round(v * 10); }
-        return Math.floor(t / 10) + '.' + (t % 10) + ' ' + units[u];
+        while (v >= step && u < units.length - 1) { v /= step; u++; }
+        var t = Math.round(v * TENTHS);
+        if (t >= step * TENTHS && u < units.length - 1) { v /= step; u++; t = Math.round(v * TENTHS); }
+        return Math.floor(t / TENTHS) + '.' + (t % TENTHS) + ' ' + units[u];
       }
+      // The figures on a day's card, in order: label and how to get its text.
+      var dayFigures = [
+        ['Hit rate', function (d) { return pct(d.hits, d.hits + d.misses); }],
+        ['Lookups', function (d) { return d.hits + d.misses; }],
+        ['Connections', function (d) { return d.connections; }],
+        ['Uploaded', function (d) { return bytes(d.bytesUp); }],
+        ['Downloaded', function (d) { return bytes(d.bytesDown); }]
+      ];
       function pct(part, total) { return total === 0 ? 'n/a' : Math.round(part / total * 100) + '%'; }
       function sum(key) { return report.days.reduce(function (a, d) { return a + d[key]; }, 0); }
-      function headRow(cells) { return '<tr>' + cells.map(function (c) { return '<th>' + c + '</th>'; }).join('') + '</tr>'; }
       // Cells with a data-k key are the ones highlighted when their text changes.
       function keyed(key, text) { return '<td data-k="' + key + '">' + text + '</td>'; }
       function statRow(label, value) { return '<tr><td>' + label + '</td>' + keyed('stored:' + label, value) + '</tr>'; }
@@ -400,6 +411,7 @@ private let statsScript: StaticString = """
       // A changed value flashes and fades over FLASH_MS. The pieces are rebuilt
       // on every render, so a flash still running when the next render comes
       // resumes where it was, by starting its animation that far in.
+      var TENTHS = 10; // one decimal place
       var FLASH_MS = 1500, shown = {}, changedAt = {}, rendered = false;
       function highlight() {
         var now = Date.now();
@@ -433,12 +445,11 @@ private let statsScript: StaticString = """
         if (!report.enabled) {
           set('live-days', '<p>Traffic counters are not enabled on this deployment.</p>');
         } else {
-          set('live-days', '<table>' +
-            headRow(['Day', 'Hit rate', 'Lookups', 'Connections', 'Uploaded', 'Downloaded']) +
-            report.days.map(function (d) {
-              var values = [pct(d.hits, d.hits + d.misses), d.hits + d.misses, d.connections, bytes(d.bytesUp), bytes(d.bytesDown)];
-              return '<tr><td>' + d.date + '</td>' + values.map(function (v, i) { return keyed('day:' + d.date + ':' + i, v); }).join('') + '</tr>';
-            }).join('') + '</table>');
+          set('live-days', '<div class="days">' + report.days.map(function (d) {
+            return '<div class="day"><h3>' + d.date + '</h3>' + dayFigures.map(function (f) {
+              return '<div class="metric"><span>' + f[0] + '</span><strong data-k="day:' + d.date + ':' + f[0] + '">' + f[1](d) + '</strong></div>';
+            }).join('') + '</div>';
+          }).join('') + '</div>');
         }
         highlight();
       }
@@ -482,13 +493,7 @@ private func statsDocument(_ report: StatsReport) -> Node {
 
     let byDay: Node
     if report.enabled {
-        var rows = [ChildOf<Tag.Table>]()
-        for day in report.days {
-            rows.append(dayRow(day))
-        }
-        byDay = .table(
-            .tr(.th("Day"), .th("Hit rate"), .th("Lookups"), .th("Connections"), .th("Uploaded"), .th("Downloaded")),
-            .fragment(rows))
+        byDay = .div(attributes: [.class("days")], .fragment(report.days.map(dayCard)))
     } else {
         byDay = .p("Traffic counters are not enabled on this deployment.")
     }
@@ -509,7 +514,7 @@ private func statsDocument(_ report: StatsReport) -> Node {
 
                 .p(attributes: [.id("live-status")], .text("Not live: JavaScript is off.")),
 
-                .div(attributes: [.class("tiles"), .id("live-tiles"), .data("byte-units", ByteSize.unitSymbols.joined(separator: ","))],
+                .div(attributes: [.class("tiles"), .id("live-tiles"), .data("byte-units", ByteSize.unitSymbols.joined(separator: ",")), .data("byte-step", String(ByteSize.step))],
                     tile(formatPercent(hits, of: hits + misses), "cache hit rate"),
                     tile(String(hits + misses), "cache lookups"),
                     tile(String(connections), "client connections"),
