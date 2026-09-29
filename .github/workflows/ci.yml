@@ -39,7 +39,7 @@ jobs:
         run: Scripts/check-c-cache.sh ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
       - name: Check that Swift results travel through the Worker
-        run: '[ -z "${CAS_PLUGIN_PATH:-}" ] || Scripts/check-swift-cache.sh'
+        run: '[ -z "${CAS_PLUGIN_PATH:-}" ] || Scripts/check-swift-cache.sh ${SWIFT_CACHE_FLAGS:+--build-system native}'
 
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
@@ -78,7 +78,7 @@ jobs:
         run: Scripts/check-c-cache.sh $BUILD_FLAGS $SWIFT_CACHE_FLAGS
 
       - name: Check that Swift results travel through the Worker
-        run: '[ -z "${CAS_PLUGIN_PATH:-}" ] || Scripts/check-swift-cache.sh'
+        run: '[ -z "${CAS_PLUGIN_PATH:-}" ] || Scripts/check-swift-cache.sh $BUILD_FLAGS'
 
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin

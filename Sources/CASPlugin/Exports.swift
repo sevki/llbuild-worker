@@ -395,11 +395,23 @@ public func llcas_loaded_object_export_data_to_filepath(
 
 // MARK: - Action cache
 
+/// With LLBUILD_CAS_DEBUG set, says what the compiler asked for. `globally` is
+/// the compiler's choice: only when it is true does the plugin touch the shared
+/// cache, on lookups and on stores, so a compiler that passes false gets a
+/// purely local cache and nothing else in the log explains it.
+private func traceAction(_ what: String, _ key: llcas_digest_t, globally: Bool, _ instance: Plugin) {
+    guard RemoteTier.debug else { return }
+    let remote = instance.remote.map { $0.isEnabled ? "on" : "disabled" } ?? "not configured"
+    FileHandle.standardError.write(Data(
+        "llbuild-worker CAS: \(what) \(digest(key).hex.prefix(12)) globally=\(globally) remote=\(remote)\n".utf8))
+}
+
 private func actionGet(
     _ instance: Plugin, _ key: llcas_digest_t, globally: Bool
 ) -> (result: llcas_lookup_result_t, value: llcas_objectid_t, message: String?) {
     let none = llcas_objectid_t(opaque: 0)
     let keyDigest = digest(key)
+    traceAction("action lookup", key, globally: globally, instance)
     do {
         if let value = try instance.store.actionGet(keyDigest) {
             return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
@@ -436,6 +448,7 @@ public func llcas_actioncache_get_for_digest_async(
     let instance = plugin(cas)
     let none = llcas_objectid_t(opaque: 0)
     let keyDigest = digest(key)
+    traceAction("action lookup", key, globally: globally, instance)
     do {
         if let value = try instance.store.actionGet(keyDigest) {
             callback?(context, LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
@@ -484,6 +497,7 @@ public func llcas_actioncache_put_for_digest(
     _ error: ErrorOut
 ) -> Bool {
     let instance = plugin(cas)
+    traceAction("action store", key, globally: globally, instance)
     let local = actionPutLocally(instance, key, value)
     if let message = local.message {
         setError(error, message)
@@ -503,6 +517,7 @@ public func llcas_actioncache_put_for_digest_async(
 ) {
     cancel?.pointee = nil
     let instance = plugin(cas)
+    traceAction("action store", key, globally: globally, instance)
     let local = actionPutLocally(instance, key, value)
     if let message = local.message {
         callback?(context, true, strdup(message))
