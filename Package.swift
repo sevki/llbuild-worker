@@ -14,10 +14,11 @@ let package = Package(
     ],
     dependencies: [
         // WorkerKit's native WebSocket transport (PR #12) with the client
-        // frame-size fix (PR #13) and R2 bindings (PR #14), pinned at its merge commit on main.
+        // frame-size fix (PR #13), R2 bindings (PR #14) and worker-build's `--`
+        // pass-through (PR #16), pinned at its merge commit on main.
         .package(
             url: "https://github.com/sevki/WorkerKit.git",
-            revision: "564ada3494f7a24df5b232831907c1fce3704de2"
+            revision: "cb369089072900934ab4f9e4cde0cae94edf97ca"
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
         .package(url: "https://github.com/pointfreeco/swift-html", from: "0.5.0"),

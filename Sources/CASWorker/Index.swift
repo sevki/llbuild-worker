@@ -1,12 +1,6 @@
 import Html
 import WorkerKit
 
-let apple_trademarks = ["Xcode®", "Swift®"]
-let cloudflare_trademarks = ["Cloudflare®", "Cloudflare Workers®"]
-let apple_trademark_notice_template = apple_trademarks.joined(separator: " and ") + " are trademarks of Apple Inc., registered in the U.S. and other countries and regions."
-let cloudflare_trademark_notice = cloudflare_trademarks.joined(separator: " and ") + " are trademarks and/or registered trademarks of Cloudflare, Inc."
-let devtools_affiliation_notice = "Devtools Ltd. is not affiliated with, or endorsed or sponsored by, Apple Inc. or Cloudflare, Inc."
-
 /// The landing page served at `/`, distinct from `/__rpc` (see `fetch(_:_:_:)`
 /// in Worker.swift), which is where the actual CAS traffic goes.
 private let indexDocument: Node = .document(
@@ -15,24 +9,7 @@ private let indexDocument: Node = .document(
             .meta(attributes: [.charset(.utf8)]),
             .title("xcache"),
             .meta(viewport: .width(.deviceWidth), .initialScale(1)),
-            .style(safe: """
-                body {
-                    max-width: 640px;
-                    margin: 0 auto;
-                    padding: 2rem;
-                    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-                }
-                pre {
-                    overflow-x: auto;
-                    background: #f5f5f5;
-                    padding: 1rem;
-                }
-                .site-footer {
-                    text-align: center;
-                    padding: 1rem;
-                    color: #666;
-                }
-                """)
+            .style(safe: siteStyle)
         ),
         .body(
             .h1("xcache (pronounced 'ten cache')"),
@@ -76,25 +53,7 @@ private let indexDocument: Node = .document(
                 """
             )),
 
-            .footer(attributes: [.class("site-footer")],
-                .small(
-                    "© 2026 Devtools Ltd. All rights reserved.",
-                    .br,
-                    "Devtools Ltd is a limited company registered in England (№ ",
-                    .a(attributes: [
-                        .href("https://find-and-update.company-information.service.gov.uk/company/16372953"),
-                        .target(.blank),
-                        .rel(.init(rawValue: "noopener noreferrer")),
-                    ], "16372953"),
-                    ")."
-                ),
-                .p(.text("")),
-                .small(.text(apple_trademark_notice_template)),
-                .p(.text("")),
-                .small(.text(cloudflare_trademark_notice)),
-                .p(.text("")),
-                .small(.text(devtools_affiliation_notice)),
-            ),
+            siteFooter
         )
     )
 )

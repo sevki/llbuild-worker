@@ -11,6 +11,13 @@ func fetch(req: Request, env: Env, ctx: Context) async throws -> Response {
         return .text(setupScript, status: 200)
     }
 
+    // Public like the page it feeds: a WebSocket that pushes counter updates.
+    if req.path == "/stats/live" {
+        guard env.jsObject["CASSTATS"].object != nil else { return .error("Statistics are not enabled", 404) }
+        let stats = env.durableObject("CASSTATS")
+        return try await stats.get(id: stats.idFromName("stats")).fetch(req)
+    }
+
     if req.path == "/stats" || req.path == "/stats.json" {
         return await statsResponse(env: env, json: req.path == "/stats.json")
     }

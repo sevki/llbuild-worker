@@ -1,5 +1,5 @@
 {
-  "originHash" : "c395768a5793024d9ca34bc3a8619c9e6fa721626707f0cfb189e19fd4f6865e",
+  "originHash" : "81c6df4a6e0fce1823421838962e6b19e989ae908c7890c25cbb665b0315d2ec",
   "pins" : [
     {
       "identity" : "compress-nio",
@@ -240,7 +240,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sevki/WorkerKit.git",
       "state" : {
-        "revision" : "564ada3494f7a24df5b232831907c1fce3704de2"
+        "revision" : "cb369089072900934ab4f9e4cde0cae94edf97ca"
       }
     }
   ],
