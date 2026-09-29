@@ -58,6 +58,9 @@ flags=(
     -Xswiftc -Rcache-compile-job
 )
 echo "SWIFT_CACHE_FLAGS=${flags[*]}" >> "$GITHUB_ENV"
+# For Scripts/check-swift-cache.sh, which needs the plugin and the Worker on their own.
+echo "CAS_PLUGIN_PATH=$dir/$lib" >> "$GITHUB_ENV"
+echo "CAS_REMOTE_URL=$remote" >> "$GITHUB_ENV"
 echo "Compiling Swift through $remote with $dir/$lib"
 
 # The C targets (swift-nio's shims, BoringSSL, ...) are compiled by clang
