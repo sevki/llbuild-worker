@@ -5,7 +5,7 @@ A remote content-addressable store on Cloudflare Workers, written in Swift with 
 Everything in the service is a distributed actor:
 
 - **`CASService`** is the stateless front-end. Native clients (`castool`, the swiftc plugin) resolve it through `WorkersActorSystem`; it is hosted by a gateway Durable Object, one per WebSocket connection.
-- **`CASShard`** is one actor per Durable Object, holding a slice of the objects and the action cache in that object's SQLite. A digest's first hex digit picks one of 16 shards.
+- **`CASShard`** is one actor per Durable Object, holding a slice of the objects and the action cache in that object's SQLite. Bodies of 32 KiB and up (every chunk of a large object) are stored in R2 under `obj/<digest>`; SQLite keeps the references and small bodies. A digest's first hex digit picks one of 16 shards.
 
 ```
 swiftc ──> CASPlugin (libCASPlugin.so) ──> CASClient ──WebSocket──> CASGateway DO ──> CASService
@@ -33,7 +33,7 @@ swiftc -c main.swift -explicit-module-build -cache-compile-job \
 - Without `remote-url` the plugin is a plain local CAS.
 - Object identity is this service's own SHA-256 scheme (`CASIdentity`), and the Worker recomputes it on every store. It is not llbuild2's identity; see [docs/design.md](docs/design.md).
 
-**Large objects.** Module artifacts are megabytes, so objects over 512 KiB are sent as 256 KiB chunk objects plus a manifest object, all ordinary CAS objects, and then registered; the Worker reassembles the object and recomputes its identity before accepting it. Objects up to 64 MiB are shared; anything larger stays in the local cache. Chunk bodies live in Durable Object SQLite for now, with R2 the intended home for them (workers-swift does not wrap R2 yet).
+**Large objects.** Module artifacts are megabytes, so objects over 512 KiB are sent as 256 KiB chunk objects plus a manifest object, all ordinary CAS objects, and then registered; the Worker reassembles the object and recomputes its identity before accepting it. Objects up to 64 MiB are shared; anything larger stays in the local cache. Chunk bodies live in R2 (binding `CASBLOBS`, see `wrangler.jsonc`; create the bucket with `wrangler r2 bucket create llbuild-cas-blobs`). Without that binding the Worker still runs and keeps every body in SQLite. Locally, `Scripts/serve-worker.mjs` backs the binding with a small in-memory stand-in, since raw workerd has no R2 emulator; the real R2 service has not been exercised.
 
 **Build the plugin in release for real use.** The debug build hashes tens of megabytes of module data unoptimized: a compile that takes about 0.3 s with `swift build -c release --product CASPlugin` takes about 10 s with the debug build.
 

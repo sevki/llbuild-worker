@@ -5,27 +5,38 @@ import JavaScriptKit
 import WorkersDistributed
 import WorkersSwift
 
-/// One CAS shard: a distributed actor living in a Durable Object, with its
-/// objects and action-cache entries in that object's SQLite. The Durable
-/// Object's single-threaded execution serializes every call, so no locking is
-/// needed here.
+/// Objects at or above this size keep their body in R2 (when a bucket is
+/// bound) instead of SQLite, so the Durable Object holds only metadata for
+/// the bulk of the bytes. Chunks of large objects (256 KiB) always qualify.
+let r2BodyThresholdBytes = 32 * 1024
+
+/// One CAS shard: a distributed actor living in a Durable Object. Its
+/// objects' references, its small objects' bodies and its action-cache
+/// entries live in that object's SQLite; large bodies live in R2, keyed by
+/// digest. A body is written to R2 before its row, so a row always has a
+/// body. Calls can interleave at the R2 awaits, which is harmless: every write
+/// is idempotent and content-addressed.
 distributed actor CASShard {
     typealias ActorSystem = WorkersActorSystem
 
     private let storage: SQLStorage
+    private let blobs: R2Bucket?
     private var schemaReady = false
 
-    init(actorSystem: WorkersActorSystem, sql: SQLStorage) {
+    init(actorSystem: WorkersActorSystem, sql: SQLStorage, blobs: R2Bucket? = nil) {
         self.actorSystem = actorSystem
         self.storage = sql
+        self.blobs = blobs
     }
+
+    private static func blobKey(_ digest: String) -> String { "obj/\(digest)" }
 
     /// Creates the tables on first use, so a storage failure surfaces as an
     /// ordinary call error instead of a trap while the Durable Object starts.
     private func database() throws -> SQLStorage {
         if !schemaReady {
             try storage.exec(
-                "CREATE TABLE IF NOT EXISTS objects (digest TEXT PRIMARY KEY, refs TEXT NOT NULL, data TEXT NOT NULL)")
+                "CREATE TABLE IF NOT EXISTS objects (digest TEXT PRIMARY KEY, refs TEXT NOT NULL, data TEXT NOT NULL, in_r2 INTEGER NOT NULL DEFAULT 0)")
             try storage.exec(
                 "CREATE TABLE IF NOT EXISTS actions (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             // A large object's entry: the manifest object listing its chunks.
@@ -39,7 +50,7 @@ distributed actor CASShard {
     /// Stores an object idempotently. The caller has already computed
     /// `digest`; the shard recomputes it and refuses a mismatch, so a shard
     /// can never hold content under the wrong identity.
-    distributed func putObject(digest: String, refs: [String], data: String) throws {
+    distributed func putObject(digest: String, refs: [String], data: String) async throws {
         guard let bytes = Data(base64Encoded: data) else { throw CASServiceError.invalidData }
         let refDigests = try refs.map { ref -> CASDigest in
             guard let parsed = CASDigest(hex: ref) else { throw CASServiceError.invalidDigest(ref) }
@@ -47,15 +58,32 @@ distributed actor CASShard {
         }
         let actual = CASIdentity.identify(refs: refDigests, data: [UInt8](bytes)).hex
         guard actual == digest else { throw CASServiceError.invalidDigest(digest) }
-        try database().exec(
-            "INSERT INTO objects (digest, refs, data) VALUES (?, ?, ?) ON CONFLICT(digest) DO NOTHING",
-            digest, refs.joined(separator: ","), data)
+        let db = try database()
+        if try !db.exec("SELECT 1 AS present FROM objects WHERE digest = ?", digest).rows().isEmpty {
+            return
+        }
+        var inline = data
+        var inR2 = 0
+        if let blobs, bytes.count >= r2BodyThresholdBytes {
+            try await blobs.put(Self.blobKey(digest), [UInt8](bytes))
+            inline = ""
+            inR2 = 1
+        }
+        try db.exec(
+            "INSERT INTO objects (digest, refs, data, in_r2) VALUES (?, ?, ?, ?) ON CONFLICT(digest) DO NOTHING",
+            digest, refs.joined(separator: ","), inline, inR2)
     }
 
-    distributed func getObject(digest: String) throws -> CASObjectPayload? {
-        let rows = try database().exec("SELECT refs, data FROM objects WHERE digest = ?", digest).rows()
+    distributed func getObject(digest: String) async throws -> CASObjectPayload? {
+        let rows = try database().exec("SELECT refs, data, in_r2 FROM objects WHERE digest = ?", digest).rows()
         guard let row = rows.first, let refs = row["refs", as: String.self],
-              let data = row["data", as: String.self] else { return nil }
+              var data = row["data", as: String.self] else { return nil }
+        if row["in_r2", as: Int.self] == 1 {
+            guard let blobs, let body = try await blobs.get(Self.blobKey(digest)) else {
+                throw CASServiceError.invalidManifest("body of \(digest) is missing from R2")
+            }
+            data = Data(try await body.bytes()).base64EncodedString()
+        }
         return CASObjectPayload(
             refs: refs.isEmpty ? [] : refs.split(separator: ",").map(String.init), data: data)
     }
@@ -111,7 +139,9 @@ final class CASShardObject {
         let hostSystem = WorkersActorSystem()
         self.hostSystem = hostSystem
         let sql = state.storage.sql
-        shard = hostSystem.host(state.id) { CASShard(actorSystem: $0, sql: sql) }
+        // Without an R2 binding every body stays in SQLite.
+        let blobs = env.jsObject["CASBLOBS"].object == nil ? nil : env.r2("CASBLOBS")
+        shard = hostSystem.host(state.id) { CASShard(actorSystem: $0, sql: sql, blobs: blobs) }
     }
 }
 

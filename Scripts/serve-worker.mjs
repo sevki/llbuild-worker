@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = join(root, "build", "worker");
+const r2Binding = "CASBLOBS";
 const classes = { CASGATEWAY: "CASGateway", CASSHARD: "CASShardObject" };
 
 function freePort() {
@@ -33,6 +34,7 @@ const portFlag = process.argv.indexOf("--port");
 const port = portFlag > 0 ? Number(process.argv[portFlag + 1]) : await freePort();
 const directory = await mkdtemp(join(tmpdir(), "llbuild-worker-"));
 await mkdir(join(directory, "disk"));
+await copyFile(join(root, "Scripts", "r2-service.mjs"), join(directory, "r2-service.mjs"));
 for (const file of ["worker.mjs", "WorkersSwift.wasm"]) {
   await copyFile(join(workerDir, file), join(directory, file));
 }
@@ -51,6 +53,7 @@ using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   services = [
     (name = "main", worker = .worker),
+    (name = "r2", worker = .r2Worker),
     (name = "disk", disk = (path = ${JSON.stringify(join(directory, "disk"))}, writable = true)),
   ],
   sockets = [(name = "http", address = "127.0.0.1:${port}", http = (), service = "main")],
@@ -61,9 +64,14 @@ const worker :Workerd.Worker = (
     (name = "worker.mjs", esModule = embed "worker.mjs"),
     (name = "WorkersSwift.wasm", wasm = embed "WorkersSwift.wasm"),
   ],
-  bindings = [${bindings}],
+  bindings = [${bindings}, (name = ${JSON.stringify(r2Binding)}, r2Bucket = "r2")],
   durableObjectNamespaces = [${namespaces}],
   durableObjectStorage = (localDisk = "disk"),
+  compatibilityDate = "2026-01-01",
+);
+
+const r2Worker :Workerd.Worker = (
+  modules = [(name = "r2-service.mjs", esModule = embed "r2-service.mjs")],
   compatibilityDate = "2026-01-01",
 );
 `);

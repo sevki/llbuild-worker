@@ -13,10 +13,10 @@ let package = Package(
     ],
     dependencies: [
         // workers-swift's native WebSocket transport (PR #12) with the client
-        // frame-size fix (PR #13), pinned at its merge commit on main.
+        // frame-size fix (PR #13) and R2 bindings (PR #14), pinned at its merge commit on main.
         .package(
             url: "https://github.com/sevki/workers-swift.git",
-            revision: "aaad96f185eaf30e74f8e817d683c10511de7a7b"
+            revision: "d84154d87e3c3c023ea73cccc38b3fd93afa7ceb"
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
     ],

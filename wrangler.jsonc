@@ -9,6 +9,9 @@
       { "name": "CASSHARD", "class_name": "CASShardObject" }
     ]
   },
+  "r2_buckets": [
+    { "binding": "CASBLOBS", "bucket_name": "llbuild-cas-blobs" }
+  ],
   "migrations": [
     { "tag": "v2", "new_sqlite_classes": ["CASGateway", "CASShardObject"] }
   ]

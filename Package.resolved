@@ -1,5 +1,5 @@
 {
-  "originHash" : "52c32477305a68fb3eddaedd6f4f88d013ca89a2280e0c3035e428915ecb02fd",
+  "originHash" : "c559f936bc6cc999b271f8ac90da4bd82ae590552317cee0aa467b448b5cd274",
   "pins" : [
     {
       "identity" : "compress-nio",
@@ -204,7 +204,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sevki/workers-swift.git",
       "state" : {
-        "revision" : "aaad96f185eaf30e74f8e817d683c10511de7a7b"
+        "revision" : "d84154d87e3c3c023ea73cccc38b3fd93afa7ceb"
       }
     }
   ],

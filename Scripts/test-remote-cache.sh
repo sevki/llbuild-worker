@@ -31,7 +31,7 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-node Scripts/serve-worker.mjs > "$work/serve.log" 2>&1 &
+DEBUG_WORKERD=1 node Scripts/serve-worker.mjs > "$work/serve.log" 2>&1 &
 server_pid=$!
 for _ in $(seq 1 120); do
     grep -q '^READY ' "$work/serve.log" && break
@@ -55,6 +55,12 @@ for size in 1000 200000 524288 524289 3000000; do
     echo "ok: $size-byte object round-trips through the shard actors"
 done
 echo "ok: objects over 512 KiB go up as chunks and come back verified"
+
+# Bodies of 32 KiB and up live in R2; the 1000-byte object and manifests stay
+# in the shard's SQLite. The stand-in bucket logs each put it receives.
+grep -q '^R2PUT obj/[0-9a-f]* 262144$' "$work/serve.log" || fail "chunk bodies did not reach R2"
+if grep -q '^R2PUT obj/[0-9a-f]* 1000$' "$work/serve.log"; then fail "a small object went to R2"; fi
+echo "ok: chunk bodies are stored in R2, small objects stay in SQLite"
 
 # The largest logical object is 64 MiB; the client refuses more before uploading.
 head -c 67108865 /dev/urandom > "$work/too-big"
