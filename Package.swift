@@ -48,7 +48,15 @@ let package = Package(
         ),
         .target(
             name: "CASPlugin",
-            dependencies: ["CASProtocol", "CASClient", "CLLCAS"]
+            dependencies: ["CASProtocol", "CASClient", "CLLCAS"],
+            linkerSettings: [
+                // swift-frontend dlcloses the plugin when it exits, while the
+                // WebSocket client's NIO threads are still running; they then
+                // execute unmapped code and the compiler crashes (signal 11,
+                // reported as "generate-pcm command failed"). NODELETE keeps
+                // the library mapped for the life of the process.
+                .unsafeFlags(["-Xlinker", "-z", "-Xlinker", "nodelete"], .when(platforms: [.linux])),
+            ]
         ),
         .target(
             name: "CASWorker",
