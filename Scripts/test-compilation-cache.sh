@@ -5,8 +5,12 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-swift build --package-path "$root" --product CASPlugin
-plugin="$(swift build --package-path "$root" --show-bin-path)/libCASPlugin.so"
+# BUILD_FLAGS lets CI pick a backend (macOS builds need --build-system native).
+# shellcheck disable=SC2086
+swift build ${BUILD_FLAGS:-} --package-path "$root" --product CASPlugin
+case "$(uname -s)" in Darwin) ext=dylib ;; *) ext=so ;; esac
+# shellcheck disable=SC2086
+plugin="$(swift build ${BUILD_FLAGS:-} --package-path "$root" --show-bin-path)/libCASPlugin.$ext"
 [ -f "$plugin" ] || { echo "plugin not found: $plugin" >&2; exit 1; }
 
 work="$(mktemp -d)"

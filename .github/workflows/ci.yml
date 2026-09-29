@@ -27,6 +27,33 @@ jobs:
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
 
+  macos:
+    name: Native Swift build and tests (macOS)
+    runs-on: macos-latest
+    env:
+      # SwiftPM's default swiftbuild backend compiles JavaScriptKit on macOS
+      # even though only wasm needs it, and that fails (its custom-executor
+      # code needs a newer SDK). The native backend honors the wasi-only
+      # dependency conditions.
+      BUILD_FLAGS: --build-system native
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          sudo xcode-select -s "$xcode"
+          swift --version
+
+      - name: Run tests
+        run: swift test $BUILD_FLAGS
+
+      - name: Build castool
+        run: swift build $BUILD_FLAGS --product castool
+
+      - name: Compilation caching through CASPlugin
+        run: Scripts/test-compilation-cache.sh
+
   worker:
     name: Build Cloudflare Worker WebAssembly bundle
     runs-on: ubuntu-24.04
@@ -52,7 +79,7 @@ jobs:
         run: |
           swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm --configuration release
           test -s build/worker/worker.mjs
-          test -s build/worker/WorkersSwift.wasm
+          test -s build/worker/WorkerKit.wasm
 
       - uses: actions/setup-node@v4
         with:
