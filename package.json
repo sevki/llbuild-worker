@@ -1,0 +1,11 @@
+{
+  "name": "llbuild-worker-dev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "serve": "node Scripts/serve-worker.mjs"
+  },
+  "devDependencies": {
+    "workerd": "1.20260926.1"
+  }
+}
