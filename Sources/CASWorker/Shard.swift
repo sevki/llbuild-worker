@@ -138,10 +138,12 @@ distributed actor CASShard {
         return ShardTotals(
             objects: objects?["n", as: Int.self] ?? 0,
             objectsInR2: objects?["r2", as: Int.self] ?? 0,
-            inlineBytes: (objects?["chars", as: Int.self] ?? 0) / 4 * 3,
+            // The byte totals are read as JS numbers into Int64: they pass 2.1 GB,
+            // which overflows the Worker's 32-bit Int.
+            inlineBytes: Int64(objects?["chars", as: Double.self] ?? 0) / 4 * 3,
             actions: actions?["n", as: Int.self] ?? 0,
             largeObjects: large?["n", as: Int.self] ?? 0,
-            largeBytes: large?["bytes", as: Int.self] ?? 0)
+            largeBytes: Int64(large?["bytes", as: Double.self] ?? 0))
     }
 }
 

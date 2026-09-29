@@ -13,11 +13,12 @@ import WorkerKitDistributed
 /// Days of history the stats object keeps.
 let statsRetentionDays = 90
 
-/// One counter's value for one day.
+/// One counter's value for one day. `Int64`: the Worker is 32-bit WebAssembly,
+/// where `Int` overflows at 2.1 GB and byte counters pass that in a day.
 struct StatsCounter: Codable, Sendable {
     var day: Int
     var name: String
-    var value: Int
+    var value: Int64
 }
 
 /// What one shard holds. Bodies kept in R2 are counted in `objectsInR2` but
@@ -25,10 +26,10 @@ struct StatsCounter: Codable, Sendable {
 struct ShardTotals: Codable, Sendable {
     var objects: Int
     var objectsInR2: Int
-    var inlineBytes: Int
+    var inlineBytes: Int64
     var actions: Int
     var largeObjects: Int
-    var largeBytes: Int
+    var largeBytes: Int64
 }
 
 /// The per-day traffic counters, as the names recorded by `StatsBackend`.
@@ -64,7 +65,7 @@ distributed actor CASStatsKeeper {
         let viewers = state.getWebSockets(tag: statsViewerTag)
         guard !viewers.isEmpty else { return }
         var event = DayStats(date: isoDate(day: day))
-        for (name, delta) in deltas { event.add(name, delta) }
+        for (name, delta) in deltas { event.add(name, Int64(delta)) }
         guard let data = try? JSONEncoder().encode(event) else { return }
         let text = String(decoding: data, as: UTF8.self)
         for viewer in viewers { viewer.send(text) }
@@ -97,8 +98,9 @@ distributed actor CASStatsKeeper {
         try database().exec("SELECT day, name, value FROM counters WHERE day >= ? ORDER BY day", day).rows()
             .compactMap { row in
                 guard let day = row["day", as: Int.self], let name = row["name", as: String.self],
-                      let value = row["value", as: Int.self] else { return nil }
-                return StatsCounter(day: day, name: name, value: value)
+                      let value = row["value", as: Double.self] else { return nil }
+                // Read as a JS number (exact to 9 PB) rather than Int, which is 32-bit here.
+                return StatsCounter(day: day, name: name, value: Int64(value))
             }
     }
 }
@@ -221,21 +223,22 @@ struct DayStats: Codable, Sendable {
     var actionsPut = 0
     var objectsPut = 0
     var objectsGot = 0
-    var bytesUp = 0
-    var bytesDown = 0
+    var bytesUp: Int64 = 0
+    var bytesDown: Int64 = 0
     var connections = 0
 
     /// Adds `value` to the field the counter `name` feeds.
-    mutating func add(_ name: String, _ value: Int) {
+    mutating func add(_ name: String, _ value: Int64) {
+        let count = Int(clamping: value)
         switch name {
-        case StatsName.hits: hits += value
-        case StatsName.misses: misses += value
-        case StatsName.actionsPut: actionsPut += value
-        case StatsName.objectsPut: objectsPut += value
-        case StatsName.objectsGot: objectsGot += value
+        case StatsName.hits: hits += count
+        case StatsName.misses: misses += count
+        case StatsName.actionsPut: actionsPut += count
+        case StatsName.objectsPut: objectsPut += count
+        case StatsName.objectsGot: objectsGot += count
         case StatsName.bytesUp: bytesUp += value
         case StatsName.bytesDown: bytesDown += value
-        case StatsName.connections: connections += value
+        case StatsName.connections: connections += count
         default: break
         }
     }
@@ -299,7 +302,7 @@ func isoDate(day: Int) -> String {
     return "\(pad(year, 4))-\(pad(month, 2))-\(pad(dayOfMonth, 2))"
 }
 
-func formatBytes(_ bytes: Int) -> String { ByteSize.format(bytes) }
+func formatBytes(_ bytes: Int64) -> String { ByteSize.format(bytes) }
 
 func formatPercent(_ part: Int, of total: Int) -> String {
     total == 0 ? "n/a" : "\(Int((Double(part) / Double(total) * 100).rounded()))%"
@@ -454,8 +457,8 @@ private func statsDocument(_ report: StatsReport) -> Node {
     let hits = report.days.reduce(0) { $0 + $1.hits }
     let misses = report.days.reduce(0) { $0 + $1.misses }
     let connections = report.days.reduce(0) { $0 + $1.connections }
-    let up = report.days.reduce(0) { $0 + $1.bytesUp }
-    let down = report.days.reduce(0) { $0 + $1.bytesDown }
+    let up = report.days.reduce(Int64(0)) { $0 + $1.bytesUp }
+    let down = report.days.reduce(Int64(0)) { $0 + $1.bytesDown }
 
     func tile(_ value: String, _ label: String) -> Node {
         .div(attributes: [.class("tile")], .strong(.text(value)), .text(label))
