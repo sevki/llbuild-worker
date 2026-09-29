@@ -3,10 +3,9 @@
 # (https://xcache.devtoo.ls), so CI is its own first user.
 #
 # Downloads the latest *released* CASPlugin - the artifact users install, not a
-# build of this checkout - and exports, for later steps, SWIFT_CACHE_FLAGS (the
-# Swift compiles) and, where the clang supports it, CCC_OVERRIDE_OPTIONS (the C
-# compiles, which every `clang` the build runs picks up by itself). Use
-# SWIFT_CACHE_FLAGS like:
+# build of this checkout - and exports SWIFT_CACHE_FLAGS for later steps (the
+# Swift compiles; C compiles are an experiment, see the end of this file). Use
+# it like:
 #
 #   swift test ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 #   swift package worker-build ... -- ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
@@ -69,11 +68,23 @@ echo "Compiling Swift through $remote with $dir/$lib"
 # every `clang` executable the build runs and never reaches the importer,
 # which uses clang as a library. Each `+word` appends one argument.
 #
+# OFF unless LLBUILD_CAS_CACHE_C=1. Because the override applies to every clang
+# the build runs, each kind of invocation is a way to break it, and CI found
+# two the probe below did not: on Linux `-fdepscan` fails to spawn for BoringSSL's
+# assembly (.S) files ("clang: error: unable to execute command: posix_spawn
+# failed"), and on macOS module builds fail (see the probe). A targeted
+# mechanism that only touches C compile jobs is needed before this is a default.
+if [ "${LLBUILD_CAS_CACHE_C:-}" != 1 ]; then
+    echo "C compiles run without the cache (LLBUILD_CAS_CACHE_C=1 tries it)"
+    exit 0
+fi
+
 # Not every clang takes these options (an unknown one fails the build), so
 # compile a one-line file with them first and only export them if that clang
 # answers with a compile-job-cache remark, proving the options were applied
 # and understood. This is the same check on Linux and macOS.
 clang_options=(
+    +-fno-modules
     +-fdepscan
     +-Rcompile-job-cache
     +-Xclang +-fcache-compile-job
@@ -81,6 +92,9 @@ clang_options=(
     +-Xclang +-fcas-plugin-path +-Xclang "+$dir/$lib"
     +-Xclang +-fcas-plugin-option +-Xclang "+remote-url=$remote"
 )
+# A leading `#` keeps clang from echoing the edit list to stderr on every
+# invocation (it would, and SwiftPM turns that into a warning per package).
+override="#${clang_options[*]}"
 
 # The plugin links the Swift runtime (libswiftDistributed.so, ...). swift-frontend
 # finds it through its own search path, but a bare `clang` does not, so on Linux
@@ -94,17 +108,28 @@ if [ "$(uname -s)" = Linux ]; then
     fi
 fi
 
+# SwiftPM compiles C targets with -fmodules, and clang's compile cache cannot
+# do that: a file that includes <stdbool.h> makes clang build the
+# _Builtin_stdbool module, which aborts clang on Linux ("unexpected call to
+# lookupModuleOutput") and fails Apple's ("caching backend error: cached output
+# file has unknown path ...ModuleCache/..._Builtin_stdbool.pcm"), while a plain
+# file with no includes compiles through the cache fine. So the override starts
+# with -fno-modules, which comes after SwiftPM's -fmodules and wins; the C
+# targets here are plain C, and the object file does not depend on modules. The
+# probe passes -fmodules itself to check that this really overrides it.
 probe="$RUNNER_TEMP/clang-probe"
 mkdir -p "$probe"
-printf 'int probe(void) { return 0; }\n' > "$probe/probe.c"
-if output="$(LD_LIBRARY_PATH="$library_path" CCC_OVERRIDE_OPTIONS="${clang_options[*]}" \
-        clang -c "$probe/probe.c" -o "$probe/probe.o" 2>&1)" \
+printf '#include <stdbool.h>\nbool probe(void) { return true; }\n' > "$probe/probe.c"
+if output="$(LD_LIBRARY_PATH="$library_path" CCC_OVERRIDE_OPTIONS="$override" \
+        clang -c "$probe/probe.c" -o "$probe/probe.o" \
+        -fmodules -fmodules-cache-path="$probe/modules" 2>&1)" \
         && grep -q "compile job cache" <<<"$output"; then
     {
-        echo "CCC_OVERRIDE_OPTIONS=${clang_options[*]}"
+        echo "CCC_OVERRIDE_OPTIONS=$override"
         [ -z "$library_path" ] || echo "LD_LIBRARY_PATH=$library_path"
     } >> "$GITHUB_ENV"
     echo "Compiling C through the same cache"
 else
-    echo "::notice::This clang did not take the compile-cache options, so C compiles run without the cache: ${output:-no output}"
+    # First line only: a clang that aborts prints a whole backtrace.
+    echo "::notice::This clang did not take the compile-cache options, so C compiles run without the cache: $(head -n 1 <<<"${output:-no output}")"
 fi
