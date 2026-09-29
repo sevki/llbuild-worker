@@ -1,5 +1,7 @@
+import CASClient
 import CASProtocol
 import Foundation
+import WorkerKitDistributed
 import XCTest
 
 final class CASProtocolTests: XCTestCase {
@@ -95,4 +97,60 @@ final class CASChunkingTests: XCTestCase {
         truncated.removeLast()
         XCTAssertNil(CASChunking.size(ofManifestData: truncated))
     }
+
+    // MARK: Authentication
+
+    func testTokenInTheQueryIsPercentDecoded() {
+        // URLQueryItem may escape the padding of a base64 token.
+        XCTAssertEqual(presentedToken(url: "https://w/__rpc?token=abc%3D", authorization: nil), "abc=")
+        XCTAssertEqual(presentedToken(url: "https://w/__rpc?x=1&token=abc=&y=2", authorization: nil), "abc=")
+        XCTAssertEqual(presentedToken(url: "https://w/__rpc?token=a%2Fb%2Bc", authorization: nil), "a/b+c")
+        XCTAssertEqual(presentedToken(url: "https://w/__rpc?token=plain#frag", authorization: nil), "plain")
+        XCTAssertNil(presentedToken(url: "https://w/__rpc", authorization: nil))
+    }
+
+    func testBearerTokenWinsAndClientEncodingAuthenticates() throws {
+        XCTAssertEqual(presentedToken(url: "https://w/__rpc?token=q", authorization: "Bearer h"), "h")
+        // What the client really sends must compare equal to the configured token.
+        let token = "dGVzdC10b2tlbg=="
+        let url = CASClient.authenticated(
+            try XCTUnwrap(URL(string: "https://worker.example/__rpc")),
+            environment: ["LLBUILD_CAS_TOKEN": token], tokenPath: "/nonexistent")
+        let presented = try XCTUnwrap(presentedToken(url: url.absoluteString, authorization: nil))
+        XCTAssertTrue(constantTimeEqual(presented, token))
+        XCTAssertFalse(constantTimeEqual(presented, token + "x"))
+    }
+
+    // MARK: Action cache
+
+    func testActionPutRefusesAValueThatIsNotStored() async throws {
+        let backend = RecordingBackend()
+        let service = CASService(actorSystem: WorkersActorSystem(worker: URL(string: "ws://127.0.0.1:1")!), backend: backend)
+        let key = String(repeating: "a", count: 64), value = String(repeating: "b", count: 64)
+
+        do {
+            try await service.actionPut(key: key, value: value)
+            XCTFail("an action pointing at a missing object was accepted")
+        } catch let error as CASServiceError {
+            XCTAssertEqual(error, .missingObject(value))
+        }
+        XCTAssertTrue(backend.actions.isEmpty, "the key must stay free so a good value can still be written")
+
+        backend.stored.insert(value)
+        try await service.actionPut(key: key, value: value)
+        XCTAssertEqual(backend.actions[key], value)
+    }
+}
+
+private final class RecordingBackend: CASBackend, @unchecked Sendable {
+    var stored = Set<String>()
+    var actions = [String: String]()
+
+    func contains(digest: String) async throws -> Bool { stored.contains(digest) }
+    func put(digest: String, refs: [String], data: String) async throws {}
+    func get(digest: String) async throws -> CASObjectPayload? { nil }
+    func actionGet(key: String) async throws -> String? { actions[key] }
+    func actionPut(key: String, value: String) async throws { actions[key] = value }
+    func putLarge(digest: String, refs: [String], manifest: String) async throws {}
+    func getLarge(digest: String) async throws -> CASLargeObject? { nil }
 }

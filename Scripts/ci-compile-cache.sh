@@ -115,9 +115,14 @@ done
 [ "\$compile" = 1 ] || exec "$clang" "\$@"
 # Module maps make the include tree name modules, which -fno-modules cannot
 # load back ("failed to find module 'CNIOBoringSSL'"): keep includes textual.
+# A few of these also come with the operand as the next argument, which has to
+# go with the option.
+skip=0
 for arg; do
     shift
+    if [ "\$skip" = 1 ]; then skip=0; continue; fi
     case "\$arg" in
+        -fmodules-user-build-path|-fmodule-map-file|-fmodule-name) skip=1 ;;
         -fmodules|-fmodules-*|-fmodule-map-file=*|-fmodule-name=*|-fbuiltin-module-map|-fimplicit-module-maps) ;;
         *) set -- "\$@" "\$arg" ;;
     esac

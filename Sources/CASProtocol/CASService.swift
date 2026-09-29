@@ -57,6 +57,7 @@ public enum CASServiceError: Error, Codable, Equatable, CustomStringConvertible 
     case invalidManifest(String)
     case invalidDigest(String)
     case invalidData
+    case missingObject(String)
     case storageNotConfigured
 
     public var description: String {
@@ -69,6 +70,8 @@ public enum CASServiceError: Error, Codable, Equatable, CustomStringConvertible 
             return "invalid digest: \(value)"
         case .invalidData:
             return "object data is not valid base64"
+        case .missingObject(let digest):
+            return "object \(digest) is not stored"
         case .storageNotConfigured:
             return "this CAS service has no storage backend"
         }
@@ -180,8 +183,16 @@ public distributed actor CASService {
     }
 
     public distributed func actionPut(key: String, value: String) async throws {
-        try await requireBackend().actionPut(
-            key: try Self.validated(key), value: try Self.validated(value))
+        let backend = try requireBackend()
+        let key = try Self.validated(key), value = try Self.validated(value)
+        // An action key is immutable once written, so it must never point at an
+        // object the store does not have: that would leave every later lookup
+        // dangling and the key impossible to repair. Clients upload the value
+        // (and what it references) before the action.
+        guard try await backend.contains(digest: value) else {
+            throw CASServiceError.missingObject(value)
+        }
+        try await backend.actionPut(key: key, value: value)
     }
 
     private func requireBackend() throws -> any CASBackend {

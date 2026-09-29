@@ -75,7 +75,10 @@ let package = Package(
                 .target(name: "CASWorker", condition: .when(platforms: [.wasi]))
             ]
         ),
-        .testTarget(name: "CASProtocolTests", dependencies: ["CASProtocol"]),
+        .testTarget(name: "CASProtocolTests", dependencies: [
+            "CASProtocol", "CASClient",
+            .product(name: "WorkerKitDistributed", package: "WorkerKit"),
+        ]),
         .testTarget(name: "CASPluginTests", dependencies: ["CASPlugin", "CASProtocol"]),
     ]
 )
