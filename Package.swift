@@ -20,6 +20,7 @@ let package = Package(
             revision: "564ada3494f7a24df5b232831907c1fce3704de2"
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
+        .package(url: "https://github.com/pointfreeco/swift-html", from: "0.5.0"),
     ],
     targets: [
         .target(
@@ -55,7 +56,8 @@ let package = Package(
                 "CASProtocol",
                 .product(name: "WorkerKit", package: "WorkerKit", condition: .when(platforms: [.wasi])),
                 .product(name: "WorkerKitDistributed", package: "WorkerKit"),
-                .product(name: "JavaScriptKit", package: "JavaScriptKit", condition: .when(platforms: [.wasi]))
+                .product(name: "JavaScriptKit", package: "JavaScriptKit", condition: .when(platforms: [.wasi])),
+                .product(name: "Html", package: "swift-html")
             ]
         ),
         .executableTarget(

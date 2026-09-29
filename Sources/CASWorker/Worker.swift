@@ -7,6 +7,14 @@ import WorkerKit
 /// per-shard Durable Objects.
 @Event(.fetch)
 func fetch(req: Request, env: Env, ctx: Context) async throws -> Response {
+    if req.path == "/setup" {
+        return .text(setupScript, status: 200)
+    }
+
+    if req.path == "/" {
+        return indexResponse()
+    }
+
     guard req.path == WorkersActorSystem.gatewayPath else {
         return .error("Not Found", 404)
     }
