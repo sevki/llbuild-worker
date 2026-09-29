@@ -4,7 +4,7 @@ A remote content-addressable store on Cloudflare Workers, written in Swift with 
 
 Everything in the service is a distributed actor:
 
-- **`CASService`** is the stateless front-end. Native clients (`casctl`, the swiftc plugin) resolve it through `WorkersActorSystem`; it is hosted by a gateway Durable Object, one per WebSocket connection.
+- **`CASService`** is the stateless front-end. Native clients (`castool`, the swiftc plugin) resolve it through `WorkersActorSystem`; it is hosted by a gateway Durable Object, one per WebSocket connection.
 - **`CASShard`** is one actor per Durable Object, holding a slice of the objects and the action cache in that object's SQLite. A digest's first hex digit picks one of 16 shards.
 
 ```
@@ -37,13 +37,35 @@ swiftc -c main.swift -explicit-module-build -cache-compile-job \
 
 **Build the plugin in release for real use.** The debug build hashes tens of megabytes of module data unoptimized: a compile that takes about 0.3 s with `swift build -c release --product CASPlugin` takes about 10 s with the debug build.
 
-## `casctl`
+## Xcode and SwiftPM (Swift Build)
+
+Xcode's build engine, Swift Build, loads a CAS plugin from `COMPILATION_CACHE_PLUGIN_PATH` and gives it the value of `COMPILATION_CACHE_REMOTE_SERVICE_PATH` as the option `remote-service-path`. That setting is typed as a *path*, so point it at a small file containing the Worker's URL (or, with the same option, give the URL itself):
 
 ```sh
-casctl <worker-url> status              # exit 2 if the service has no storage
-casctl <worker-url> put <file>          # prints the object's digest
-casctl <worker-url> get <digest> <out>
-casctl <worker-url> has <digest>        # exit 0 if present, 1 if not
+echo https://your-worker.example.workers.dev > ~/.config/llbuild-cas-remote
+swift build -c release --product CASPlugin   # libCASPlugin.dylib on macOS, .so on Linux
+```
+
+```
+COMPILATION_CACHE_ENABLE_CACHING = YES
+SWIFT_ENABLE_EXPLICIT_MODULES = YES
+SWIFT_USE_INTEGRATED_DRIVER = YES
+COMPILATION_CACHE_ENABLE_PLUGIN = YES
+COMPILATION_CACHE_PLUGIN_PATH = /path/to/libCASPlugin.dylib
+COMPILATION_CACHE_REMOTE_SERVICE_PATH = /Users/you/.config/llbuild-cas-remote
+```
+
+The plugin also reads `LLBUILD_CAS_REMOTE_URL`, and `remote-url` still works for `swiftc -cas-plugin-option`.
+
+**What was verified, and what was not.** `Scripts/test-with-swift-build.sh` runs Swift Build itself on Linux (its own tests are macOS-only, so this uses a test written for the purpose): one build populates the Worker, and a second build with a different empty local CAS gets `Cache hit` from it. That is the same build engine Xcode uses, with the same SwiftScan-driven lookups and async plugin calls, and it is what found and fixed a thread-pool starvation bug that `swiftc` alone could not show. It has **not** been run in Xcode on macOS. The likeliest problem there is code signing: Apple-signed Xcode processes may refuse to load an unsigned plugin, so sign it and expect to check that first. If macOS blocks a third-party plugin, the alternative is a local gRPC service on a Unix socket, which is the interface Apple's own plugin uses for remote caches.
+
+## `castool`
+
+```sh
+castool <worker-url> status              # exit 2 if the service has no storage
+castool <worker-url> put <file>          # prints the object's digest
+castool <worker-url> get <digest> <out>
+castool <worker-url> has <digest>        # exit 0 if present, 1 if not
 ```
 
 ## Build and test
@@ -56,7 +78,8 @@ Scripts/test-compilation-cache.sh   # swiftc miss/hit/replay through the plugin,
 
 swift package --allow-writing-to-package-directory worker-build --product CASWorkerWasm
 npm ci
-Scripts/test-remote-cache.sh        # Worker in workerd + casctl + two developers sharing a cache
+Scripts/test-remote-cache.sh        # Worker in workerd + castool + two developers sharing a cache
+Scripts/test-with-swift-build.sh    # optional, slow: Xcode's build engine against the plugin
 ```
 
 `node Scripts/serve-worker.mjs` serves the built Worker in a local workerd and prints its URL.

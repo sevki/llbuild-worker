@@ -1,28 +1,67 @@
 import CASClient
 import CASProtocol
+import Dispatch
 import Foundation
 
-private final class ResultBox<T: Sendable>: @unchecked Sendable {
-    var result: Result<T, Error>?
+/// Runs the remote client's work on its own threads instead of Swift's shared
+/// cooperative pool.
+///
+/// The plugin is called from threads it does not own. Swift Build calls the
+/// async entry points from cooperative-pool threads; blocking one of those
+/// while waiting on a task that itself needs a pool thread starves the pool
+/// (all threads waiting, none able to run the work). Giving the client a
+/// separate executor breaks that dependency.
+final class PluginExecutor: TaskExecutor, @unchecked Sendable {
+    let queue = DispatchQueue(
+        label: "llbuild-worker.cas.remote", qos: .userInitiated, attributes: .concurrent)
+
+    func enqueue(_ job: consuming ExecutorJob) {
+        let unowned = UnownedJob(job)
+        queue.async { unowned.runSynchronously(on: self.asUnownedTaskExecutor()) }
+    }
+}
+
+private final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    /// True for exactly one caller.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
+    }
+}
+
+private final class ValueBox<T: Sendable>: @unchecked Sendable {
+    var value: T?
+}
+
+struct RemoteUnavailable: Error, CustomStringConvertible {
+    var description: String
 }
 
 /// The shared tier behind the local store: the Worker's distributed
-/// `CASService`, called from the plugin's synchronous C entry points.
+/// `CASService`, reached from the plugin's C entry points.
 ///
-/// Remote trouble must never fail a compile, so every call returns nil on
-/// failure and the first failure switches the tier off for this process.
+/// Remote trouble must never fail a compile, so every call reports failure as
+/// a value and the first failure switches the tier off for this process.
 /// Set LLBUILD_CAS_DEBUG=1 to see what it decided.
 final class RemoteTier: @unchecked Sendable {
-    private let client: CASClient
-    private let lock = NSLock()
-    private var uploaded = Set<CASDigest>()
-    private var disabled = false
-    private let timeout: TimeInterval
-
+    static let executor = PluginExecutor()
     static let debug = ProcessInfo.processInfo.environment["LLBUILD_CAS_DEBUG"] != nil
 
-    init(url: URL, timeout: TimeInterval = 30) throws {
-        client = try CASClient(workerURL: url)
+    private let url: URL
+    private let timeout: TimeInterval
+    private let lock = NSLock()
+    private var connection: CASClient?
+    private var uploaded = Set<CASDigest>()
+    private var disabled = false
+
+    init(url: URL, timeout: TimeInterval = 30) {
+        self.url = url
         self.timeout = timeout
     }
 
@@ -46,34 +85,67 @@ final class RemoteTier: @unchecked Sendable {
         if wasEnabled { log("remote disabled: \(reason)") }
     }
 
-    /// Runs `operation` to completion on the calling thread, or returns nil.
-    private func blocking<T: Sendable>(
-        _ what: String, _ operation: @escaping @Sendable (CASClient) async throws -> T
-    ) -> T? {
-        guard isEnabled else { return nil }
-        let box = ResultBox<T>()
-        let done = DispatchSemaphore(value: 0)
-        let client = self.client
-        Task.detached {
-            do {
-                box.result = .success(try await operation(client))
-            } catch {
-                box.result = .failure(error)
+    /// Connects on first use. Only called from tasks running on `executor`,
+    /// so the connection's own tasks inherit that executor too.
+    private func client() throws -> CASClient {
+        lock.lock()
+        defer { lock.unlock() }
+        if let connection { return connection }
+        let created = try CASClient(workerURL: url)
+        connection = created
+        return created
+    }
+
+    /// Runs `operation` on the plugin's executor and reports the outcome to
+    /// `completion` exactly once, from whichever thread finishes first:
+    /// the operation, or a timeout.
+    func run<T: Sendable>(
+        _ what: String, timeout limit: TimeInterval? = nil,
+        _ operation: @escaping @Sendable (CASClient) async throws -> T,
+        completion: @escaping @Sendable (Result<T, Error>) -> Void
+    ) {
+        guard isEnabled else {
+            completion(.failure(RemoteUnavailable(description: "remote is disabled")))
+            return
+        }
+        let once = Once()
+        let seconds = limit ?? timeout
+        Self.executor.queue.asyncAfter(deadline: .now() + seconds) { [self] in
+            if once.claim() {
+                disable("\(what) timed out after \(Int(seconds))s")
+                completion(.failure(RemoteUnavailable(description: "\(what) timed out")))
             }
-            done.signal()
         }
-        guard done.wait(timeout: .now() + timeout) == .success else {
-            disable("\(what) timed out after \(Int(timeout))s")
-            return nil
-        }
-        switch box.result! {
-        case .success(let value):
-            return value
-        case .failure(let error):
-            disable("\(what) failed: \(error)")
-            return nil
+        Task(executorPreference: Self.executor) { [self] in
+            do {
+                let value = try await operation(try client())
+                if once.claim() { completion(.success(value)) }
+            } catch {
+                if once.claim() {
+                    disable("\(what) failed: \(error)")
+                    completion(.failure(error))
+                }
+            }
         }
     }
+
+    /// The blocking form, for the plugin's synchronous entry points. Nil on
+    /// any failure.
+    func blocking<T: Sendable>(
+        _ what: String, timeout limit: TimeInterval? = nil,
+        _ operation: @escaping @Sendable (CASClient) async throws -> T
+    ) -> T? {
+        let box = ValueBox<T>()
+        let done = DispatchSemaphore(value: 0)
+        run(what, timeout: limit, operation) { result in
+            if case .success(let value) = result { box.value = value }
+            done.signal()
+        }
+        done.wait()
+        return box.value
+    }
+
+    // MARK: - Objects and actions
 
     func contains(_ digest: CASDigest) -> Bool? {
         blocking("contains") { try await $0.contains(digest) }
@@ -84,48 +156,96 @@ final class RemoteTier: @unchecked Sendable {
         blocking("get") { try await $0.get(digest) }
     }
 
+    func getAsync(_ digest: CASDigest, completion: @escaping @Sendable (Result<CASBlob?, Error>) -> Void) {
+        run("get", { try await $0.get(digest) }, completion: completion)
+    }
+
     func actionGet(_ key: CASDigest) -> CASDigest?? {
         blocking("actionGet") { try await $0.actionGet(key) }
     }
 
-    func actionPut(_ key: CASDigest, value: CASDigest) -> Bool {
-        blocking("actionPut") { try await $0.actionPut(key, value: value) } != nil
+    func actionGetAsync(
+        _ key: CASDigest, completion: @escaping @Sendable (Result<CASDigest?, Error>) -> Void
+    ) {
+        run("actionGet", { try await $0.actionGet(key) }, completion: completion)
     }
 
-    /// Uploads `digest` and everything it references, children first, so the
-    /// remote never holds an object whose references are missing. False if
-    /// any part cannot be uploaded (absent locally, or over the size limit).
-    func ensureUploaded(_ digest: CASDigest, from store: LocalStore) -> Bool {
-        lock.lock()
-        let already = uploaded.contains(digest)
-        lock.unlock()
-        if already { return true }
+    /// Uploads `value` and everything it references (children first, so the
+    /// remote never holds an object whose references are missing), then
+    /// records the action. The result is true only if all of it was shared;
+    /// otherwise the action stays local.
+    private static let publishTimeout: TimeInterval = 300
+
+    func publish(key: CASDigest, value: CASDigest, from store: LocalStore) -> Bool {
+        blocking("publish", timeout: Self.publishTimeout) {
+            try await self.publishOperation(key: key, value: value, store: store, client: $0)
+        } ?? false
+    }
+
+    func publishAsync(
+        key: CASDigest, value: CASDigest, from store: LocalStore,
+        completion: @escaping @Sendable (Bool) -> Void
+    ) {
+        run("publish", timeout: Self.publishTimeout, {
+            try await self.publishOperation(key: key, value: value, store: store, client: $0)
+        }) { completion((try? $0.get()) ?? false) }
+    }
+
+    private func publishOperation(
+        key: CASDigest, value: CASDigest, store: LocalStore, client: CASClient
+    ) async throws -> Bool {
+        guard try await ensureUploaded(value, from: store, client: client) else {
+            log("kept action \(key.hex) local")
+            return false
+        }
+        try await client.actionPut(key, value: value)
+        log("shared action \(key.hex)")
+        return true
+    }
+
+    private func ensureUploaded(_ digest: CASDigest, from store: LocalStore, client: CASClient) async throws -> Bool {
+        if hasUploaded(digest) { return true }
 
         guard let blob = try? store.get(digest) else {
             log("cannot upload \(digest.hex): not in the local store")
             return false
         }
-        for ref in blob.refs where !ensureUploaded(ref, from: store) {
-            return false
+        for ref in blob.refs {
+            guard try await ensureUploaded(ref, from: store, client: client) else { return false }
         }
         guard blob.data.count <= CASLimits.maxLargeObjectBytes else {
             log("not uploading \(digest.hex): \(blob.data.count) bytes is over the \(CASLimits.maxLargeObjectBytes) byte limit")
             return false
         }
-        if contains(digest) != true {
-            guard blocking("put", { try await $0.put(blob) }) != nil else { return false }
+        if try await !client.contains(digest) {
+            try await client.put(blob)
         }
-        lock.lock()
-        uploaded.insert(digest)
-        lock.unlock()
+        markUploaded(digest)
         return true
     }
 
+    // Synchronous helpers: an NSLock may not be held across, or taken from,
+    // async code directly.
+    private func hasUploaded(_ digest: CASDigest) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return uploaded.contains(digest)
+    }
+
+    private func markUploaded(_ digest: CASDigest) {
+        lock.lock()
+        defer { lock.unlock() }
+        uploaded.insert(digest)
+    }
+
     func close() {
-        let client = self.client
+        lock.lock()
+        let connection = self.connection
+        lock.unlock()
+        guard let connection else { return }
         let done = DispatchSemaphore(value: 0)
-        Task.detached {
-            await client.close()
+        Task(executorPreference: Self.executor) {
+            await connection.close()
             done.signal()
         }
         _ = done.wait(timeout: .now() + 5)

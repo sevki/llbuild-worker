@@ -4,7 +4,7 @@ import Foundation
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
-    usage: casctl <worker-url> <command>
+    usage: castool <worker-url> <command>
 
     commands:
       status                    print the service status (exit 2 if it has no storage)
@@ -17,7 +17,7 @@ func usage() -> Never {
 }
 
 func fail(_ message: String, code: Int32 = 1) -> Never {
-    FileHandle.standardError.write(Data("casctl: \(message)\n".utf8))
+    FileHandle.standardError.write(Data("castool: \(message)\n".utf8))
     exit(code)
 }
 
@@ -60,7 +60,7 @@ func run() async throws -> Int32 {
 
     case ("get", 5):
         guard let blob = try await client.get(digest(arguments[3])) else {
-            FileHandle.standardError.write(Data("casctl: not found\n".utf8))
+            FileHandle.standardError.write(Data("castool: not found\n".utf8))
             return 1
         }
         try Data(blob.data).write(to: URL(fileURLWithPath: arguments[4]))
@@ -78,7 +78,7 @@ var status: Int32
 do {
     status = try await run()
 } catch {
-    FileHandle.standardError.write(Data("casctl: \(error)\n".utf8))
+    FileHandle.standardError.write(Data("castool: \(error)\n".utf8))
     status = 1
 }
 await client.close()

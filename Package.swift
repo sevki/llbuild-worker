@@ -6,7 +6,7 @@ let package = Package(
     name: "llbuild-worker",
     products: [
         .library(name: "CASProtocol", targets: ["CASProtocol"]),
-        .executable(name: "casctl", targets: ["casctl"]),
+        .executable(name: "castool", targets: ["castool"]),
         // Loaded by swift-frontend via -cas-plugin-path for compilation caching.
         .library(name: "CASPlugin", type: .dynamic, targets: ["CASPlugin"]),
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
@@ -28,7 +28,7 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "casctl",
+            name: "castool",
             dependencies: [
                 "CASProtocol",
                 "CASClient",
@@ -36,7 +36,7 @@ let package = Package(
             ]
         ),
         .target(name: "CLLCAS"),
-        // Native-only client for the CAS service; shared by casctl and the plugin.
+        // Native-only client for the CAS service; shared by castool and the plugin.
         .target(
             name: "CASClient",
             dependencies: [

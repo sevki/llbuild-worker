@@ -122,7 +122,7 @@ public protocol CASBackend: Sendable {
 }
 
 /// The llbuild-worker CAS: the distributed actor a Worker hosts and a native
-/// client (`casctl`, the swiftc plugin) resolves through `WorkersActorSystem`.
+/// client (`castool`, the swiftc plugin) resolves through `WorkersActorSystem`.
 ///
 /// It holds no state. Hosted in a Worker it is given a `backend`; a client
 /// resolving it remotely never runs these method bodies.

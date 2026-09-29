@@ -23,4 +23,4 @@ Before implementing llbuild2's `putKnown`, pin llbuild2 and add identity conform
 
 ## CI
 
-The workflow has separate native and Worker Wasm jobs. The native job runs the tests and `Scripts/test-compilation-cache.sh` (real swiftc miss/hit/replay through the plugin). The Worker job installs the matching Swift Wasm SDK, builds the bundle, and runs `Scripts/test-remote-cache.sh`, which serves it in workerd and exercises `casctl` and two developers sharing a compile cache.
+The workflow has separate native and Worker Wasm jobs. The native job runs the tests and `Scripts/test-compilation-cache.sh` (real swiftc miss/hit/replay through the plugin). The Worker job installs the matching Swift Wasm SDK, builds the bundle, and runs `Scripts/test-remote-cache.sh`, which serves it in workerd and exercises `castool` and two developers sharing a compile cache.

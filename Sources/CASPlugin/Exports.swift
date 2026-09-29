@@ -100,17 +100,13 @@ public func llcas_cas_create(_ opts: llcas_cas_options_t?, _ error: ErrorOut) ->
         return nil
     }
     var remote: RemoteTier?
-    if let value = configured.options["remote-url"] {
-        guard let url = URL(string: value), ["http", "https"].contains(url.scheme ?? "") else {
-            setError(error, "remote-url must be an http(s) URL: \(value)")
-            return nil
+    do {
+        if let url = try RemoteConfig.resolve(options: configured.options) {
+            remote = RemoteTier(url: url)
         }
-        do {
-            remote = try RemoteTier(url: url)
-        } catch let failure {
-            setError(error, "cannot set up the remote CAS at \(value): \(failure)")
-            return nil
-        }
+    } catch let failure {
+        setError(error, "cannot set up the remote CAS: \(failure)")
+        return nil
     }
     return OpaquePointer(Unmanaged.passRetained(Plugin(store: store, remote: remote)).toOpaque())
 }
@@ -260,8 +256,44 @@ public func llcas_cas_load_object_async(
     _ callback: llcas_cas_load_object_cb?, _ cancel: UnsafeMutablePointer<llcas_cancellable_t?>?
 ) {
     cancel?.pointee = nil
-    let loaded = load(plugin(cas), id)
-    callback?(context, loaded.result, loaded.object, loaded.message.flatMap { strdup($0) })
+    let instance = plugin(cas)
+    let none = llcas_loaded_object_t(opaque: 0)
+    guard let digest = instance.digest(of: id) else {
+        callback?(context, LLCAS_LOOKUP_RESULT_ERROR, none, strdup("unknown object id"))
+        return
+    }
+    // Answer from the local store on this thread; only a miss goes remote, and
+    // that must not block the caller (Swift Build calls this from pool threads).
+    do {
+        if let stored = try instance.store.get(digest) {
+            callback?(context, LLCAS_LOOKUP_RESULT_SUCCESS, instance.addLoaded(stored), nil)
+            return
+        }
+    } catch let failure {
+        callback?(context, LLCAS_LOOKUP_RESULT_ERROR, none, strdup("\(failure)"))
+        return
+    }
+    guard let remote = instance.remote, remote.isEnabled else {
+        callback?(context, LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
+        return
+    }
+    nonisolated(unsafe) let context = context
+    nonisolated(unsafe) let callback = callback
+    remote.getAsync(digest) { result in
+        switch result {
+        case .success(.some(let blob)):
+            do {
+                try instance.store.put(blob, digest: digest)
+                remote.log("fetched \(digest.hex) (\(blob.data.count) bytes)")
+                callback?(context, LLCAS_LOOKUP_RESULT_SUCCESS, instance.addLoaded(blob), nil)
+            } catch let failure {
+                callback?(context, LLCAS_LOOKUP_RESULT_ERROR, none, strdup("\(failure)"))
+            }
+        case .success(nil), .failure:
+            // A remote failure is a miss, never an error the build must handle.
+            callback?(context, LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
+        }
+    }
 }
 
 @_cdecl("llcas_cas_store_object")
@@ -401,30 +433,48 @@ public func llcas_actioncache_get_for_digest_async(
     _ callback: llcas_actioncache_get_cb?, _ cancel: UnsafeMutablePointer<llcas_cancellable_t?>?
 ) {
     cancel?.pointee = nil
-    let found = actionGet(plugin(cas), key, globally: globally)
-    callback?(context, found.result, found.value, found.message.flatMap { strdup($0) })
-}
-
-private func actionPut(
-    _ instance: Plugin, _ key: llcas_digest_t, _ value: llcas_objectid_t, globally: Bool
-) -> String? {
-    guard let valueDigest = instance.digest(of: value) else { return "unknown object id" }
+    let instance = plugin(cas)
+    let none = llcas_objectid_t(opaque: 0)
     let keyDigest = digest(key)
     do {
-        try instance.store.actionPut(keyDigest, value: valueDigest)
-        // Share the result only if all of it can be shared: the action entry
-        // must never point at an object another machine cannot fetch.
-        if globally, let remote = instance.remote, remote.isEnabled {
-            if remote.ensureUploaded(valueDigest, from: instance.store),
-               remote.actionPut(keyDigest, value: valueDigest) {
-                remote.log("shared action \(keyDigest.hex)")
-            } else {
-                remote.log("kept action \(keyDigest.hex) local")
-            }
+        if let value = try instance.store.actionGet(keyDigest) {
+            callback?(context, LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
+            return
         }
-        return nil
+    } catch let failure {
+        callback?(context, LLCAS_LOOKUP_RESULT_ERROR, none, strdup("\(failure)"))
+        return
+    }
+    guard globally, let remote = instance.remote, remote.isEnabled else {
+        callback?(context, LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
+        return
+    }
+    nonisolated(unsafe) let context = context
+    nonisolated(unsafe) let callback = callback
+    remote.actionGetAsync(keyDigest) { result in
+        if case .success(.some(let value)) = result {
+            try? instance.store.actionPut(keyDigest, value: value)
+            remote.log("action \(keyDigest.hex) hit remotely")
+            callback?(context, LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
+        } else {
+            callback?(context, LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
+        }
+    }
+}
+
+/// Records the action locally; returns an error message on failure. The
+/// action is shared only if all of it can be shared, so the shared cache never
+/// holds an entry that points at an object another machine cannot fetch.
+private func actionPutLocally(
+    _ instance: Plugin, _ key: llcas_digest_t, _ value: llcas_objectid_t
+) -> (message: String?, key: CASDigest, value: CASDigest?) {
+    let keyDigest = digest(key)
+    guard let valueDigest = instance.digest(of: value) else { return ("unknown object id", keyDigest, nil) }
+    do {
+        try instance.store.actionPut(keyDigest, value: valueDigest)
+        return (nil, keyDigest, valueDigest)
     } catch {
-        return "\(error)"
+        return ("\(error)", keyDigest, valueDigest)
     }
 }
 
@@ -433,9 +483,14 @@ public func llcas_actioncache_put_for_digest(
     _ cas: llcas_cas_t?, _ key: llcas_digest_t, _ value: llcas_objectid_t, _ globally: Bool,
     _ error: ErrorOut
 ) -> Bool {
-    if let message = actionPut(plugin(cas), key, value, globally: globally) {
+    let instance = plugin(cas)
+    let local = actionPutLocally(instance, key, value)
+    if let message = local.message {
         setError(error, message)
         return true
+    }
+    if globally, let remote = instance.remote, remote.isEnabled, let valueDigest = local.value {
+        _ = remote.publish(key: local.key, value: valueDigest, from: instance.store)
     }
     return false
 }
@@ -447,6 +502,21 @@ public func llcas_actioncache_put_for_digest_async(
     _ cancel: UnsafeMutablePointer<llcas_cancellable_t?>?
 ) {
     cancel?.pointee = nil
-    let message = actionPut(plugin(cas), key, value, globally: globally)
-    callback?(context, message != nil, message.flatMap { strdup($0) })
+    let instance = plugin(cas)
+    let local = actionPutLocally(instance, key, value)
+    if let message = local.message {
+        callback?(context, true, strdup(message))
+        return
+    }
+    guard globally, let remote = instance.remote, remote.isEnabled, let valueDigest = local.value else {
+        callback?(context, false, nil)
+        return
+    }
+    // Report completion only after the upload attempt, so a process that exits
+    // as soon as its last callback fires has not lost the publish.
+    nonisolated(unsafe) let context = context
+    nonisolated(unsafe) let callback = callback
+    remote.publishAsync(key: local.key, value: valueDigest, from: instance.store) { _ in
+        callback?(context, false, nil)
+    }
 }
