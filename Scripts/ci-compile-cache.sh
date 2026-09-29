@@ -3,12 +3,16 @@
 # (https://xcache.devtoo.ls), so CI is its own first user.
 #
 # Downloads the latest *released* CASPlugin - the artifact users install, not a
-# build of this checkout - and exports SWIFT_CACHE_FLAGS for later steps (the
-# Swift compiles; C compiles are an experiment, see the end of this file). Use
-# it like:
+# build of this checkout - and exports, for later steps, SWIFT_CACHE_FLAGS (the
+# Swift compiles) and CC (a wrapper that sends the C and C++ compiles through
+# the same cache, see below). Use SWIFT_CACHE_FLAGS like:
 #
-#   swift test ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
+#   swift build --product X ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 #   swift package worker-build ... -- ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
+#
+# Not for `swift test`: a cache hit on a test target fails the build, because
+# SwiftPM discovers tests through the index store and a replayed compile does
+# not recreate it.
 #
 # (`--build-system native` is the backend the flags were verified with.) The
 # job must have the Worker's access token in LLBUILD_CAS_TOKEN.
