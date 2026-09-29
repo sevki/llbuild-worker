@@ -154,3 +154,27 @@ private final class RecordingBackend: CASBackend, @unchecked Sendable {
     func putLarge(digest: String, refs: [String], manifest: String) async throws {}
     func getLarge(digest: String) async throws -> CASLargeObject? { nil }
 }
+
+final class ByteSizeTests: XCTestCase {
+    func testUsesSIUnitsNotBinary() {
+        XCTAssertEqual(ByteSize.unitSymbols, ["B", "kB", "MB", "GB", "TB"])
+        XCTAssertEqual(ByteSize.format(0), "0 B")
+        XCTAssertEqual(ByteSize.format(999), "999 B")
+        XCTAssertEqual(ByteSize.format(1000), "1.0 kB")
+        XCTAssertEqual(ByteSize.format(1024), "1.0 kB", "1024 bytes is 1.0 kB in SI, not 1 KiB")
+        XCTAssertEqual(ByteSize.format(1_500), "1.5 kB")
+        XCTAssertEqual(ByteSize.format(512 * 1024), "524.3 kB")
+        XCTAssertEqual(ByteSize.format(1_000_000), "1.0 MB")
+        XCTAssertEqual(ByteSize.format(64 * 1024 * 1024), "67.1 MB")
+        XCTAssertEqual(ByteSize.format(2_500_000_000), "2.5 GB")
+        XCTAssertEqual(ByteSize.format(3_000_000_000_000), "3.0 TB")
+    }
+
+    func testRoundingNeverShowsAThousandOfTheSmallerUnit() {
+        XCTAssertEqual(ByteSize.format(999_949), "999.9 kB")
+        XCTAssertEqual(ByteSize.format(999_950), "1.0 MB")
+        XCTAssertEqual(ByteSize.format(999_999_999), "1.0 GB")
+        // Beyond the largest prefix it keeps counting in TB.
+        XCTAssertEqual(ByteSize.format(1_500_000_000_000_000), "1500.0 TB")
+    }
+}

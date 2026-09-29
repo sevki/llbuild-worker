@@ -299,17 +299,7 @@ func isoDate(day: Int) -> String {
     return "\(pad(year, 4))-\(pad(month, 2))-\(pad(dayOfMonth, 2))"
 }
 
-func formatBytes(_ bytes: Int) -> String {
-    let units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    var value = Double(bytes)
-    var unit = 0
-    while value >= 1024, unit < units.count - 1 {
-        value /= 1024
-        unit += 1
-    }
-    let tenths = Int((value * 10).rounded())
-    return unit == 0 ? "\(bytes) B" : "\(tenths / 10).\(tenths % 10) \(units[unit])"
-}
+func formatBytes(_ bytes: Int) -> String { ByteSize.format(bytes) }
 
 func formatPercent(_ part: Int, of total: Int) -> String {
     total == 0 ? "n/a" : "\(Int((Double(part) / Double(total) * 100).rounded()))%"
@@ -370,11 +360,14 @@ private let statsScript: StaticString = """
     (function () {
       var report = null;
       var fields = ['hits', 'misses', 'actionsPut', 'objectsPut', 'objectsGot', 'bytesUp', 'bytesDown', 'connections'];
+      // SI units, powers of 1000; the symbols are the server's (data-byte-units).
+      var units = document.getElementById('live-tiles').getAttribute('data-byte-units').split(',');
       function bytes(n) {
-        var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'], v = n, u = 0;
-        while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
-        if (u === 0) return n + ' B';
+        if (n < 1000) return n + ' B';
+        var u = 0, v = n;
+        while (v >= 1000 && u < units.length - 1) { v /= 1000; u++; }
         var t = Math.round(v * 10);
+        if (t >= 10000 && u < units.length - 1) { v /= 1000; u++; t = Math.round(v * 10); }
         return Math.floor(t / 10) + '.' + (t % 10) + ' ' + units[u];
       }
       function pct(part, total) { return total === 0 ? 'n/a' : Math.round(part / total * 100) + '%'; }
@@ -497,7 +490,7 @@ private func statsDocument(_ report: StatsReport) -> Node {
 
                 .p(attributes: [.id("live-status")], .text("Not live: JavaScript is off.")),
 
-                .div(attributes: [.class("tiles"), .id("live-tiles")],
+                .div(attributes: [.class("tiles"), .id("live-tiles"), .data("byte-units", ByteSize.unitSymbols.joined(separator: ","))],
                     tile(formatPercent(hits, of: hits + misses), "cache hit rate"),
                     tile(String(hits + misses), "cache lookups"),
                     tile(String(connections), "client connections"),

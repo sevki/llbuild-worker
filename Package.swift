@@ -31,12 +31,15 @@ let package = Package(
         ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
         .package(url: "https://github.com/pointfreeco/swift-html", from: "0.5.0"),
+        // SI prefixes (symbol and power of ten) for the sizes the stats page shows.
+        .package(url: "https://github.com/moriturus/SystemeInternational.git", from: "1.0.1"),
     ],
     targets: [
         .target(
             name: "CASProtocol",
             dependencies: [
-                .product(name: "WorkerKitDistributed", package: "WorkerKit")
+                .product(name: "WorkerKitDistributed", package: "WorkerKit"),
+                .product(name: "PrefixesDuSI", package: "SystemeInternational"),
             ]
         ),
         .executableTarget(

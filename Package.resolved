@@ -1,5 +1,5 @@
 {
-  "originHash" : "81c6df4a6e0fce1823421838962e6b19e989ae908c7890c25cbb665b0315d2ec",
+  "originHash" : "a43f2d3b46c898a26b1f5d481f96770b6cedb2fff5cbb2d96d55c8063e01dde2",
   "pins" : [
     {
       "identity" : "compress-nio",
@@ -233,6 +233,15 @@
       "state" : {
         "revision" : "126df9655565068bd97838c072c1db11f9fd42ee",
         "version" : "1.6.1"
+      }
+    },
+    {
+      "identity" : "systemeinternational",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/moriturus/SystemeInternational.git",
+      "state" : {
+        "revision" : "44769f9c95e10ea253fc27d6a7a0b8349a54457a",
+        "version" : "1.0.1"
       }
     },
     {
