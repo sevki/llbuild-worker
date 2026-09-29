@@ -1,18 +1,43 @@
 {
-  "name": "llbuild-worker",
-  "main": "build/worker/worker.mjs",
-  "no_bundle": true,
-  "compatibility_date": "2026-01-01",
-  "durable_objects": {
-    "bindings": [
-      { "name": "CASGATEWAY", "class_name": "CASGateway" },
-      { "name": "CASSHARD", "class_name": "CASShardObject" }
-    ]
-  },
-  "r2_buckets": [
-    { "binding": "CASBLOBS", "bucket_name": "llbuild-cas-blobs" }
-  ],
-  "migrations": [
-    { "tag": "v2", "new_sqlite_classes": ["CASGateway", "CASShardObject"] }
-  ]
+	"name": "llbuild",
+	"main": "build/worker/worker.mjs",
+	"no_bundle": true,
+	"compatibility_date": "2026-01-01",
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "CASGATEWAY",
+				"class_name": "CASGateway"
+			},
+			{
+				"name": "CASSHARD",
+				"class_name": "CASShardObject"
+			},
+			{
+				"name": "CASSTATS",
+				"class_name": "CASStatsObject"
+			}
+		]
+	},
+	"r2_buckets": [
+		{
+			"binding": "CASBLOBS",
+			"bucket_name": "llbuild-cas-blobs"
+		}
+	],
+	"migrations": [
+		{
+			"tag": "v2",
+			"new_sqlite_classes": [
+				"CASGateway",
+				"CASShardObject"
+			]
+		},
+		{
+			"tag": "v3",
+			"new_sqlite_classes": [
+				"CASStatsObject"
+			]
+		}
+	]
 }

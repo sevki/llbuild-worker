@@ -90,7 +90,9 @@ private let indexDocument: Node = .document(
                 ),
                 .p(.text("")),
                 .small(.text(apple_trademark_notice_template)),
+                .p(.text("")),
                 .small(.text(cloudflare_trademark_notice)),
+                .p(.text("")),
                 .small(.text(devtools_affiliation_notice)),
             ),
         )

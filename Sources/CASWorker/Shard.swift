@@ -126,6 +126,23 @@ distributed actor CASShard {
     distributed func getAction(key: String) throws -> String? {
         try database().exec("SELECT value FROM actions WHERE key = ?", key).rows().first?["value", as: String.self]
     }
+
+    /// What this shard holds, for the stats page. `inlineBytes` estimates the
+    /// decoded size from the base64 text kept in SQLite.
+    distributed func totals() throws -> ShardTotals {
+        let db = try database()
+        let objects = try db.exec(
+            "SELECT count(*) AS n, coalesce(sum(in_r2), 0) AS r2, coalesce(sum(length(data)), 0) AS chars FROM objects").rows().first
+        let actions = try db.exec("SELECT count(*) AS n FROM actions").rows().first
+        let large = try db.exec("SELECT count(*) AS n, coalesce(sum(size), 0) AS bytes FROM large").rows().first
+        return ShardTotals(
+            objects: objects?["n", as: Int.self] ?? 0,
+            objectsInR2: objects?["r2", as: Int.self] ?? 0,
+            inlineBytes: (objects?["chars", as: Int.self] ?? 0) / 4 * 3,
+            actions: actions?["n", as: Int.self] ?? 0,
+            largeObjects: large?["n", as: Int.self] ?? 0,
+            largeBytes: large?["bytes", as: Int.self] ?? 0)
+    }
 }
 
 /// The Durable Object that hosts one `CASShard`, mirroring WorkerKit's
@@ -159,6 +176,11 @@ struct ShardBackend: CASBackend {
 
     private func shard(for digest: String) throws -> CASShard {
         try CASShard.resolve(id: namespace.idFromName("shard-\(digest.prefix(1))"), using: system)
+    }
+
+    /// Every shard, for reading totals across the whole store.
+    func allShards() throws -> [CASShard] {
+        try "0123456789abcdef".map { try shard(for: String($0)) }
     }
 
     func contains(digest: String) async throws -> Bool {
@@ -235,12 +257,16 @@ public final class CASGateway {
     let state: DurableObjectState
     let hostSystem: WorkersActorSystem
     let service: CASService
+    let stats: StatsClient?
 
     public init(state: DurableObjectState, env: Env) {
         self.state = state
         let hostSystem = WorkersActorSystem()
         self.hostSystem = hostSystem
-        let backend = ShardBackend(namespace: env.durableObject("CASSHARD"))
+        let shards = ShardBackend(namespace: env.durableObject("CASSHARD"))
+        let stats = StatsClient(env: env)
+        self.stats = stats
+        let backend: any CASBackend = stats.map { StatsBackend(inner: shards, stats: $0) } ?? shards
         let service = CASService(actorSystem: hostSystem, backend: backend)
         hostSystem.host(service)
         self.service = service
@@ -250,6 +276,7 @@ public final class CASGateway {
         guard req.headers.get("Upgrade")?.lowercased() == "websocket" else {
             return .error("Expected Upgrade: websocket", 426)
         }
+        stats?.record([StatsName.connections: 1])
         return .webSocketUpgrade(state.acceptWebSocket(tags: ["rpc"]))
     }
 

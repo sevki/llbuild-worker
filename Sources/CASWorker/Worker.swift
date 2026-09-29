@@ -11,6 +11,10 @@ func fetch(req: Request, env: Env, ctx: Context) async throws -> Response {
         return .text(setupScript, status: 200)
     }
 
+    if req.path == "/stats" || req.path == "/stats.json" {
+        return await statsResponse(env: env, json: req.path == "/stats.json")
+    }
+
     if req.path == "/" {
         return indexResponse()
     }

@@ -18,7 +18,7 @@ const require = createRequire(import.meta.url);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = join(root, "build", "worker");
 const r2Binding = "CASBLOBS";
-const classes = { CASGATEWAY: "CASGateway", CASSHARD: "CASShardObject" };
+const classes = { CASGATEWAY: "CASGateway", CASSHARD: "CASShardObject", CASSTATS: "CASStatsObject" };
 
 function freePort() {
   return new Promise((resolvePort, reject) => {
