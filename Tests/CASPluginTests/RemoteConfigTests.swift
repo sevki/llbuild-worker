@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 
+import CASClient
 @testable import CASPlugin
 
 final class RemoteConfigTests: XCTestCase {
@@ -56,5 +57,38 @@ final class RemoteConfigTests: XCTestCase {
                 options: ["remote-url": "https://url.example", "remote-service-path": "https://path.example"],
                 environment: env),
             URL(string: "https://url.example"))
+    }
+}
+
+final class AuthenticatedURLTests: XCTestCase {
+    private let url = URL(string: "https://cas.example")!
+
+    private func file(_ contents: String) throws -> String {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("token-\(UUID().uuidString)").path
+        try contents.write(toFile: path, atomically: true, encoding: .utf8)
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: path) }
+        return path
+    }
+
+    func testNoTokenLeavesURLAlone() {
+        XCTAssertEqual(CASClient.authenticated(url, environment: [:], tokenPath: "/nonexistent"), url)
+    }
+
+    func testTokenFileIsAttached() throws {
+        let path = try file("secret\n")
+        XCTAssertEqual(
+            CASClient.authenticated(url, environment: [:], tokenPath: path).absoluteString,
+            "https://cas.example?token=secret")
+    }
+
+    func testEnvironmentBeatsFileAndURLBeatsBoth() throws {
+        let path = try file("from-file")
+        XCTAssertEqual(
+            CASClient.authenticated(url, environment: ["LLBUILD_CAS_TOKEN": "from-env"], tokenPath: path).absoluteString,
+            "https://cas.example?token=from-env")
+        let explicit = URL(string: "https://cas.example?token=in-url")!
+        XCTAssertEqual(
+            CASClient.authenticated(explicit, environment: ["LLBUILD_CAS_TOKEN": "from-env"], tokenPath: path), explicit)
     }
 }

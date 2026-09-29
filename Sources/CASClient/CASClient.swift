@@ -20,8 +20,36 @@ public final class CASClient: @unchecked Sendable {
     private let system: WorkersActorSystem
     private let service: CASService
 
+    /// Where the shared token lives when the URL doesn't carry one, next to
+    /// the remote-URL file `/setup` writes.
+    public static let defaultTokenPath = "\(NSHomeDirectory())/.config/llbuild-cas-remote-token"
+
+    /// `workerURL` with the Worker's access token attached as its `token`
+    /// query parameter, which is how the WebSocket client authenticates (it
+    /// can't set headers on the upgrade request). A token already in the URL
+    /// wins, then `LLBUILD_CAS_TOKEN`, then the file at `tokenPath`. Without
+    /// any, the URL is returned unchanged and the Worker will refuse it.
+    public static func authenticated(
+        _ workerURL: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        tokenPath: String = defaultTokenPath
+    ) -> URL {
+        guard var components = URLComponents(url: workerURL, resolvingAgainstBaseURL: false),
+              !(components.queryItems ?? []).contains(where: { $0.name == "token" }) else {
+            return workerURL
+        }
+        var token = environment["LLBUILD_CAS_TOKEN"] ?? ""
+        if token.isEmpty, let data = FileManager.default.contents(atPath: tokenPath) {
+            token = String(decoding: data, as: UTF8.self)
+        }
+        token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return workerURL }
+        components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "token", value: token)]
+        return components.url ?? workerURL
+    }
+
     public init(workerURL: URL) throws {
-        system = WorkersActorSystem(worker: workerURL)
+        system = WorkersActorSystem(worker: Self.authenticated(workerURL))
         service = try CASService.resolve(id: "cas-service", using: system)
     }
 

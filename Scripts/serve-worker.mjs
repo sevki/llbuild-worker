@@ -4,7 +4,8 @@
 //
 //   node Scripts/serve-worker.mjs [--port N]
 //
-// Prints a single line `READY http://127.0.0.1:<port>` once it answers HTTP.
+// Prints a single line `READY http://127.0.0.1:<port>?token=<token>` once it
+// answers HTTP.
 import { spawn } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -32,6 +33,10 @@ function freePort() {
 
 const portFlag = process.argv.indexOf("--port");
 const port = portFlag > 0 ? Number(process.argv[portFlag + 1]) : await freePort();
+// The Worker refuses /__rpc without this token (the CAS_TOKEN secret in
+// production). It goes out in the READY URL so clients that take that URL
+// authenticate without further setup.
+const token = process.env.CAS_TOKEN ?? "local-dev-token";
 const directory = await mkdtemp(join(tmpdir(), "llbuild-worker-"));
 await mkdir(join(directory, "disk"));
 await copyFile(join(root, "Scripts", "r2-service.mjs"), join(directory, "r2-service.mjs"));
@@ -64,7 +69,7 @@ const worker :Workerd.Worker = (
     (name = "worker.mjs", esModule = embed "worker.mjs"),
     (name = "WorkerKit.wasm", wasm = embed "WorkerKit.wasm"),
   ],
-  bindings = [${bindings}, (name = ${JSON.stringify(r2Binding)}, r2Bucket = "r2")],
+  bindings = [${bindings}, (name = ${JSON.stringify(r2Binding)}, r2Bucket = "r2"), (name = "CAS_TOKEN", text = ${JSON.stringify(token)})],
   durableObjectNamespaces = [${namespaces}],
   durableObjectStorage = (localDisk = "disk"),
   compatibilityDate = "2026-01-01",
@@ -117,5 +122,5 @@ while (true) {
     await new Promise((delay) => setTimeout(delay, 250));
   }
 }
-console.log(`READY http://127.0.0.1:${port}`);
+console.log(`READY http://127.0.0.1:${port}?token=${token}`);
 setInterval(() => {}, 1 << 30); // stay alive until signalled

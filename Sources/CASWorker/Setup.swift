@@ -15,6 +15,7 @@ INDEX_URL="$REMOTE_URL/"
 BASE_URL="https://github.com/$REPO/releases/latest/download"
 PLUGIN_DIR="$HOME/.cache/llbuild-cas/plugin"
 CONFIG_FILE="$HOME/.config/llbuild-cas-remote"
+TOKEN_FILE="$HOME/.config/llbuild-cas-remote-token"
 
 err() {
     echo "error: $*" >&2
@@ -73,10 +74,28 @@ mv -f "$tmp/libCASPlugin.$ext" "$plugin"
 
 echo "$REMOTE_URL" > "$CONFIG_FILE"
 
+# The cache requires an access token. It is never served from here; take it
+# from the environment or ask for it on the terminal (stdin is this script).
+token="${LLBUILD_CAS_TOKEN:-}"
+if [ -z "$token" ] && ( : < /dev/tty ) 2>/dev/null; then
+    printf 'Access token for %s (input hidden): ' "$REMOTE_URL" > /dev/tty
+    stty -echo < /dev/tty 2>/dev/null || true
+    read -r token < /dev/tty || token=""
+    stty echo < /dev/tty 2>/dev/null || true
+    echo > /dev/tty
+fi
+if [ -n "$token" ]; then
+    (umask 077; printf '%s\n' "$token" > "$TOKEN_FILE")
+    token_note="Wrote $TOKEN_FILE"
+else
+    token_note="No access token saved: put one in $TOKEN_FILE or set LLBUILD_CAS_TOKEN, or the cache will refuse connections."
+fi
+
 cat <<EOF
 
 Installed $plugin
 Wrote $CONFIG_FILE
+$token_note
 
 swiftc:
 
