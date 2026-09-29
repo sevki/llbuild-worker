@@ -1,7 +1,9 @@
 import CASClient
 import CASProtocol
 import CLLCAS
+import Distributed
 import Foundation
+import WorkersDistributed
 import XCTest
 
 @testable import CASPlugin
@@ -79,5 +81,67 @@ final class RemoteIntegrationTests: XCTestCase {
             "every object should be fetched from the Worker")
         // A starved pool shows up as 30 s timeouts, not as a failure of the loads.
         XCTAssertLessThan(Date().timeIntervalSince(start), 20, "loads should not wait on timeouts")
+    }
+
+    /// A manifest may list one chunk many times, so its reference list can
+    /// describe far more data than its declared size. The Worker must stop
+    /// before assembling it, not after: unbounded, 15,000 references to one
+    /// 256 KiB chunk (about what a 1 MiB message can carry) is nearly 4 GB.
+    func testManifestListingMoreDataThanItDeclaresIsRejectedEarly() async throws {
+        guard let text = ProcessInfo.processInfo.environment["LLBUILD_CAS_TEST_URL"], let url = URL(string: text) else {
+            throw XCTSkip("set LLBUILD_CAS_TEST_URL to a running Worker")
+        }
+        let system = WorkersActorSystem(worker: url)
+        defer { system.close() }
+        let service = try CASService.resolve(id: "cas-service", using: system)
+
+        var bytes = Array(UUID().uuidString.utf8)
+        bytes += [UInt8](repeating: 7, count: CASLimits.chunkBytes - bytes.count)
+        let chunk = CASBlob(refs: [], data: bytes)
+        try await service.put(
+            digest: chunk.digest.hex, refs: [], data: Data(chunk.data).base64EncodedString())
+
+        // 40 references (10 MiB of chunk data) under a manifest that declares 600,000 bytes.
+        let refs = [CASDigest](repeating: chunk.digest, count: 40)
+        let manifest = CASBlob(refs: refs, data: CASChunking.manifestData(size: 600_000))
+        try await service.put(
+            digest: manifest.digest.hex, refs: refs.map(\.hex),
+            data: Data(manifest.data).base64EncodedString())
+
+        do {
+            try await service.putLarge(
+                digest: CASIdentity.identify(refs: [], data: [1, 2, 3]).hex, refs: [],
+                manifest: manifest.digest.hex)
+            XCTFail("a manifest listing more data than it declares must be rejected")
+        } catch {
+            // The early bound names the declared size; assembling everything
+            // first would only notice the total afterwards.
+            XCTAssertTrue("\(error)".contains("declared size"), "rejected, but not by the early bound: \(error)")
+        }
+    }
+
+    private final class Probe: Sendable {}
+
+    /// A finished call must not keep its completion (and whatever that captured)
+    /// alive until the timeout: with a 30 s deadline per call, and 300 s for a
+    /// publish, a long build would otherwise pile up retained plugin state.
+    func testFinishedCallReleasesItsCompletionBeforeTheTimeout() async throws {
+        guard let text = ProcessInfo.processInfo.environment["LLBUILD_CAS_TEST_URL"], let url = URL(string: text) else {
+            throw XCTSkip("set LLBUILD_CAS_TEST_URL to a running Worker")
+        }
+        let tier = RemoteTier(url: url)
+        let missing = CASIdentity.identify(refs: [], data: Array(UUID().uuidString.utf8))
+        weak var probe: Probe?
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let held = Probe()
+            probe = held
+            tier.run("contains", { try await $0.contains(missing) }) { _ in
+                _ = held
+                continuation.resume()
+            }
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNil(probe, "the completion was still retained after the call finished")
+        tier.close()
     }
 }

@@ -171,6 +171,12 @@ struct ShardBackend: CASBackend {
                   bytes.count <= CASLimits.chunkBytes else {
                 throw CASServiceError.invalidManifest("chunk \(chunk) is missing or malformed")
             }
+            // A manifest may list the same chunk many times, so the reference
+            // list can describe far more data than `size` says. Stop as soon
+            // as the next chunk would pass it, before the buffer grows.
+            guard assembled.count + bytes.count <= size else {
+                throw CASServiceError.invalidManifest("chunks exceed the manifest's declared size of \(size) bytes")
+            }
             assembled.append(contentsOf: bytes)
         }
         guard assembled.count == size else {

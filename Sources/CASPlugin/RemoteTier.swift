@@ -21,17 +21,25 @@ final class PluginExecutor: TaskExecutor, @unchecked Sendable {
     }
 }
 
-private final class Once: @unchecked Sendable {
-    private let lock = NSLock()
-    private var claimed = false
+/// A call's completion, handed out exactly once. Whoever finishes first (the
+/// operation or the timeout) takes it; after that the box holds nothing, so a
+/// timer that is still queued keeps only this empty box alive.
+private final class PendingCall<T: Sendable>: @unchecked Sendable {
+    typealias Completion = @Sendable (Result<T, Error>) -> Void
 
-    /// True for exactly one caller.
-    func claim() -> Bool {
+    private let lock = NSLock()
+    private var completion: Completion?
+
+    init(_ completion: @escaping Completion) {
+        self.completion = completion
+    }
+
+    func take() -> Completion? {
         lock.lock()
         defer { lock.unlock() }
-        if claimed { return false }
-        claimed = true
-        return true
+        let taken = completion
+        completion = nil
+        return taken
     }
 }
 
@@ -108,20 +116,26 @@ final class RemoteTier: @unchecked Sendable {
             completion(.failure(RemoteUnavailable(description: "remote is disabled")))
             return
         }
-        let once = Once()
+        let pending = PendingCall<T>(completion)
         let seconds = limit ?? timeout
-        Self.executor.queue.asyncAfter(deadline: .now() + seconds) { [self] in
-            if once.claim() {
-                disable("\(what) timed out after \(Int(seconds))s")
-                completion(.failure(RemoteUnavailable(description: "\(what) timed out")))
-            }
+        // A queued timer is not freed when cancelled, only skipped when its
+        // deadline arrives. So it must not hold anything that matters: it
+        // captures the (emptied, once finished) `pending` box and a weak
+        // `self`, never the completion or the plugin.
+        let timer = DispatchWorkItem { [weak self] in
+            guard let completion = pending.take() else { return }
+            self?.disable("\(what) timed out after \(Int(seconds))s")
+            completion(.failure(RemoteUnavailable(description: "\(what) timed out")))
         }
+        Self.executor.queue.asyncAfter(deadline: .now() + seconds, execute: timer)
         Task(executorPreference: Self.executor) { [self] in
             do {
                 let value = try await operation(try client())
-                if once.claim() { completion(.success(value)) }
+                timer.cancel()
+                pending.take()?(.success(value))
             } catch {
-                if once.claim() {
+                timer.cancel()
+                if let completion = pending.take() {
                     disable("\(what) failed: \(error)")
                     completion(.failure(error))
                 }
