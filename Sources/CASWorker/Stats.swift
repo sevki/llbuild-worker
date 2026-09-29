@@ -343,6 +343,8 @@ private func dayFigures(_ day: DayStats) -> [(label: String, value: String)] {
     let lookups = day.hits + day.misses
     return [
         ("Hit rate", formatPercent(day.hits, of: lookups)),
+        ("Hits", String(day.hits)),
+        ("Misses", String(day.misses)),
         ("Lookups", String(lookups)),
         ("Connections", String(day.connections)),
         ("Uploaded", formatBytes(day.bytesUp)),
@@ -396,6 +398,8 @@ private let statsScript: StaticString = """
       // The figures on a day's card, in order: label and how to get its text.
       var dayFigures = [
         ['Hit rate', function (d) { return pct(d.hits, d.hits + d.misses); }],
+        ['Hits', function (d) { return d.hits; }],
+        ['Misses', function (d) { return d.misses; }],
         ['Lookups', function (d) { return d.hits + d.misses; }],
         ['Connections', function (d) { return d.connections; }],
         ['Uploaded', function (d) { return bytes(d.bytesUp); }],
@@ -432,6 +436,8 @@ private let statsScript: StaticString = """
         var hits = sum('hits'), misses = sum('misses');
         set('live-tiles',
           tile('tile:rate', pct(hits, hits + misses), 'cache hit rate') +
+          tile('tile:hits', hits, 'cache hits') +
+          tile('tile:misses', misses, 'cache misses') +
           tile('tile:lookups', hits + misses, 'cache lookups') +
           tile('tile:connections', sum('connections'), 'client connections') +
           tile('tile:transferred', bytes(sum('bytesUp') + sum('bytesDown')), 'transferred'));
@@ -516,6 +522,8 @@ private func statsDocument(_ report: StatsReport) -> Node {
 
                 .div(attributes: [.class("tiles"), .id("live-tiles"), .data("byte-units", ByteSize.unitSymbols.joined(separator: ",")), .data("byte-step", String(ByteSize.step))],
                     tile(formatPercent(hits, of: hits + misses), "cache hit rate"),
+                    tile(String(hits), "cache hits"),
+                    tile(String(misses), "cache misses"),
                     tile(String(hits + misses), "cache lookups"),
                     tile(String(connections), "client connections"),
                     tile(formatBytes(up + down), "transferred")
