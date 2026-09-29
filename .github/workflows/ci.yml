@@ -36,7 +36,7 @@ jobs:
         run: swift build --product castool ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
       - name: Check that C compiles go through the cache
-        run: Scripts/check-c-cache.sh --product castool ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
+        run: Scripts/check-c-cache.sh ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
@@ -72,7 +72,7 @@ jobs:
         run: swift build $BUILD_FLAGS --product castool $SWIFT_CACHE_FLAGS
 
       - name: Check that C compiles go through the cache
-        run: Scripts/check-c-cache.sh $BUILD_FLAGS --product castool $SWIFT_CACHE_FLAGS
+        run: Scripts/check-c-cache.sh $BUILD_FLAGS $SWIFT_CACHE_FLAGS
 
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
