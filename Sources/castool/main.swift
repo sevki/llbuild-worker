@@ -11,6 +11,11 @@ func usage() -> Never {
       put <file>                store a file as an object and print its digest
       get <digest> <out-file>   fetch an object's data into a file
       has <digest>              exit 0 if the object exists, 1 if not
+      bench <count> <size>      seed <count> distinct <size>-byte objects (sequentially,
+                                 not timed), then fetch all of them concurrently on one
+                                 client and print the wall-clock time — the read path is
+                                 what many concurrent compile jobs actually exercise, so
+                                 it is the one worth timing under concurrency
 
     """.utf8))
     exit(64)
@@ -68,6 +73,40 @@ func run() async throws -> Int32 {
 
     case ("has", 4):
         return try await client.contains(digest(arguments[3])) ? 0 : 1
+
+    case ("bench", 5):
+        guard let count = Int(arguments[3]), count > 0 else { fail("not a valid count: \(arguments[3])", code: 64) }
+        guard let size = Int(arguments[4]), size > 0 else { fail("not a valid size: \(arguments[4])", code: 64) }
+
+        // Distinct content per object, so each seeds its own digest instead
+        // of every put deduplicating onto one.
+        var digests = [CASDigest]()
+        digests.reserveCapacity(count)
+        for index in 0..<count {
+            var bytes = [UInt8](repeating: 0, count: size)
+            for offset in 0..<min(size, 8) { bytes[offset] = UInt8(truncatingIfNeeded: index &+ offset) }
+            digests.append(try await client.put(CASBlob(refs: [], data: bytes)))
+        }
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for target in digests {
+                group.addTask {
+                    guard try await client.get(target) != nil else {
+                        throw CASClientError("bench: object \(target.hex) missing right after put")
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+        let elapsed = start.duration(to: clock.now).components
+        let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+
+        print("bench: n=\(count) size=\(size)B concurrent_get_total=\(String(format: "%.3f", seconds))s "
+            + "avg_latency=\(String(format: "%.1f", seconds / Double(count) * 1000))ms "
+            + "throughput=\(String(format: "%.1f", Double(count) / seconds))obj/s")
+        return 0
 
     default:
         usage()

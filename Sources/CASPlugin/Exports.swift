@@ -280,7 +280,7 @@ public func llcas_cas_load_object_async(
         return
     }
     nonisolated(unsafe) let context = context
-    nonisolated(unsafe) let callback = callback
+    let callback = callback
     remote.getAsync(digest) { result in
         switch result {
         case .success(.some(let blob)):
@@ -465,7 +465,7 @@ public func llcas_actioncache_get_for_digest_async(
         return
     }
     nonisolated(unsafe) let context = context
-    nonisolated(unsafe) let callback = callback
+    let callback = callback
     remote.actionGetAsync(keyDigest) { result in
         if case .success(.some(let value)) = result {
             try? instance.store.actionPut(keyDigest, value: value)
@@ -532,7 +532,7 @@ public func llcas_actioncache_put_for_digest_async(
     // Report completion only after the upload attempt, so a process that exits
     // as soon as its last callback fires has not lost the publish.
     nonisolated(unsafe) let context = context
-    nonisolated(unsafe) let callback = callback
+    let callback = callback
     remote.publishAsync(key: local.key, value: valueDigest, from: instance.store) { _ in
         callback?(context, false, nil)
     }

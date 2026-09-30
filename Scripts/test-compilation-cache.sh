@@ -5,6 +5,12 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+# This checks the local cache alone. CI sets LLBUILD_CAS_REMOTE_URL for the whole
+# job (its own scope on the live Worker), and the plugin reads it from the
+# environment; the source below never changes, so a re-run, or any run after the
+# first, would find the last run's result there and "first compile misses" would
+# fail. Sharing through the Worker is checked by test-remote-cache.sh.
+unset LLBUILD_CAS_REMOTE_URL
 # BUILD_FLAGS lets CI pick a backend (macOS builds need --build-system native).
 # shellcheck disable=SC2086
 swift build ${BUILD_FLAGS:-} --package-path "$root" --product CASPlugin

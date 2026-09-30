@@ -90,6 +90,13 @@ public enum CASLimits {
     /// Largest logical object. The Worker reassembles a large object in
     /// memory to verify its identity, so this is bounded by its isolate.
     public static let maxLargeObjectBytes = 64 * 1024 * 1024
+
+    /// Largest object accepted over the plain-HTTP object endpoints (`GET`/
+    /// `PUT /{scope}/objects/{digest}`), which have no WebSocket
+    /// message-size ceiling to chunk around — one streamed body instead of
+    /// `chunkBytes` pieces. Bounded by the Worker isolate's memory, same as
+    /// `maxLargeObjectBytes`.
+    public static let maxHTTPObjectBytes = 64 * 1024 * 1024
 }
 
 /// A large object's entry: its references, the manifest object that lists its
