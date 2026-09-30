@@ -53,6 +53,8 @@ actor FakeUpstream: CASUpstream {
     func actionPut(_ key: CASDigest, value: CASDigest) async throws {
         if down { throw Down() }
         guard objects[value] != nil else { throw Down() }
+        // As at the Worker: a key keeps its first value.
+        if let existing = actions[key], existing != value { throw Down() }
         actions[key] = value
     }
 }
@@ -297,6 +299,39 @@ final class DaemonTests: XCTestCase {
         XCTAssertTrue(spooled(parent.digest))
         XCTAssertFalse(spooled(orphan.digest), "nothing claims it")
         await again.close()
+    }
+
+    func testAnActionKeyKeepsItsFirstValue() async throws {
+        let client = try client()
+        let first = blob("first"), second = blob("second")
+        try await client.put(first)
+        try await client.put(second)
+        let key = blob("key").digest
+        try await client.actionPut(key, value: first.digest)
+        try await client.actionPut(key, value: first.digest)   // a repeat is fine
+        do {
+            try await client.actionPut(key, value: second.digest)
+            XCTFail("a different value for an existing key was accepted")
+        } catch {}
+        let kept = try await client.actionGet(key)
+        XCTAssertEqual(kept, first.digest)
+        await client.close()
+    }
+
+    func testAnUpstreamValueThatWonTheKeyReplacesAQueuedOne() async throws {
+        let mine = blob("mine"), theirs = blob("theirs")
+        await upstream.seed(theirs)
+        let key = blob("contested").digest
+        await upstream.seed(action: key, value: theirs.digest)
+        let client = try client()
+        try await client.put(mine)
+        try await client.actionPut(key, value: mine.digest)
+        await daemon.drain()
+        let stored = await upstream.actions[key]
+        XCTAssertEqual(stored, theirs.digest, "the Worker keeps the first value")
+        let pending = await Set((try? FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("s/pending").path)) ?? [])
+        XCTAssertTrue(pending.isEmpty, "nothing is retried forever")
+        await client.close()
     }
 
     func testOnlyTheLoopbackIsServed() async throws {

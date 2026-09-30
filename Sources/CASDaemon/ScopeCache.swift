@@ -31,7 +31,14 @@ public actor ScopeCache {
     private var actions: [CASDigest: CASDigest] = [:]
     private var misses: [CASDigest: ContinuousClock.Instant] = [:]
     /// Objects known to be upstream, so they are never asked about twice.
-    private var uploaded = Set<CASDigest>()
+    private var uploaded = Set<CASDigest>() {
+        didSet {
+            // Forgetting only costs another upstream check, so a long-lived
+            // daemon's set is kept from growing without bound.
+            if uploaded.count > Self.maxKnownUpstream { uploaded.removeAll(keepingCapacity: false) }
+        }
+    }
+    private static let maxKnownUpstream = 500_000
     private var fetching: [CASDigest: Task<CASBlob?, Never>] = [:]
     private var uploading: [CASDigest: Task<Bool, Never>] = [:]
     private var forwarding: [CASDigest: Task<Void, Never>] = [:]
@@ -151,7 +158,7 @@ public actor ScopeCache {
         case .failed:
             return nil
         case .miss:
-            misses[key] = .now
+            noteMiss(key)
             return nil
         case .hit(let hit):
             value = hit
@@ -218,6 +225,11 @@ public actor ScopeCache {
     /// Throws if it could not be recorded on disk (a full or unwritable cache
     /// directory): acknowledging it then would lose it on a restart.
     public func actionPut(_ key: CASDigest, value: CASDigest) throws {
+        // An action key is immutable, as at the Worker: the first value stays, a
+        // repeat of it is fine, a different one is refused.
+        if let existing = actions[key] ?? readAction(key), existing != value {
+            throw CASServiceError.invalidDigest(key.hex)
+        }
         try writeAction(key, value)
         try writePending(key)
         actions[key] = value
@@ -235,6 +247,19 @@ public actor ScopeCache {
 
     public var pendingCount: Int { forwarding.count }
 
+    private static let maxRememberedMisses = 20_000
+
+    /// A miss is remembered briefly; past `maxRememberedMisses` the expired ones
+    /// are dropped, and if the rest are all fresh the table starts over.
+    private func noteMiss(_ key: CASDigest) {
+        if misses.count >= Self.maxRememberedMisses {
+            let now = ContinuousClock.now
+            misses = misses.filter { now - $0.value < negativeTTL }
+            if misses.count >= Self.maxRememberedMisses { misses.removeAll() }
+        }
+        misses[key] = .now
+    }
+
     private func remember(key: CASDigest, value: CASDigest) {
         if actions.count >= Self.maxActionsInMemory { actions.removeAll(keepingCapacity: true) }
         actions[key] = value
@@ -247,6 +272,13 @@ public actor ScopeCache {
             var delay = Duration.milliseconds(250)
             for attempt in 1...6 {
                 if await upload(value), (try? await upstream.actionPut(key, value: value)) != nil {
+                    clearPending(key)
+                    break
+                }
+                // Upstream may already hold a different value for this key (another
+                // machine got there first): it wins, and this write is moot.
+                if let held = try? await upstream.actionGet(key), held != value {
+                    remember(key: key, value: held)
                     clearPending(key)
                     break
                 }
@@ -374,8 +406,9 @@ public actor ScopeCache {
     }
 
     private func readSpool(_ digest: CASDigest) -> CASBlob? {
-        guard let data = FileManager.default.contents(atPath: shard(spoolDirectory, digest.hex).path) else { return nil }
-        return ObjectCache.decode(data)
+        guard let data = FileManager.default.contents(atPath: shard(spoolDirectory, digest.hex).path),
+              let blob = ObjectCache.decode(data), blob.digest == digest else { return nil }
+        return blob
     }
 
     private func removeSpool(_ digest: CASDigest) {
