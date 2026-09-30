@@ -68,8 +68,8 @@ public actor ScopeCache {
 
     /// Re-queues the actions a previous run acknowledged but had not yet
     /// forwarded.
-    public func resumePending() {
-        sweepSpool()
+    public func resumePending() async {
+        await sweepSpool()
         countActions()
         let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
         for name in names {
@@ -128,6 +128,7 @@ public actor ScopeCache {
     /// the spool, where the cache's eviction cannot take it.
     public func put(_ blob: CASBlob) async throws {
         let digest = blob.digest
+        await sweepSpoolIfDue()
         if !uploaded.contains(digest) { try writeSpool(blob) }
         _ = try await objects.put(blob)
     }
@@ -214,10 +215,13 @@ public actor ScopeCache {
     }
 
     /// Acknowledged when recorded locally; the upload happens behind it.
-    public func actionPut(_ key: CASDigest, value: CASDigest) {
-        remember(key: key, value: value)
+    /// Throws if it could not be recorded on disk (a full or unwritable cache
+    /// directory): acknowledging it then would lose it on a restart.
+    public func actionPut(_ key: CASDigest, value: CASDigest) throws {
+        try writeAction(key, value)
+        try writePending(key)
+        actions[key] = value
         misses[key] = nil
-        writePending(key)
         forward(key: key, value: value)
     }
 
@@ -234,7 +238,7 @@ public actor ScopeCache {
     private func remember(key: CASDigest, value: CASDigest) {
         if actions.count >= Self.maxActionsInMemory { actions.removeAll(keepingCapacity: true) }
         actions[key] = value
-        writeAction(key, value)
+        try? writeAction(key, value)
     }
 
     private func forward(key: CASDigest, value: CASDigest) {
@@ -305,11 +309,11 @@ public actor ScopeCache {
 
     /// One small file per action. The count is capped (`maxActionFiles`): past it
     /// the oldest are deleted, except those still waiting to be forwarded.
-    private func writeAction(_ key: CASDigest, _ value: CASDigest) {
+    private func writeAction(_ key: CASDigest, _ value: CASDigest) throws {
         let file = shard(actionDirectory, key.hex)
         let existed = FileManager.default.fileExists(atPath: file.path)
-        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? Data(value.hex.utf8).write(to: file, options: .atomic)
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(value.hex.utf8).write(to: file, options: .atomic)
         guard !existed else { return }
         actionFiles += 1
         if actionFiles > maxActionFiles + maxActionFiles / 10 { pruneActions() }
@@ -348,8 +352,8 @@ public actor ScopeCache {
         actionFiles = remaining
     }
 
-    private func writePending(_ key: CASDigest) {
-        FileManager.default.createFile(atPath: pendingDirectory.appendingPathComponent(key.hex).path, contents: Data())
+    private func writePending(_ key: CASDigest) throws {
+        try Data().write(to: pendingDirectory.appendingPathComponent(key.hex), options: .atomic)
     }
 
     private func clearPending(_ key: CASDigest) {
@@ -378,17 +382,46 @@ public actor ScopeCache {
         try? FileManager.default.removeItem(at: shard(spoolDirectory, digest.hex))
     }
 
+    private var lastSweep = Date()
+    private static let spoolMaxAge: TimeInterval = 24 * 3600
+
     /// Spooled objects that no action ever claimed (the client died between storing
-    /// and recording) are dropped after a day, at start-up.
-    private func sweepSpool() {
-        let cutoff = Date().addingTimeInterval(-24 * 3600)
+    /// and recording) are dropped after a day, at start-up and then hourly while the
+    /// daemon runs. What a pending action can still reach is kept however old.
+    private func sweepSpool() async {
+        lastSweep = Date()
+        let cutoff = Date().addingTimeInterval(-Self.spoolMaxAge)
+        var old: [URL] = []
         let files = FileManager.default.enumerator(
             at: spoolDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
         while let file = files?.nextObject() as? URL {
             let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
             if values?.isRegularFile == true, (values?.contentModificationDate ?? .distantFuture) < cutoff {
-                try? FileManager.default.removeItem(at: file)
+                old.append(file)
             }
         }
+        guard !old.isEmpty else { return }
+        let keep = await reachableFromPending()
+        for file in old where !keep.contains(file.lastPathComponent) {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    /// Hex digests of everything the pending actions' values reach.
+    private func reachableFromPending() async -> Set<String> {
+        var seen = Set<String>()
+        var queue: [CASDigest] = []
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? [] {
+            if let key = CASDigest(hex: name), let value = readAction(key) { queue.append(value) }
+        }
+        while let digest = queue.popLast() {
+            guard seen.insert(digest.hex).inserted else { continue }
+            if let blob = await objects.get(digest) ?? readSpool(digest) { queue.append(contentsOf: blob.refs) }
+        }
+        return seen
+    }
+
+    private func sweepSpoolIfDue() async {
+        if Date().timeIntervalSince(lastSweep) > 3600 { await sweepSpool() }
     }
 }

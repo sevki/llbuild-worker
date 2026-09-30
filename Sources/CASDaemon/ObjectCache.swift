@@ -80,7 +80,9 @@ public actor ObjectCache {
         let name = digest.hex
         guard await index.get(name) != nil else { return nil }
         let file = Self.path(of: name, in: directory)
-        guard let data = try? Data(contentsOf: file), let blob = Self.decode(data) else {
+        // Identity as well as shape: a file damaged into another well-formed object
+        // must read as a miss and be refetched, not be served under the wrong name.
+        guard let data = try? Data(contentsOf: file), let blob = Self.decode(data), blob.digest == digest else {
             _ = await index.delete(name)
             return nil
         }

@@ -169,4 +169,20 @@ final class ObjectCacheTests: XCTestCase {
         let count = await cache.count
         XCTAssertEqual(count, 200)
     }
+
+    func testAFileDamagedIntoAnotherValidObjectReadsAsAMiss() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("oc-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = try await ObjectCache.open(directory: directory, maxBytes: 1 << 20)
+        let real = CASBlob(refs: [], data: Array("real".utf8))
+        try await cache.put(real)
+        // The file now holds a different, well-formed object.
+        let name = real.digest.hex
+        let file = directory.appendingPathComponent(String(name.prefix(2))).appendingPathComponent(name)
+        try ObjectCache.encode(CASBlob(refs: [], data: Array("forged".utf8))).write(to: file)
+        let read = await cache.get(real.digest)
+        XCTAssertNil(read)
+        let held = await cache.contains(real.digest)
+        XCTAssertFalse(held, "the bad entry is dropped so it can be refetched")
+    }
 }

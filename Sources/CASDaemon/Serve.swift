@@ -73,7 +73,11 @@ extension CASDaemon {
             // The Worker refuses an action whose value it does not hold; so does
             // this, so a client cannot tell the difference.
             guard await cache.contains(v) else { return Self.reply(id: id, error: "object \(v.hex) is not stored") }
-            await cache.actionPut(k, value: v)
+            do {
+                try await cache.actionPut(k, value: v)
+            } catch {
+                return Self.reply(id: id, error: "the daemon could not record the action: \(error)")
+            }
             return Self.reply(id: id, result: nil)
         }
         if identifier.contains("6status") {

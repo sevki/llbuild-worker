@@ -267,6 +267,38 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testAStaleSpoolFileIsSweptUnlessAPendingActionNeedsIt() async throws {
+        await upstream.setDown(true)
+        let client = try client()
+        let child = blob("needed"), parent = blob("parent", refs: [child.digest]), orphan = blob("orphan")
+        for object in [child, parent, orphan] { try await client.put(object) }
+        try await client.actionPut(blob("k").digest, value: parent.digest)
+        await client.close()
+        await daemon.stop()
+
+        // A restart more than a day later.
+        let spool = directory.appendingPathComponent("s/spool")
+        let files = FileManager.default.enumerator(at: spool, includingPropertiesForKeys: [.isRegularFileKey])
+        let old = Date().addingTimeInterval(-3 * 24 * 3600)
+        while let file = files?.nextObject() as? URL {
+            if (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true {
+                try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: file.path)
+            }
+        }
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20) { _ in fake })
+        port = try await daemon.start()
+        let again = try self.client()
+        _ = try await again.status()
+        func spooled(_ d: CASDigest) -> Bool {
+            FileManager.default.fileExists(atPath: spool.appendingPathComponent(String(d.hex.prefix(2))).appendingPathComponent(d.hex).path)
+        }
+        XCTAssertTrue(spooled(child.digest), "reachable from a pending action")
+        XCTAssertTrue(spooled(parent.digest))
+        XCTAssertFalse(spooled(orphan.digest), "nothing claims it")
+        await again.close()
+    }
+
     func testOnlyTheLoopbackIsServed() async throws {
         let fake = upstream!
         for host in ["0.0.0.0", "192.168.1.5", "::"] {
