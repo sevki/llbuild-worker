@@ -435,6 +435,26 @@ final class DaemonTests: XCTestCase {
         await again.close()
     }
 
+    func testAPutOfAnOldSpooledObjectRefreshesItsAge() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1) { _ in fake })   // nothing fits the cache
+        port = try await daemon.start()
+        await upstream.setDown(true)
+        let client = try client()
+        let object = blob("old but wanted again")
+        try await client.put(object)
+        let file = directory.appendingPathComponent("s/spool")
+            .appendingPathComponent(String(object.digest.hex.prefix(2))).appendingPathComponent(object.digest.hex)
+        let old = Date().addingTimeInterval(-3 * 24 * 3600)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: file.path)
+
+        try await client.put(object)
+        let modified = try XCTUnwrap(try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+        XCTAssertGreaterThan(modified, Date().addingTimeInterval(-60), "a sweep that listed it as old must see it as new")
+        await client.close()
+    }
+
     func testOnlyTheLoopbackIsServed() async throws {
         let fake = upstream!
         for host in ["0.0.0.0", "192.168.1.5", "::"] {

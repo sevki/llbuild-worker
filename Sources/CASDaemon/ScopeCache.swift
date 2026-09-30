@@ -450,7 +450,12 @@ public actor ScopeCache {
 
     private func writeSpool(_ blob: CASBlob) throws {
         let file = shard(spoolDirectory, blob.digest.hex)
-        guard !isSpooled(blob.digest) else { return }
+        if isSpooled(blob.digest) {
+            // Already held, but it now has a new claim on it: refresh its age so a
+            // sweep that listed it as old does not take it (see `sweepSpool`).
+            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
+            return
+        }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try ObjectCache.encode(blob).write(to: file, options: .atomic)
     }
@@ -493,6 +498,9 @@ public actor ScopeCache {
             let keep = await reachableFromPending()
             guard generation == pendingGeneration else { continue }
             for file in old where !keep.contains(file.lastPathComponent) {
+                // Still as old as when it was listed? A PUT since then refreshed it.
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                guard let modified, modified < cutoff else { continue }
                 try? FileManager.default.removeItem(at: file)
             }
             return
