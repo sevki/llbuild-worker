@@ -241,6 +241,64 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testAcknowledgedObjectsSurviveCachePressureUntilTheActionIsSent() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        // A cache far smaller than the closure being built.
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 4096) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+
+        var previous: [CASDigest] = []
+        var all: [CASBlob] = []
+        for index in 0..<40 {
+            let object = CASBlob(refs: previous, data: Array(repeating: UInt8(index), count: 1000))
+            try await client.put(object)
+            all.append(object)
+            previous = [object.digest]
+        }
+        let key = blob("pressure").digest
+        try await client.actionPut(key, value: all.last!.digest)
+        await daemon.drain()
+        let stored = await upstream.actions[key]
+        XCTAssertEqual(stored, all.last!.digest)
+        let held = await Set(upstream.objects.keys)
+        XCTAssertEqual(held, Set(all.map(\.digest)), "every object of the chain reached the Worker")
+        await client.close()
+    }
+
+    func testOnlyTheLoopbackIsServed() async throws {
+        let fake = upstream!
+        for host in ["0.0.0.0", "192.168.1.5", "::"] {
+            let other = CASDaemon(.init(host: host, directory: directory, maxBytes: 1 << 20) { _ in fake })
+            do {
+                _ = try await other.start()
+                XCTFail("\(host) was accepted")
+            } catch {}
+        }
+    }
+
+    func testOldActionRecordsAreDroppedPastTheCap() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20, maxActions: 10) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+        let object = blob("v")
+        try await client.put(object)
+        for index in 0..<30 { try await client.actionPut(blob("a\(index)").digest, value: object.digest) }
+        await daemon.drain()
+        await daemon.stop()
+
+        let files = FileManager.default.enumerator(at: directory.appendingPathComponent("s/actions"), includingPropertiesForKeys: [.isRegularFileKey])
+        var count = 0
+        while let file = files?.nextObject() as? URL {
+            if (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true { count += 1 }
+        }
+        XCTAssertLessThanOrEqual(count, 11 + 1, "the action directory holds \(count) records")
+        XCTAssertGreaterThan(count, 0)
+    }
+
     func testLargeObjectRoundTrip() async throws {
         let big = CASBlob(refs: [], data: (0..<3_000_000).map { UInt8(truncatingIfNeeded: $0 &* 31) })
         let client = try client()

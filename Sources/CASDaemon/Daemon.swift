@@ -16,22 +16,31 @@ import NIOWebSocket
 /// It listens on the loopback only and does not authenticate: anything on the
 /// machine that can connect can read and write through the token it holds
 /// upstream. Fine for a developer machine or CI runner, not for a shared host.
+public struct CASDaemonError: Error, CustomStringConvertible {
+    public var description: String
+    init(_ description: String) { self.description = description }
+}
+
 public final class CASDaemon: @unchecked Sendable {
     public struct Configuration: Sendable {
         public var host: String
         public var port: Int
         public var directory: URL
         public var maxBytes: Int64
+        /// Most action records kept on disk per scope; the oldest go first.
+        public var maxActions: Int
         public var makeUpstream: @Sendable (_ scope: String) -> any CASUpstream
 
         public init(
             host: String = "127.0.0.1", port: Int = 0, directory: URL, maxBytes: Int64 = 4 << 30,
+            maxActions: Int = 1_000_000,
             makeUpstream: @escaping @Sendable (String) -> any CASUpstream
         ) {
             self.host = host
             self.port = port
             self.directory = directory
             self.maxBytes = maxBytes
+            self.maxActions = maxActions
             self.makeUpstream = makeUpstream
         }
     }
@@ -72,7 +81,8 @@ public final class CASDaemon: @unchecked Sendable {
             let created = Task { [configuration, log] in
                 let cache = try await ScopeCache(
                     directory: configuration.directory.appendingPathComponent(name),
-                    maxBytes: configuration.maxBytes, upstream: configuration.makeUpstream(name), log: log)
+                    maxBytes: configuration.maxBytes, upstream: configuration.makeUpstream(name),
+                    maxActions: configuration.maxActions, log: log)
                 await cache.resumePending()
                 return cache
             }
@@ -92,8 +102,19 @@ public final class CASDaemon: @unchecked Sendable {
 
     // MARK: Serving
 
-    /// Binds and starts serving; returns the port.
+    /// Whether `host` is an address only this machine can reach.
+    static func isLoopback(_ host: String) -> Bool {
+        if host == "localhost" || host == "::1" { return true }
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        return octets.count == 4 && octets[0] == "127" && octets.allSatisfy { UInt8($0) != nil }
+    }
+
+    /// Binds and starts serving; returns the port. Only a loopback address is
+    /// accepted: the daemon does not authenticate, and holds the upstream token.
     public func start() async throws -> Int {
+        guard Self.isLoopback(configuration.host) else {
+            throw CASDaemonError("refusing to listen on \(configuration.host): the daemon does no authentication, so it only serves the loopback")
+        }
         let server = try await ServerBootstrap(group: NIOSingletons.posixEventLoopGroup)
             .serverChannelOption(.backlog, value: 256)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)

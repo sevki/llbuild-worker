@@ -20,6 +20,10 @@ public actor ScopeCache {
     private let upstream: any CASUpstream
     private let actionDirectory: URL
     private let pendingDirectory: URL
+    /// Objects a client stored that are not upstream yet. The object cache evicts
+    /// whatever is least recently used, so it cannot be what an acknowledged write
+    /// waits in: a file here stays until it has been uploaded.
+    private let spoolDirectory: URL
     private let negativeTTL: Duration
     private let batchWindow: Duration
     private let log: @Sendable (String) -> Void
@@ -44,7 +48,7 @@ public actor ScopeCache {
 
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
-        negativeTTL: Duration = .seconds(5), batchWindow: Duration = .milliseconds(3),
+        maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), batchWindow: Duration = .milliseconds(3),
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
         self.objects = try await ObjectCache.open(
@@ -52,16 +56,21 @@ public actor ScopeCache {
         self.upstream = upstream
         self.actionDirectory = directory.appendingPathComponent("actions")
         self.pendingDirectory = directory.appendingPathComponent("pending")
+        self.spoolDirectory = directory.appendingPathComponent("spool")
+        self.maxActionFiles = maxActions
         self.negativeTTL = negativeTTL
         self.batchWindow = batchWindow
         self.log = log
         try FileManager.default.createDirectory(at: actionDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: spoolDirectory, withIntermediateDirectories: true)
     }
 
     /// Re-queues the actions a previous run acknowledged but had not yet
     /// forwarded.
     public func resumePending() {
+        sweepSpool()
+        countActions()
         let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
         for name in names {
             guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
@@ -76,7 +85,7 @@ public actor ScopeCache {
     // MARK: Objects
 
     public func contains(_ digest: CASDigest) async -> Bool {
-        if await objects.contains(digest) { return true }
+        if await objects.contains(digest) || isSpooled(digest) { return true }
         if uploaded.contains(digest) { return true }
         guard let found = try? await upstream.contains(digest) else { return false }
         if found { uploaded.insert(digest) }
@@ -84,7 +93,7 @@ public actor ScopeCache {
     }
 
     public func get(_ digest: CASDigest) async -> CASBlob? {
-        if let blob = await objects.get(digest) { return blob }
+        if let blob = await objects.get(digest) ?? readSpool(digest) { return blob }
         if let inflight = fetching[digest] { return await inflight.value }
         let task = Task { [self] () -> CASBlob? in
             let blob = try? await upstream.get(digest)
@@ -114,16 +123,13 @@ public actor ScopeCache {
         }
     }
 
-    /// Stores an object a client made. It is forwarded with the action that
-    /// first references it; one too big to keep locally is sent upstream now, as
-    /// it could not be found later.
+    /// Stores an object a client made, acknowledged once it is on disk. It is
+    /// forwarded with the action that first references it; until then it is kept in
+    /// the spool, where the cache's eviction cannot take it.
     public func put(_ blob: CASBlob) async throws {
         let digest = blob.digest
+        if !uploaded.contains(digest) { try writeSpool(blob) }
         _ = try await objects.put(blob)
-        if await !objects.contains(digest) {
-            try await upstream.put(blob)
-            uploaded.insert(digest)
-        }
     }
 
     // MARK: Actions
@@ -257,7 +263,7 @@ public actor ScopeCache {
         if uploaded.contains(digest) { return true }
         if let inflight = uploading[digest] { return await inflight.value }
         let task = Task { [self] () -> Bool in
-            guard let blob = await objects.get(digest) else {
+            guard let blob = await objects.get(digest) ?? readSpool(digest) else {
                 log("cannot upload \(digest.hex): not in the local cache")
                 return false
             }
@@ -275,6 +281,7 @@ public actor ScopeCache {
                 return false
             }
             uploaded.insert(digest)
+            removeSpool(digest)
             return true
         }
         uploading[digest] = task
@@ -285,26 +292,103 @@ public actor ScopeCache {
 
     // MARK: Files
 
-    private func path(_ directory: URL, _ key: CASDigest) -> URL {
-        directory.appendingPathComponent(key.hex)
+    private func shard(_ directory: URL, _ name: String) -> URL {
+        directory.appendingPathComponent(String(name.prefix(2)), isDirectory: true).appendingPathComponent(name)
     }
 
     private func readAction(_ key: CASDigest) -> CASDigest? {
-        guard let data = FileManager.default.contents(atPath: path(actionDirectory, key).path),
+        guard let data = FileManager.default.contents(atPath: shard(actionDirectory, key.hex).path),
               let text = String(data: data, encoding: .utf8),
               let value = CASDigest(hex: text), value.bytes.count == CASIdentity.digestSize else { return nil }
         return value
     }
 
+    /// One small file per action. The count is capped (`maxActionFiles`): past it
+    /// the oldest are deleted, except those still waiting to be forwarded.
     private func writeAction(_ key: CASDigest, _ value: CASDigest) {
-        try? Data(value.hex.utf8).write(to: path(actionDirectory, key), options: .atomic)
+        let file = shard(actionDirectory, key.hex)
+        let existed = FileManager.default.fileExists(atPath: file.path)
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data(value.hex.utf8).write(to: file, options: .atomic)
+        guard !existed else { return }
+        actionFiles += 1
+        if actionFiles > maxActionFiles + maxActionFiles / 10 { pruneActions() }
+    }
+
+    private var actionFiles = 0
+    private let maxActionFiles: Int
+
+    private func actionFileList() -> [(url: URL, modified: Date)] {
+        var found: [(URL, Date)] = []
+        let files = FileManager.default.enumerator(
+            at: actionDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+        while let file = files?.nextObject() as? URL {
+            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+            guard values?.isRegularFile == true else { continue }
+            found.append((file, values?.contentModificationDate ?? .distantPast))
+        }
+        return found
+    }
+
+    private func countActions() {
+        actionFiles = actionFileList().count
+        if actionFiles > maxActionFiles { pruneActions() }
+    }
+
+    private func pruneActions() {
+        let target = maxActionFiles * 9 / 10
+        var excess = actionFileList().sorted { $0.modified < $1.modified }
+        var remaining = excess.count
+        excess.removeAll { FileManager.default.fileExists(atPath: pendingDirectory.appendingPathComponent($0.url.lastPathComponent).path) }
+        for entry in excess where remaining > target {
+            try? FileManager.default.removeItem(at: entry.url)
+            if let key = CASDigest(hex: entry.url.lastPathComponent) { actions[key] = nil }
+            remaining -= 1
+        }
+        actionFiles = remaining
     }
 
     private func writePending(_ key: CASDigest) {
-        FileManager.default.createFile(atPath: path(pendingDirectory, key).path, contents: Data())
+        FileManager.default.createFile(atPath: pendingDirectory.appendingPathComponent(key.hex).path, contents: Data())
     }
 
     private func clearPending(_ key: CASDigest) {
-        try? FileManager.default.removeItem(at: path(pendingDirectory, key))
+        try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(key.hex))
+    }
+
+    // The spool
+
+    private func isSpooled(_ digest: CASDigest) -> Bool {
+        FileManager.default.fileExists(atPath: shard(spoolDirectory, digest.hex).path)
+    }
+
+    private func writeSpool(_ blob: CASBlob) throws {
+        let file = shard(spoolDirectory, blob.digest.hex)
+        guard !FileManager.default.fileExists(atPath: file.path) else { return }
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try ObjectCache.encode(blob).write(to: file, options: .atomic)
+    }
+
+    private func readSpool(_ digest: CASDigest) -> CASBlob? {
+        guard let data = FileManager.default.contents(atPath: shard(spoolDirectory, digest.hex).path) else { return nil }
+        return ObjectCache.decode(data)
+    }
+
+    private func removeSpool(_ digest: CASDigest) {
+        try? FileManager.default.removeItem(at: shard(spoolDirectory, digest.hex))
+    }
+
+    /// Spooled objects that no action ever claimed (the client died between storing
+    /// and recording) are dropped after a day, at start-up.
+    private func sweepSpool() {
+        let cutoff = Date().addingTimeInterval(-24 * 3600)
+        let files = FileManager.default.enumerator(
+            at: spoolDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+        while let file = files?.nextObject() as? URL {
+            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+            if values?.isRegularFile == true, (values?.contentModificationDate ?? .distantFuture) < cutoff {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 }
