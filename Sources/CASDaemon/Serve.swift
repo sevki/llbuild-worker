@@ -5,7 +5,7 @@ import NIOHTTP1
 import NIOWebSocket
 
 /// The largest object body accepted over HTTP, as at the Worker.
-private let maxBodyBytes = CASLimits.maxHTTPObjectBytes + 1024
+private let maxBodyBytes = CASLimits.maxHTTPObjectBytes
 
 extension CASDaemon {
     // MARK: WebSocket: the control plane

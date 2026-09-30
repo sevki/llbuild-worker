@@ -238,8 +238,15 @@ public actor ScopeCache {
         if let existing = actions[key] ?? readAction(key), existing != value {
             throw CASServiceError.invalidDigest(key.hex)
         }
-        try writeAction(key, value)
+        // The pending marker first: pruning old records (inside `writeAction`) spares
+        // what is pending, and this record must be spared too.
         try writePending(key)
+        do {
+            try writeAction(key, value)
+        } catch {
+            clearPending(key)
+            throw error
+        }
         actions[key] = value
         misses[key] = nil
         pendingGeneration += 1

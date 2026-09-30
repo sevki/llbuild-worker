@@ -409,6 +409,32 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testPruningNeverTakesTheRecordOfAnActionStillPending() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20, maxActions: 10, retryInterval: .seconds(3600)) { _ in fake })
+        port = try await daemon.start()
+        await upstream.setDown(true)            // every action stays pending
+        let client = try client()
+        let object = blob("shared value")
+        try await client.put(object)
+        let keys = (0..<30).map { blob("pending \($0)").digest }
+        for key in keys { try await client.actionPut(key, value: object.digest) }
+        await client.close()
+        await daemon.stop()
+
+        await upstream.setDown(false)
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20, maxActions: 10) { _ in fake })
+        port = try await daemon.start()
+        let again = try self.client()
+        _ = try await again.status()
+        await daemon.drain()
+        var stored = 0
+        for key in keys where await upstream.actions[key] == object.digest { stored += 1 }
+        XCTAssertEqual(stored, 30, "every acknowledged action survived the restart")
+        await again.close()
+    }
+
     func testOnlyTheLoopbackIsServed() async throws {
         let fake = upstream!
         for host in ["0.0.0.0", "192.168.1.5", "::"] {
