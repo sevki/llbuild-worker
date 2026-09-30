@@ -431,13 +431,19 @@ public actor ScopeCache {
 
     // The spool
 
+    /// Whether a good copy is spooled: a file that is cut short or is another object
+    /// does not count, and is removed so it can be replaced.
     private func isSpooled(_ digest: CASDigest) -> Bool {
-        FileManager.default.fileExists(atPath: shard(spoolDirectory, digest.hex).path)
+        let file = shard(spoolDirectory, digest.hex)
+        guard FileManager.default.fileExists(atPath: file.path) else { return false }
+        if readSpool(digest) != nil { return true }
+        try? FileManager.default.removeItem(at: file)
+        return false
     }
 
     private func writeSpool(_ blob: CASBlob) throws {
         let file = shard(spoolDirectory, blob.digest.hex)
-        guard !FileManager.default.fileExists(atPath: file.path) else { return }
+        guard !isSpooled(blob.digest) else { return }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try ObjectCache.encode(blob).write(to: file, options: .atomic)
     }

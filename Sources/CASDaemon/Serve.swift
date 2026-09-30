@@ -68,6 +68,22 @@ extension CASDaemon {
             guard let k = digest(0) else { return Self.reply(id: id, error: "invalid digest") }
             return Self.reply(id: id, result: await cache.actionGet(k)?.hex ?? NSNull())
         }
+        if identifier.contains("13actionGetMany4keys") {
+            guard let names = arguments.first as? [String], names.count <= CASLimits.maxBatchKeys else {
+                return Self.reply(id: id, error: "expected at most \(CASLimits.maxBatchKeys) keys")
+            }
+            let keys = names.compactMap(Self.fullDigest)
+            guard keys.count == names.count else { return Self.reply(id: id, error: "invalid digest") }
+            let answers = await withTaskGroup(of: (Int, String?).self) { group in
+                for (index, key) in keys.enumerated() {
+                    group.addTask { (index, await cache.actionGet(key)?.hex) }
+                }
+                var all = [Any](repeating: NSNull(), count: keys.count)
+                for await (index, value) in group { if let value { all[index] = value } }
+                return all
+            }
+            return Self.reply(id: id, result: answers)
+        }
         if identifier.contains("9actionPut3key5value") {
             guard let k = digest(0), let v = digest(1) else { return Self.reply(id: id, error: "invalid digest") }
             // The Worker refuses an action whose value it does not hold; so does

@@ -373,6 +373,42 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testTheDaemonAnswersABatchOfLookupsLikeTheWorker() async throws {
+        let object = blob("batched")
+        await upstream.seed(object)
+        let hit = blob("hit").digest, miss = blob("miss").digest
+        await upstream.seed(action: hit, value: object.digest)
+        let client = try client()
+        let answers = try await client.actionGetMany([miss, hit, miss])
+        XCTAssertEqual(answers, [nil, object.digest, nil])
+        let none = try await client.actionGetMany([])
+        XCTAssertEqual(none, [])
+        await client.close()
+    }
+
+    func testADamagedSpoolFileIsNotTakenForACopyAndAPutRepairsIt() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        // A cache too small to keep anything, so the spool holds the only copy.
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+        let object = blob("only in the spool")
+        try await client.put(object)
+        let file = directory.appendingPathComponent("s/spool")
+            .appendingPathComponent(String(object.digest.hex.prefix(2))).appendingPathComponent(object.digest.hex)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+
+        try Data("garbage".utf8).write(to: file)
+        await upstream.setDown(true)            // so `contains` cannot be answered upstream
+        let held = try await client.contains(object.digest)
+        XCTAssertFalse(held, "a damaged file is not a copy")
+        try await client.put(object)            // repairs it
+        let repaired = try await client.contains(object.digest)
+        XCTAssertTrue(repaired)
+        await client.close()
+    }
+
     func testOnlyTheLoopbackIsServed() async throws {
         let fake = upstream!
         for host in ["0.0.0.0", "192.168.1.5", "::"] {
