@@ -282,7 +282,7 @@ public final class CASGateway {
         guard req.headers.get("Upgrade")?.lowercased() == "websocket" else {
             return .error("Expected Upgrade: websocket", 426)
         }
-        guard let (scope, _) = splitScope(req.path) else {
+        guard let scope = gatewayScope(req.path) else {
             return .error("Not Found", 404)
         }
 

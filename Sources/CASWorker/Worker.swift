@@ -19,6 +19,19 @@ private func isValidScope<S: StringProtocol>(_ scope: S) -> Bool {
         && scope.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
 }
 
+/// The scope `path` addresses `WorkersActorSystem.gatewayPath` under: bare
+/// `/__rpc` (no scope segment, what `WorkersActorSystem(worker:)` builds for
+/// a `workerURL` with no path) resolves to `"default"`, exactly like
+/// `route(...)`'s own default-scope attempt — a bare `splitScope(path)` here
+/// would instead misread `/__rpc`'s own path component as the scope name.
+/// `CASGateway.fetch(_:)` uses this so it can never drift from `route(...)`'s
+/// resolution of the same request.
+func gatewayScope(_ path: String) -> String? {
+    if path == WorkersActorSystem.gatewayPath { return "default" }
+    if let (scope, rest) = splitScope(path), rest == WorkersActorSystem.gatewayPath { return scope }
+    return nil
+}
+
 /// `scheme://host` from an absolute URL string, dropping its path and query.
 func origin(of url: String) -> String {
     guard let schemeEnd = url.range(of: "://") else { return url }
