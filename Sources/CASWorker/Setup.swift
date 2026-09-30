@@ -1,16 +1,20 @@
-/// The POSIX `sh` installer served at `/setup` (see `fetch(_:_:_:)` in
+/// The POSIX `sh` installer served at `/{scope}/setup` (see `route(...)` in
 /// Worker.swift), meant to be run as
-/// `curl --proto '=https' --tlsv1.2 -sSf https://xcache.devtoo.ls/setup | sh`.
+/// `curl --proto '=https' --tlsv1.2 -sSf https://xcache.devtoo.ls/setup | sh`
+/// (or `.../prod/setup`, `.../dev/setup`, ... for a non-default scope).
 ///
 /// It downloads the prebuilt CASPlugin published by
-/// `.github/workflows/release.yml`.
-let setupScript = #"""
+/// `.github/workflows/release.yml`, and writes `remoteURL` — this scope's own
+/// `origin/scope`, computed from the request that fetched this script — into
+/// the client's config, so the installed plugin talks to the same scope.
+func setupScript(scope: String, remoteURL: String) -> String {
+    #"""
 #!/bin/sh
 # xcache installer: downloads libCASPlugin and points it at the remote cache.
 set -eu
 
 REPO="sevki/llbuild-worker"
-REMOTE_URL="https://xcache.devtoo.ls"
+REMOTE_URL="\#(remoteURL)"
 INDEX_URL="$REMOTE_URL/"
 BASE_URL="https://github.com/$REPO/releases/latest/download"
 PLUGIN_DIR="$HOME/.cache/llbuild-cas/plugin"
@@ -93,7 +97,7 @@ fi
 
 cat <<EOF
 
-Installed $plugin
+Installed $plugin (scope: \#(scope))
 Wrote $CONFIG_FILE
 $token_note
 
@@ -116,3 +120,4 @@ Xcode / Swift Build settings:
 EOF
 
 """#
+}

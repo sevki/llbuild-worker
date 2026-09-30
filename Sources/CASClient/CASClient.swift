@@ -1,6 +1,9 @@
 import CASProtocol
 import Distributed
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import WorkerKitDistributed
 
 public struct CASClientError: Error, CustomStringConvertible {
@@ -19,6 +22,15 @@ public struct CASClientError: Error, CustomStringConvertible {
 public final class CASClient: @unchecked Sendable {
     private let system: WorkersActorSystem
     private let service: CASService
+    /// The authenticated worker URL (its path is the scope, e.g. `/prod`):
+    /// object bodies live at `<scheme>://<host>/<scope>/objects/<digest>`, a
+    /// plain-HTTP sibling of the WebSocket control plane at
+    /// `.../<scope>/__rpc`.
+    private let workerURL: URL
+    /// The bearer token for `PUT`, pulled back out of `workerURL`'s `token`
+    /// query item. `GET` needs none: the digest alone is the credential.
+    private let token: String?
+    private let session: URLSession
 
     /// Where the shared token lives when the URL doesn't carry one, next to
     /// the remote-URL file `/setup` writes.
@@ -49,8 +61,12 @@ public final class CASClient: @unchecked Sendable {
     }
 
     public init(workerURL: URL) throws {
-        system = WorkersActorSystem(worker: Self.authenticated(workerURL))
+        let authenticatedURL = Self.authenticated(workerURL)
+        system = WorkersActorSystem(worker: authenticatedURL)
         service = try CASService.resolve(id: "cas-service", using: system)
+        self.workerURL = authenticatedURL
+        token = presentedToken(url: authenticatedURL.absoluteString, authorization: nil)
+        session = URLSession(configuration: .ephemeral)
     }
 
     public func status() async throws -> CASServiceStatus {
@@ -61,75 +77,56 @@ public final class CASClient: @unchecked Sendable {
         try await service.contains(digest: digest.hex)
     }
 
-    /// Stores an object of any size up to `CASLimits.maxLargeObjectBytes`.
-    /// Objects over `CASLimits.maxObjectBytes` go up as chunks plus a manifest
-    /// and are then registered, which the service only accepts after
-    /// reassembling them and recomputing the identity.
-    @discardableResult
-    public func put(_ blob: CASBlob) async throws -> CASDigest {
-        if blob.data.count <= CASLimits.maxObjectBytes {
-            return try await putSmall(blob)
-        }
-        guard blob.data.count <= CASLimits.maxLargeObjectBytes else {
-            throw CASServiceError.objectTooLarge(size: blob.data.count, limit: CASLimits.maxLargeObjectBytes)
-        }
-        let expected = blob.digest
-        if try await contains(expected) { return expected }
-        let chunkDigests = try await concurrently(CASChunking.chunks(of: blob.data)) { chunk in
-            try await self.putSmall(CASBlob(refs: [], data: chunk))
-        }
-        let manifest = try await putSmall(
-            CASBlob(refs: chunkDigests, data: CASChunking.manifestData(size: blob.data.count)))
-        try await service.putLarge(digest: expected.hex, refs: blob.refs.map(\.hex), manifest: manifest.hex)
-        return expected
+    /// `<scheme>://<host>/<scope>/objects/<digest>` for `workerURL`'s scope.
+    private func objectURL(_ digest: CASDigest) -> URL {
+        var components = URLComponents(url: workerURL, resolvingAgainstBaseURL: false)!
+        let base = components.path.hasSuffix("/") ? String(components.path.dropLast()) : components.path
+        components.path = base + "/objects/" + digest.hex
+        components.query = nil
+        return components.url!
     }
 
-    private func putSmall(_ blob: CASBlob) async throws -> CASDigest {
+    /// Stores an object of any size up to `CASLimits.maxHTTPObjectBytes`, as
+    /// one streamed `PUT` — no client-side chunking: the service accepts a
+    /// full body directly, since a plain HTTP request has no WebSocket
+    /// message-size ceiling to work around.
+    @discardableResult
+    public func put(_ blob: CASBlob) async throws -> CASDigest {
         let digest = blob.digest
-        try await service.put(
-            digest: digest.hex, refs: blob.refs.map(\.hex),
-            data: Data(blob.data).base64EncodedString())
+        guard blob.data.count <= CASLimits.maxHTTPObjectBytes else {
+            throw CASServiceError.objectTooLarge(size: blob.data.count, limit: CASLimits.maxHTTPObjectBytes)
+        }
+        var request = URLRequest(url: objectURL(digest))
+        request.httpMethod = "PUT"
+        request.httpBody = Data(blob.data)
+        request.setValue(blob.refs.map(\.hex).joined(separator: ","), forHTTPHeaderField: "X-Cas-Refs")
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let (_, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw CASClientError("PUT \(digest.hex) failed with status \(status)")
+        }
         return digest
     }
 
+    /// Fetches an object over plain HTTP, unauthenticated: the digest is the
+    /// only credential a CAS entry has ever needed, since it is an
+    /// unguessable hash of the content it names.
     public func get(_ digest: CASDigest) async throws -> CASBlob? {
-        if let small = try await getSmall(digest) { return small }
-        guard let large = try await service.getLarge(digest: digest.hex) else { return nil }
-        guard let manifestDigest = CASDigest(hex: large.manifest),
-              let manifest = try await getSmall(manifestDigest),
-              CASChunking.size(ofManifestData: manifest.data) == large.size else {
-            throw CASClientError("large object \(digest.hex) has an invalid manifest")
+        var request = URLRequest(url: objectURL(digest))
+        request.httpMethod = "GET"
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CASClientError("GET \(digest.hex): no HTTP response")
         }
-        let pieces = try await concurrently(manifest.refs) { chunk in
-            guard let piece = try await self.getSmall(chunk) else {
-                throw CASClientError("large object \(digest.hex) is missing chunk \(chunk.hex)")
-            }
-            return piece.data
+        if http.statusCode == 404 { return nil }
+        guard (200..<300).contains(http.statusCode) else {
+            throw CASClientError("GET \(digest.hex) failed with status \(http.statusCode)")
         }
-        var data = [UInt8]()
-        data.reserveCapacity(large.size)
-        for piece in pieces { data.append(contentsOf: piece) }
-        let refs = try large.refs.map { ref -> CASDigest in
-            guard let parsed = CASDigest(hex: ref) else {
-                throw CASClientError("large object \(digest.hex) has invalid ref \(ref)")
-            }
-            return parsed
-        }
-        let blob = CASBlob(refs: refs, data: data)
-        guard data.count == large.size, blob.digest == digest else {
-            throw CASClientError("large object \(digest.hex) does not match its digest")
-        }
-        return blob
-    }
-
-    private func getSmall(_ digest: CASDigest) async throws -> CASBlob? {
-        guard let payload = try await service.get(digest: digest.hex) else { return nil }
-        guard let data = Data(base64Encoded: payload.data) else {
-            throw CASClientError("object \(digest.hex) has invalid base64 data")
-        }
-        let refs = try payload.refs.map { ref -> CASDigest in
-            guard let parsed = CASDigest(hex: ref) else {
-                throw CASClientError("object \(digest.hex) has invalid ref \(ref)")
+        let refsHeader = http.value(forHTTPHeaderField: "X-Cas-Refs") ?? ""
+        let refs = try refsHeader.isEmpty ? [] : refsHeader.split(separator: ",").map { part -> CASDigest in
+            guard let parsed = CASDigest(hex: String(part)) else {
+                throw CASClientError("object \(digest.hex) has invalid ref \(part)")
             }
             return parsed
         }
@@ -150,33 +147,6 @@ public final class CASClient: @unchecked Sendable {
 
     public func actionPut(_ key: CASDigest, value: CASDigest) async throws {
         try await service.actionPut(key: key.hex, value: value.hex)
-    }
-
-    /// Chunks in flight at once. They land on different shard actors, so they
-    /// proceed in parallel; the bound keeps the connection's queue short.
-    private static let chunkConcurrency = 8
-
-    /// Maps `items` with up to `chunkConcurrency` calls in flight, keeping
-    /// the results in input order.
-    private func concurrently<Item: Sendable, Result: Sendable>(
-        _ items: [Item], _ transform: @escaping @Sendable (Item) async throws -> Result
-    ) async throws -> [Result] {
-        try await withThrowingTaskGroup(of: (Int, Result).self) { group in
-            var results = [Result?](repeating: nil, count: items.count)
-            var next = 0
-            func launch() {
-                let index = next
-                next += 1
-                let item = items[index]
-                group.addTask { (index, try await transform(item)) }
-            }
-            while next < min(Self.chunkConcurrency, items.count) { launch() }
-            while let (index, result) = try await group.next() {
-                results[index] = result
-                if next < items.count { launch() }
-            }
-            return results.map { $0! }
-        }
     }
 
     public func close() async {

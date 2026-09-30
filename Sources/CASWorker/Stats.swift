@@ -215,11 +215,11 @@ final class CASStatsObject {
 struct StatsClient: Sendable {
     let keeper: CASStatsKeeper
 
-    init?(env: Env) {
+    init?(env: Env, scope: String) {
         guard env.jsObject["CASSTATS"].object != nil else { return nil }
         let namespace = env.durableObject("CASSTATS")
         guard let keeper = try? CASStatsKeeper.resolve(
-            id: namespace.idFromName("stats"), using: WorkersActorSystem(durableObjects: namespace)) else {
+            id: namespace.idFromName("stats/\(scope)"), using: WorkersActorSystem(durableObjects: namespace)) else {
             return nil
         }
         self.keeper = keeper
@@ -344,9 +344,9 @@ let statsWindowDays = 30
 /// How many networks `topASNs` reports.
 let statsTopASNsLimit = 10
 
-func gatherStats(env: Env) async -> StatsReport {
+func gatherStats(env: Env, scope: String) async -> StatsReport {
     var storage = ShardTotals(objects: 0, objectsInR2: 0, inlineBytes: 0, actions: 0, largeObjects: 0, largeBytes: 0)
-    if let shards = try? ShardBackend(namespace: env.durableObject("CASSHARD")).allShards() {
+    if let shards = try? ShardBackend(namespace: env.durableObject("CASSHARD"), scope: scope).allShards() {
         for shard in shards {
             guard let totals = try? await shard.totals() else { continue }
             storage.objects += totals.objects
@@ -360,7 +360,7 @@ func gatherStats(env: Env) async -> StatsReport {
 
     let now = Int(Date().timeIntervalSince1970)
     let sinceDay = StatsClient.today() - statsWindowDays + 1
-    guard let client = StatsClient(env: env),
+    guard let client = StatsClient(env: env, scope: scope),
           let counters = try? await client.keeper.counters(since: sinceDay) else {
         return StatsReport(enabled: false, generatedAt: now, storage: storage, days: [], topASNs: [], distinctIPs: 0)
     }
@@ -662,8 +662,8 @@ private func statsDocument(_ report: StatsReport) -> Node {
     )
 }
 
-func statsResponse(env: Env, json: Bool) async -> Response {
-    let report = await gatherStats(env: env)
+func statsResponse(env: Env, scope: String, json: Bool) async -> Response {
+    let report = await gatherStats(env: env, scope: scope)
     guard json else { return .html(statsDocument(report)) }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]

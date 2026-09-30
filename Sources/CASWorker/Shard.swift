@@ -165,19 +165,24 @@ final class CASShardObject {
 }
 
 /// `CASBackend` over shard actors: a digest picks a shard by its first hex
-/// digit, so the keyspace splits across 16 Durable Objects. Fixed for now;
-/// changing it needs a resharding plan (see docs/design.md).
+/// digit, so the keyspace splits across 16 Durable Objects per scope. Fixed
+/// for now; changing it needs a resharding plan (see docs/design.md).
 struct ShardBackend: CASBackend {
     let namespace: DurableObjectNamespace
+    /// Isolates this store from every other scope sharing the same
+    /// `CASSHARD` binding — `scope`'s 16 shards never share an object,
+    /// action or Durable Object with another scope's.
+    let scope: String
     let system: WorkersActorSystem
 
-    init(namespace: DurableObjectNamespace) {
+    init(namespace: DurableObjectNamespace, scope: String) {
         self.namespace = namespace
+        self.scope = scope
         self.system = WorkersActorSystem(durableObjects: namespace)
     }
 
     private func shard(for digest: String) throws -> CASShard {
-        try CASShard.resolve(id: namespace.idFromName("shard-\(digest.prefix(1))"), using: system)
+        try CASShard.resolve(id: namespace.idFromName("\(scope)/shard-\(digest.prefix(1))"), using: system)
     }
 
     /// Every shard, for reading totals across the whole store.
@@ -254,30 +259,41 @@ struct ShardBackend: CASBackend {
 /// One WebSocket connection's gateway. Unlike WorkerKit's `RPCGateway`,
 /// which relays to a Worker entry point that has no `env`, this Durable Object
 /// hosts the `CASService` itself so the service can reach the shard namespace.
+///
+/// Its own Durable Object id is a fresh unique one per connection (see
+/// `route(...)` in Worker.swift), not derived from a scope, so the scope
+/// this connection serves is only known once `fetch(_:)` sees the request's
+/// URL — `service`/`stats` are built there, not in `init`.
 @DurableObject
 public final class CASGateway {
     let state: DurableObjectState
+    let env: Env
     let hostSystem: WorkersActorSystem
-    let service: CASService
-    let stats: StatsClient?
+    var service: CASService?
+    var stats: StatsClient?
 
     public init(state: DurableObjectState, env: Env) {
         self.state = state
-        let hostSystem = WorkersActorSystem()
-        self.hostSystem = hostSystem
-        let shards = ShardBackend(namespace: env.durableObject("CASSHARD"))
-        let stats = StatsClient(env: env)
-        self.stats = stats
-        let backend: any CASBackend = stats.map { StatsBackend(inner: shards, stats: $0) } ?? shards
-        let service = CASService(actorSystem: hostSystem, backend: backend)
-        hostSystem.host(service)
-        self.service = service
+        self.env = env
+        self.hostSystem = WorkersActorSystem()
     }
 
     public func fetch(_ req: Request) async throws -> Response {
         guard req.headers.get("Upgrade")?.lowercased() == "websocket" else {
             return .error("Expected Upgrade: websocket", 426)
         }
+        guard let (scope, _) = splitScope(req.path) else {
+            return .error("Not Found", 404)
+        }
+
+        let shards = ShardBackend(namespace: env.durableObject("CASSHARD"), scope: scope)
+        let stats = StatsClient(env: env, scope: scope)
+        self.stats = stats
+        let backend: any CASBackend = stats.map { StatsBackend(inner: shards, stats: $0) } ?? shards
+        let service = CASService(actorSystem: hostSystem, backend: backend)
+        hostSystem.host(service)
+        self.service = service
+
         stats?.record([StatsName.connections: 1])
         stats?.recordConnection(ip: req.headers.get("cf-connecting-ip"), cf: req.cf)
         return .webSocketUpgrade(state.acceptWebSocket(tags: ["rpc"]))
@@ -286,5 +302,63 @@ public final class CASGateway {
     public func webSocketMessage(_ ws: WebSocket, _ message: WebSocketMessage) async throws {
         guard case .text(let text) = message else { return }
         ws.send(await hostSystem.receiveJSON(text))
+    }
+}
+
+/// `GET`/`PUT /{scope}/objects/{digest}`: object bodies over plain HTTP
+/// instead of the WebSocket control plane, so a `GET` is an ordinary
+/// cacheable response and a `PUT` is one streamed body instead of
+/// `CASLimits.chunkBytes`-sized pieces reassembled in the isolate.
+///
+/// `GET` needs no token: a CAS digest has only ever had one credential —
+/// knowing it, since it is an unguessable hash of the content it names.
+/// `PUT` still requires the same token the WebSocket control plane does,
+/// because writing costs storage and the digest alone does not prove `data`
+/// is genuine (the shard recomputes and rejects a mismatch regardless).
+func objectsResponse(req: Request, env: Env, scope: String, digest: String) async throws -> Response {
+    guard let parsed = CASDigest(hex: digest), parsed.bytes.count == CASIdentity.digestSize else {
+        return .error("Not Found", 404)
+    }
+    let backend = ShardBackend(namespace: env.durableObject("CASSHARD"), scope: scope)
+
+    switch req.method {
+    case "GET":
+        guard let object = try await backend.get(digest: digest),
+              let bytes = Data(base64Encoded: object.data) else {
+            return .error("Not Found", 404)
+        }
+        return Response(
+            status: 200,
+            headers: [
+                ("content-type", "application/octet-stream"),
+                ("etag", "\"\(digest)\""),
+                ("cache-control", "public, max-age=31536000, immutable"),
+                ("x-cas-refs", object.refs.joined(separator: ",")),
+            ],
+            body: [UInt8](bytes))
+
+    case "PUT":
+        guard let expected = env.secret("CAS_TOKEN"), !expected.isEmpty else {
+            return .error("Service not configured", 503)
+        }
+        guard let presented = presentedToken(url: req.url, authorization: req.headers.get("authorization")),
+              constantTimeEqual(presented, expected) else {
+            return .error("Unauthorized", 401)
+        }
+        let bytes = try await req.bytes()
+        guard bytes.count <= CASLimits.maxHTTPObjectBytes else {
+            return .error("Payload Too Large", 413)
+        }
+        let refsHeader = req.headers.get("x-cas-refs") ?? ""
+        let refs = refsHeader.isEmpty ? [] : refsHeader.split(separator: ",").map(String.init)
+        do {
+            try await backend.put(digest: digest, refs: refs, data: Data(bytes).base64EncodedString())
+        } catch let error as CASServiceError {
+            return .error(error.description, 400)
+        }
+        return .empty(status: 201)
+
+    default:
+        return .error("Method Not Allowed", 405)
     }
 }

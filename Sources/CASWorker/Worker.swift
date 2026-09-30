@@ -3,32 +3,81 @@ import JavaScriptKit
 import WorkerKitDistributed
 import WorkerKit
 
-/// Native clients connect to `/__rpc` over a WebSocket. Each connection gets
-/// its own `CASGateway`, which hosts a stateless `CASService` in front of the
-/// per-shard Durable Objects.
+/// Splits `/scope/rest...` into its leading path segment and everything
+/// after it, e.g. `/prod/stats` -> `("prod", "/stats")`. `fetch(_:_:_:)` uses
+/// this to let a scope isolate its own store (shards, gateway and stats)
+/// from every other one under the same deployment — `xcache.devtoo.ls/prod`
+/// and `/dev` never share objects, actions or traffic counters.
+func splitScope(_ path: String) -> (scope: String, rest: String)? {
+    let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+    guard let first = parts.first, isValidScope(first) else { return nil }
+    return (String(first), "/" + parts.dropFirst().joined(separator: "/"))
+}
+
+private func isValidScope<S: StringProtocol>(_ scope: S) -> Bool {
+    !scope.isEmpty && scope.count <= 63
+        && scope.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+}
+
+/// `scheme://host` from an absolute URL string, dropping its path and query.
+func origin(of url: String) -> String {
+    guard let schemeEnd = url.range(of: "://") else { return url }
+    let afterScheme = url[schemeEnd.upperBound...]
+    let hostEnd = afterScheme.firstIndex(of: "/") ?? afterScheme.endIndex
+    return String(url[..<schemeEnd.upperBound]) + String(afterScheme[..<hostEnd])
+}
+
+/// Native clients connect to `/{scope}/__rpc` over a WebSocket. Each
+/// connection gets its own `CASGateway`, which hosts a stateless `CASService`
+/// in front of the per-shard Durable Objects. Object bodies instead travel
+/// over the plain-HTTP `/{scope}/objects/{digest}` sibling: see
+/// `objectsResponse(req:env:scope:digest:)` in Shard.swift.
+///
+/// A request with no scope segment (`/__rpc`, `/stats`, ...) is handled as
+/// scope `"default"`, so a deployment that never opts into multiple scopes
+/// keeps working exactly as it did before scopes existed.
 @Event(.fetch)
 func fetch(req: Request, env: Env, ctx: Context) async throws -> Response {
-    if req.path == "/setup" {
-        return .text(setupScript, status: 200)
-    }
-
-    // Public like the page it feeds: a WebSocket that pushes counter updates.
-    if req.path == "/stats/live" {
-        guard env.jsObject["CASSTATS"].object != nil else { return .error("Statistics are not enabled", 404) }
-        let stats = env.durableObject("CASSTATS")
-        return try await stats.get(id: stats.idFromName("stats")).fetch(req)
-    }
-
-    if req.path == "/stats" || req.path == "/stats.json" {
-        return await statsResponse(env: env, json: req.path == "/stats.json")
-    }
-
     if req.path == "/" {
         return indexResponse()
     }
 
-    guard req.path == WorkersActorSystem.gatewayPath else {
-        return .error("Not Found", 404)
+    if let response = try await route(req: req, env: env, path: req.path, scope: "default") {
+        return response
+    }
+    if let (scope, rest) = splitScope(req.path),
+       let response = try await route(req: req, env: env, path: rest, scope: scope) {
+        return response
+    }
+    return .error("Not Found", 404)
+}
+
+/// Matches `path` against every route this Worker serves within `scope`, or
+/// returns `nil` for no match so the caller can retry after splitting off a
+/// scope segment.
+private func route(req: Request, env: Env, path: String, scope: String) async throws -> Response? {
+    if path == "/setup" {
+        return .text(setupScript(scope: scope, remoteURL: origin(of: req.url) + "/" + scope), status: 200)
+    }
+
+    // Public like the page it feeds: a WebSocket that pushes counter updates.
+    if path == "/stats/live" {
+        guard env.jsObject["CASSTATS"].object != nil else { return .error("Statistics are not enabled", 404) }
+        let stats = env.durableObject("CASSTATS")
+        return try await stats.get(id: stats.idFromName("stats/\(scope)")).fetch(req)
+    }
+
+    if path == "/stats" || path == "/stats.json" {
+        return await statsResponse(env: env, scope: scope, json: path == "/stats.json")
+    }
+
+    if path.hasPrefix("/objects/") {
+        return try await objectsResponse(
+            req: req, env: env, scope: scope, digest: String(path.dropFirst("/objects/".count)))
+    }
+
+    guard path == WorkersActorSystem.gatewayPath else {
+        return nil
     }
 
     // Fail closed: without a configured CAS_TOKEN nobody gets in.
