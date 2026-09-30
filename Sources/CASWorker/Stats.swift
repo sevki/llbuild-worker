@@ -489,6 +489,13 @@ private func asnTable(_ topASNs: [ASNStat]) -> Node {
 private let statsScript: StaticString = """
     (function () {
       var report = null;
+      // This page's own scope prefix (e.g. "/prod" for /prod/stats, "" for
+      // the unscoped default at /stats): every fetch and the live WebSocket
+      // below must carry it, or they silently pull the default scope's data
+      // onto a scoped page.
+      var statsPath = location.pathname.charAt(location.pathname.length - 1) === '/'
+        ? location.pathname.slice(0, -1) : location.pathname;
+      var prefix = statsPath.slice(-6) === '/stats' ? statsPath.slice(0, -6) : '';
       var fields = ['hits', 'misses', 'actionsPut', 'objectsPut', 'objectsGot', 'bytesUp', 'bytesDown', 'connections'];
       // The unit symbols and the step between them come from the server.
       var tiles = document.getElementById('live-tiles');
@@ -574,7 +581,7 @@ private let statsScript: StaticString = """
         highlight();
       }
       function load() {
-        fetch('/stats.json').then(function (r) { return r.json(); }).then(function (r) { report = r; render(); });
+        fetch(prefix + '/stats.json').then(function (r) { return r.json(); }).then(function (r) { report = r; render(); });
       }
       function apply(event) {
         if (!report || !report.enabled) return;
@@ -588,7 +595,7 @@ private let statsScript: StaticString = """
         render();
       }
       function connect() {
-        var socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/stats/live');
+        var socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + prefix + '/stats/live');
         socket.onopen = function () { status('Live'); load(); };
         socket.onmessage = function (message) { apply(JSON.parse(message.data)); };
         socket.onclose = function () { status('Reconnecting...'); setTimeout(connect, 3000); };
