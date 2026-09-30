@@ -1,5 +1,5 @@
 {
-  "originHash" : "adff6d0aaf021428db5d618c44e40e4a1ca204c7d7c35a02cd6174046ccd5caf",
+  "originHash" : "07e48cf669cfc57342e9ed15712f1a25f730125c08ea1932141066a9c7ed3727",
   "pins" : [
     {
       "identity" : "compress-nio",
@@ -134,6 +134,14 @@
       "state" : {
         "revision" : "9c6fb14227f55d8f711ce3847dc2f419fb0ecacb",
         "version" : "1.15.1"
+      }
+    },
+    {
+      "identity" : "swift-lru-cache",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tornikegomareli/swift-lru-cache.git",
+      "state" : {
+        "revision" : "a4ce798976091ada42d1b22caf1158a185090a3b"
       }
     },
     {

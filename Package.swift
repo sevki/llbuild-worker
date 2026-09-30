@@ -30,6 +30,13 @@ let package = Package(
             url: "https://github.com/sevki/WorkerKit.git",
             revision: "4821611f07708cb4402922b584323dec5668a5b4"
         ),
+        // The recency index of the daemon's on-disk object cache: O(1) gets and
+        // evictions, a byte limit, and a callback when an entry is evicted (to delete
+        // its file). Pinned to a commit: a small project, so updates are reviewed.
+        .package(
+            url: "https://github.com/tornikegomareli/swift-lru-cache.git",
+            revision: "a4ce798976091ada42d1b22caf1158a185090a3b"
+        ),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
         .package(url: "https://github.com/pointfreeco/swift-html", from: "0.5.0"),
         // SI prefixes (symbol and power of ten) for the sizes the stats page shows.
@@ -52,6 +59,15 @@ let package = Package(
             ]
         ),
         .target(name: "CLLCAS"),
+        // A local cache in front of the Worker, for many short-lived compiler
+        // processes: see docs/daemon.md.
+        .target(
+            name: "CASDaemon",
+            dependencies: [
+                "CASProtocol", "CASClient",
+                .product(name: "SwiftLRUCache", package: "swift-lru-cache"),
+            ]
+        ),
         // Native-only client for the CAS service; shared by castool and the plugin.
         .target(
             name: "CASClient",
@@ -92,6 +108,7 @@ let package = Package(
             "CASProtocol", "CASClient",
             .product(name: "WorkerKitDistributed", package: "WorkerKit"),
         ], swiftSettings: testSwiftSettings),
+        .testTarget(name: "CASDaemonTests", dependencies: ["CASDaemon", "CASProtocol"], swiftSettings: testSwiftSettings),
         .testTarget(name: "CASPluginTests", dependencies: ["CASPlugin", "CASProtocol"], swiftSettings: testSwiftSettings),
     ]
 )
