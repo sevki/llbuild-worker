@@ -97,6 +97,9 @@ public enum CASLimits {
     /// `chunkBytes` pieces. Bounded by the Worker isolate's memory, same as
     /// `maxLargeObjectBytes`.
     public static let maxHTTPObjectBytes = 64 * 1024 * 1024
+
+    /// Most keys one `actionGetMany` may carry: a reply is one short string per key.
+    public static let maxBatchKeys = 256
 }
 
 /// A large object's entry: its references, the manifest object that lists its
@@ -187,6 +190,26 @@ public distributed actor CASService {
 
     public distributed func actionGet(key: String) async throws -> String? {
         try await requireBackend().actionGet(key: try Self.validated(key))
+    }
+
+    /// Many `actionGet`s in one call, for a client with many lookups outstanding:
+    /// one round trip instead of one each. The answers are in the order of the
+    /// keys, nil for an action that is not stored. Objects are not part of it; they
+    /// stay on the plain HTTP endpoints.
+    public distributed func actionGetMany(keys: [String]) async throws -> [String?] {
+        guard keys.count <= CASLimits.maxBatchKeys else {
+            throw CASServiceError.objectTooLarge(size: keys.count, limit: CASLimits.maxBatchKeys)
+        }
+        let backend = try requireBackend()
+        let valid = try keys.map(Self.validated)
+        return try await withThrowingTaskGroup(of: (Int, String?).self) { group in
+            for (index, key) in valid.enumerated() {
+                group.addTask { (index, try await backend.actionGet(key: key)) }
+            }
+            var answers = [String?](repeating: nil, count: valid.count)
+            for try await (index, value) in group { answers[index] = value }
+            return answers
+        }
     }
 
     public distributed func actionPut(key: String, value: String) async throws {

@@ -44,6 +44,12 @@ actor FakeUpstream: CASUpstream {
         actionGets += 1
         return actions[key]
     }
+    var manyCalls: [Int] = []
+    func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
+        if down { throw Down() }
+        manyCalls.append(keys.count)
+        return keys.map { actions[$0] }
+    }
     func actionPut(_ key: CASDigest, value: CASDigest) async throws {
         if down { throw Down() }
         guard objects[value] != nil else { throw Down() }
@@ -203,6 +209,35 @@ final class DaemonTests: XCTestCase {
             return try await group.reduce(into: [Bool]()) { $0.append($1) }
         }
         XCTAssertEqual(results.count, 200)
+        await client.close()
+    }
+
+    func testLookupsThatArriveTogetherShareOneUpstreamCall() async throws {
+        let object = blob("value")
+        await upstream.seed(object)
+        var keys: [CASDigest] = []
+        for index in 0..<40 {
+            let key = blob("action \(index)").digest
+            keys.append(key)
+            if index % 2 == 0 { await upstream.seed(action: key, value: object.digest) }
+        }
+        let client = try client()
+        let answers = try await withThrowingTaskGroup(of: (Int, CASDigest?).self) { group in
+            for (index, key) in keys.enumerated() {
+                group.addTask { (index, try await client.actionGet(key)) }
+            }
+            var all = [CASDigest?](repeating: nil, count: keys.count)
+            for try await (index, value) in group { all[index] = value }
+            return all
+        }
+        for (index, answer) in answers.enumerated() {
+            XCTAssertEqual(answer, index % 2 == 0 ? object.digest : nil, "key \(index)")
+        }
+        let calls = await upstream.manyCalls
+        XCTAssertEqual(calls.reduce(0, +), 40)
+        XCTAssertLessThan(calls.count, 10, "40 lookups should not cost 40 calls: \(calls)")
+        let singles = await upstream.actionGets
+        XCTAssertEqual(singles, 0)
         await client.close()
     }
 

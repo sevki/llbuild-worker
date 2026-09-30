@@ -21,6 +21,7 @@ public actor ScopeCache {
     private let actionDirectory: URL
     private let pendingDirectory: URL
     private let negativeTTL: Duration
+    private let batchWindow: Duration
     private let log: @Sendable (String) -> Void
 
     private var actions: [CASDigest: CASDigest] = [:]
@@ -31,20 +32,20 @@ public actor ScopeCache {
     private var uploading: [CASDigest: Task<Bool, Never>] = [:]
     private var forwarding: [CASDigest: Task<Void, Never>] = [:]
 
-    private var inflight = 0
-    private var maxInflight = 0
     private var lookups = 0
+    private var batches = 0
     private var lookupTime = Duration.zero
     private var lookupSummary: String {
         let mean = lookups == 0 ? Duration.zero : lookupTime / lookups
-        return "upstream actionGet: \(lookups) calls, mean \(mean), at most \(maxInflight) at once"
+        return "upstream actionGet: \(lookups) lookups in \(batches) calls, mean \(mean) each"
     }
 
     static let maxActionsInMemory = 500_000
 
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
-        negativeTTL: Duration = .seconds(5), log: @escaping @Sendable (String) -> Void = { _ in }
+        negativeTTL: Duration = .seconds(5), batchWindow: Duration = .milliseconds(3),
+        log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
         self.objects = try await ObjectCache.open(
             directory: directory.appendingPathComponent("objects"), maxBytes: maxBytes)
@@ -52,6 +53,7 @@ public actor ScopeCache {
         self.actionDirectory = directory.appendingPathComponent("actions")
         self.pendingDirectory = directory.appendingPathComponent("pending")
         self.negativeTTL = negativeTTL
+        self.batchWindow = batchWindow
         self.log = log
         try FileManager.default.createDirectory(at: actionDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
@@ -132,29 +134,77 @@ public actor ScopeCache {
             return value
         }
         if let since = misses[key], ContinuousClock.now - since < negativeTTL { return nil }
-        let found: CASDigest?
-        inflight += 1
-        maxInflight = max(maxInflight, inflight)
         let started = ContinuousClock.now
-        defer {
-            inflight -= 1
-            lookups += 1
-            lookupTime += ContinuousClock.now - started
-            if lookups % 50 == 0 { log(lookupSummary) }
-        }
-        do {
-            found = try await upstream.actionGet(key)
-        } catch {
+        let found = await lookUpstream(key)
+        lookups += 1
+        lookupTime += ContinuousClock.now - started
+        if lookups % 50 == 0 { log(lookupSummary) }
+        let value: CASDigest
+        switch found {
+        case .failed:
             return nil
-        }
-        guard let value = found else {
+        case .miss:
             misses[key] = .now
             return nil
+        case .hit(let hit):
+            value = hit
         }
         remember(key: key, value: value)
         // The value and what it references follow, ahead of the compiler asking.
         prefetch([value])
         return value
+    }
+
+    // MARK: Batched lookups
+
+    private enum Lookup: Sendable {
+        case hit(CASDigest), miss, failed
+    }
+
+    private var waiting: [CASDigest: [CheckedContinuation<Lookup, Never>]] = [:]
+    private var flushScheduled = false
+
+    /// Lookups that arrive within `batchWindow` of each other share one upstream
+    /// call; a build's many compiler processes ask at about the same moment.
+    private func lookUpstream(_ key: CASDigest) async -> Lookup {
+        await withCheckedContinuation { continuation in
+            waiting[key, default: []].append(continuation)
+            if waiting.count >= CASLimits.maxBatchKeys {
+                flush()
+            } else if !flushScheduled {
+                flushScheduled = true
+                Task { [self, batchWindow] in
+                    try? await Task.sleep(for: batchWindow)
+                    flush()
+                }
+            }
+        }
+    }
+
+    private func flush() {
+        flushScheduled = false
+        guard !waiting.isEmpty else { return }
+        let batch = waiting
+        waiting = [:]
+        batches += 1
+        Task { [self] in
+            let keys = Array(batch.keys)
+            let answers: [CASDigest?]?
+            do {
+                answers = try await upstream.actionGetMany(keys)
+            } catch {
+                answers = nil
+            }
+            for (index, key) in keys.enumerated() {
+                let result: Lookup
+                if let answers, answers.count == keys.count {
+                    result = answers[index].map { .hit($0) } ?? .miss
+                } else {
+                    result = .failed
+                }
+                for waiter in batch[key] ?? [] { waiter.resume(returning: result) }
+            }
+        }
     }
 
     /// Acknowledged when recorded locally; the upload happens behind it.

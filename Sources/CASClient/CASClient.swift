@@ -145,6 +145,21 @@ public final class CASClient: @unchecked Sendable {
         return parsed
     }
 
+    /// `actionGet` for many keys in one round trip; answers are in the keys' order.
+    public func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
+        let replies = try await service.actionGetMany(keys: keys.map(\.hex))
+        guard replies.count == keys.count else {
+            throw CASClientError("asked for \(keys.count) actions, got \(replies.count) answers")
+        }
+        return try zip(keys, replies).map { key, reply in
+            guard let reply else { return nil }
+            guard let parsed = CASDigest(hex: reply) else {
+                throw CASClientError("action \(key.hex) has invalid value \(reply)")
+            }
+            return parsed
+        }
+    }
+
     public func actionPut(_ key: CASDigest, value: CASDigest) async throws {
         try await service.actionPut(key: key.hex, value: value.hex)
     }

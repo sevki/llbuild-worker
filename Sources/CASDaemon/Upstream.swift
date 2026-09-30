@@ -13,6 +13,22 @@ public protocol CASUpstream: Sendable {
     func put(_ blob: CASBlob) async throws
     func actionGet(_ key: CASDigest) async throws -> CASDigest?
     func actionPut(_ key: CASDigest, value: CASDigest) async throws
+    /// `actionGet` for many keys at once, answers in the keys' order.
+    func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?]
+}
+
+extension CASUpstream {
+    /// For an upstream that cannot batch: the lookups run side by side.
+    public func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
+        try await withThrowingTaskGroup(of: (Int, CASDigest?).self) { group in
+            for (index, key) in keys.enumerated() {
+                group.addTask { (index, try await self.actionGet(key)) }
+            }
+            var answers = [CASDigest?](repeating: nil, count: keys.count)
+            for try await (index, value) in group { answers[index] = value }
+            return answers
+        }
+    }
 }
 
 /// The Worker, over `CASClient`. One client is held and shared by every call; if
@@ -75,5 +91,30 @@ public actor ClientUpstream: CASUpstream {
 
     public func actionPut(_ key: CASDigest, value: CASDigest) async throws {
         try await call { try await $0.actionPut(key, value: value) }
+    }
+
+    /// A Worker that predates the batch call fails it; after that, lookups go one
+    /// at a time, as before.
+    private var batchSupported = true
+
+    public func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
+        if batchSupported {
+            do {
+                return try await call { try await $0.actionGetMany(keys) }
+            } catch {
+                // If a plain lookup fails too, the trouble is real; if it works, the
+                // Worker just does not have the batch call.
+                if let first = keys.first { _ = try await actionGet(first) }
+                batchSupported = false
+            }
+        }
+        return try await withThrowingTaskGroup(of: (Int, CASDigest?).self) { group in
+            for (index, key) in keys.enumerated() {
+                group.addTask { (index, try await self.actionGet(key)) }
+            }
+            var answers = [CASDigest?](repeating: nil, count: keys.count)
+            for try await (index, value) in group { answers[index] = value }
+            return answers
+        }
     }
 }
