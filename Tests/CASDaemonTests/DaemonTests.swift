@@ -48,6 +48,7 @@ actor FakeUpstream: CASUpstream {
     func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
         if down { throw Down() }
         manyCalls.append(keys.count)
+        try await Task.sleep(for: .milliseconds(20))     // a round trip, so lookups pile up behind it
         return keys.map { actions[$0] }
     }
     func actionPut(_ key: CASDigest, value: CASDigest) async throws {

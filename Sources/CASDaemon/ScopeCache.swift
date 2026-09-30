@@ -25,7 +25,6 @@ public actor ScopeCache {
     /// waits in: a file here stays until it has been uploaded.
     private let spoolDirectory: URL
     private let negativeTTL: Duration
-    private let batchWindow: Duration
     private let retryInterval: Duration
     private var retrier: Task<Void, Never>?
     /// Bumped by every action recorded, so a sweep can tell that one arrived while
@@ -60,8 +59,7 @@ public actor ScopeCache {
 
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
-        maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), batchWindow: Duration = .milliseconds(3),
-        retryInterval: Duration = .seconds(60),
+        maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
         self.objects = try await ObjectCache.open(
@@ -72,7 +70,6 @@ public actor ScopeCache {
         self.spoolDirectory = directory.appendingPathComponent("spool")
         self.maxActionFiles = maxActions
         self.negativeTTL = negativeTTL
-        self.batchWindow = batchWindow
         self.retryInterval = retryInterval
         self.log = log
         try FileManager.default.createDirectory(at: actionDirectory, withIntermediateDirectories: true)
@@ -184,48 +181,50 @@ public actor ScopeCache {
     }
 
     private var waiting: [CASDigest: [CheckedContinuation<Lookup, Never>]] = [:]
-    private var flushScheduled = false
+    private var callsInFlight = 0
+    private static let maxCallsInFlight = 2
 
-    /// Lookups that arrive within `batchWindow` of each other share one upstream
-    /// call; a build's many compiler processes ask at about the same moment.
+    /// Lookups are batched by what piles up while a call is out, not by a timer: one
+    /// that finds the upstream idle goes at once (no added latency), and while calls
+    /// are in flight new ones accumulate and go together when one returns. So the
+    /// longer the round trip, the larger the batches, which is when they pay.
     private func lookUpstream(_ key: CASDigest) async -> Lookup {
         await withCheckedContinuation { continuation in
             waiting[key, default: []].append(continuation)
-            if waiting.count >= CASLimits.maxBatchKeys {
-                flush()
-            } else if !flushScheduled {
-                flushScheduled = true
-                Task { [self, batchWindow] in
-                    try? await Task.sleep(for: batchWindow)
-                    flush()
-                }
+            sendWaiting()
+        }
+    }
+
+    private func sendWaiting() {
+        while !waiting.isEmpty, callsInFlight < Self.maxCallsInFlight {
+            var batch: [CASDigest: [CheckedContinuation<Lookup, Never>]] = [:]
+            for key in waiting.keys.prefix(CASLimits.maxBatchKeys) { batch[key] = waiting.removeValue(forKey: key) }
+            callsInFlight += 1
+            batches += 1
+            Task { [self] in
+                await send(batch)
+                callsInFlight -= 1
+                sendWaiting()
             }
         }
     }
 
-    private func flush() {
-        flushScheduled = false
-        guard !waiting.isEmpty else { return }
-        let batch = waiting
-        waiting = [:]
-        batches += 1
-        Task { [self] in
-            let keys = Array(batch.keys)
-            let answers: [CASDigest?]?
-            do {
-                answers = try await upstream.actionGetMany(keys)
-            } catch {
-                answers = nil
+    private func send(_ batch: [CASDigest: [CheckedContinuation<Lookup, Never>]]) async {
+        let keys = Array(batch.keys)
+        let answers: [CASDigest?]?
+        do {
+            answers = try await upstream.actionGetMany(keys)
+        } catch {
+            answers = nil
+        }
+        for (index, key) in keys.enumerated() {
+            let result: Lookup
+            if let answers, answers.count == keys.count {
+                result = answers[index].map { .hit($0) } ?? .miss
+            } else {
+                result = .failed
             }
-            for (index, key) in keys.enumerated() {
-                let result: Lookup
-                if let answers, answers.count == keys.count {
-                    result = answers[index].map { .hit($0) } ?? .miss
-                } else {
-                    result = .failed
-                }
-                for waiter in batch[key] ?? [] { waiter.resume(returning: result) }
-            }
+            for waiter in batch[key] ?? [] { waiter.resume(returning: result) }
         }
     }
 
