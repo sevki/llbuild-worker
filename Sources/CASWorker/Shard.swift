@@ -279,6 +279,7 @@ public final class CASGateway {
             return .error("Expected Upgrade: websocket", 426)
         }
         stats?.record([StatsName.connections: 1])
+        stats?.recordConnection(ip: req.headers.get("cf-connecting-ip"), cf: req.cf)
         return .webSocketUpgrade(state.acceptWebSocket(tags: ["rpc"]))
     }
 

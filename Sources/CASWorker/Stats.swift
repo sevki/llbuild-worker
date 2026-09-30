@@ -44,6 +44,14 @@ enum StatsName {
     static let connections = "connections"
 }
 
+/// One network's connection count over the reporting window.
+struct ASNStat: Codable, Sendable {
+    var asn: Int
+    var asOrganization: String
+    var country: String
+    var connections: Int
+}
+
 /// Daily traffic counters, in the SQLite of a single Durable Object.
 distributed actor CASStatsKeeper {
     typealias ActorSystem = WorkersActorSystem
@@ -75,9 +83,30 @@ distributed actor CASStatsKeeper {
         if !schemaReady {
             try storage.exec(
                 "CREATE TABLE IF NOT EXISTS counters (day INTEGER NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (day, name))")
+            try storage.exec(
+                """
+                CREATE TABLE IF NOT EXISTS asn_counts (
+                    day INTEGER NOT NULL, asn INTEGER NOT NULL,
+                    as_organization TEXT NOT NULL, country TEXT NOT NULL,
+                    count INTEGER NOT NULL, PRIMARY KEY (day, asn)
+                )
+                """)
+            try storage.exec(
+                "CREATE TABLE IF NOT EXISTS connections_raw (day INTEGER NOT NULL, ip TEXT, asn INTEGER, connected_at INTEGER NOT NULL)")
             schemaReady = true
         }
         return storage
+    }
+
+    /// Prunes every table's history to `statsRetentionDays`, at most once per
+    /// distinct `day` seen (`record` and `recordConnection` both call this).
+    private func pruneIfNeeded(day: Int, db: SQLStorage) throws {
+        guard prunedDay != day else { return }
+        prunedDay = day
+        let cutoff = day - statsRetentionDays
+        try db.exec("DELETE FROM counters WHERE day < ?", cutoff)
+        try db.exec("DELETE FROM asn_counts WHERE day < ?", cutoff)
+        try db.exec("DELETE FROM connections_raw WHERE day < ?", cutoff)
     }
 
     distributed func record(day: Int, deltas: [String: Int]) throws {
@@ -87,10 +116,7 @@ distributed actor CASStatsKeeper {
                 "INSERT INTO counters (day, name, value) VALUES (?, ?, ?) ON CONFLICT(day, name) DO UPDATE SET value = value + excluded.value",
                 day, name, delta)
         }
-        if prunedDay != day {
-            prunedDay = day
-            try db.exec("DELETE FROM counters WHERE day < ?", day - statsRetentionDays)
-        }
+        try pruneIfNeeded(day: day, db: db)
         broadcast(day: day, deltas: deltas)
     }
 
@@ -102,6 +128,50 @@ distributed actor CASStatsKeeper {
                 // Read as a JS number (exact to 9 PB) rather than Int, which is 32-bit here.
                 return StatsCounter(day: day, name: name, value: Int64(value))
             }
+    }
+
+    /// Records one incoming connection: bumps `asn_counts` when Cloudflare
+    /// identified the network, and always appends to `connections_raw` for
+    /// the operator's own inspection (never surfaced over `/stats`).
+    distributed func recordConnection(day: Int, ip: String?, asn: Int?, asOrganization: String?, country: String?) throws {
+        let db = try database()
+        if let asn {
+            try db.exec(
+                """
+                INSERT INTO asn_counts (day, asn, as_organization, country, count) VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(day, asn) DO UPDATE SET count = count + 1
+                """,
+                day, asn, asOrganization ?? "", country ?? "")
+        }
+        try db.exec(
+            "INSERT INTO connections_raw (day, ip, asn, connected_at) VALUES (?, ?, ?, ?)",
+            day, ip, asn, Int(Date().timeIntervalSince1970))
+        try pruneIfNeeded(day: day, db: db)
+    }
+
+    /// The networks with the most connections since `day`, most first.
+    distributed func topASNs(since day: Int, limit: Int) throws -> [ASNStat] {
+        try database().exec(
+            """
+            SELECT asn, MAX(as_organization) AS as_organization, MAX(country) AS country, SUM(count) AS connections
+            FROM asn_counts WHERE day >= ? GROUP BY asn ORDER BY SUM(count) DESC LIMIT ?
+            """,
+            day, limit
+        ).rows().compactMap { row in
+            guard let asn = row["asn", as: Int.self],
+                  let asOrganization = row["as_organization", as: String.self],
+                  let country = row["country", as: String.self],
+                  let connections = row["connections", as: Double.self] else { return nil }
+            return ASNStat(asn: asn, asOrganization: asOrganization, country: country, connections: Int(connections))
+        }
+    }
+
+    /// How many distinct connecting IPs were seen since `day`.
+    distributed func distinctIPCount(since day: Int) throws -> Int {
+        let count = try database().exec(
+            "SELECT COUNT(DISTINCT ip) AS count FROM connections_raw WHERE ip IS NOT NULL AND day >= ?", day
+        ).rows().first?["count", as: Double.self] ?? 0
+        return Int(count)
     }
 }
 
@@ -163,6 +233,16 @@ struct StatsClient: Sendable {
         let keeper = keeper
         let day = Self.today()
         Task { try? await keeper.record(day: day, deltas: deltas) }
+    }
+
+    /// Records one incoming connection's network, fire-and-forget like `record(_:)`.
+    func recordConnection(ip: String?, cf: Request.CFProperties?) {
+        let keeper = keeper
+        let day = Self.today()
+        Task {
+            try? await keeper.recordConnection(
+                day: day, ip: ip, asn: cf?.asn, asOrganization: cf?.asOrganization, country: cf?.country)
+        }
     }
 }
 
@@ -250,10 +330,19 @@ struct StatsReport: Codable, Sendable {
     var storage: ShardTotals
     /// Newest day first, for the days that saw any traffic.
     var days: [DayStats]
+    /// The networks with the most connections in the window, most first.
+    var topASNs: [ASNStat]
+    /// Distinct connecting IPs seen in the window. Never broken down by IP:
+    /// the raw addresses stay in `connections_raw`, for the operator's own
+    /// inspection, and are never read back over `/stats` or `/stats.json`.
+    var distinctIPs: Int
 }
 
 /// How many days of traffic the page and `/stats.json` cover.
 let statsWindowDays = 30
+
+/// How many networks `topASNs` reports.
+let statsTopASNsLimit = 10
 
 func gatherStats(env: Env) async -> StatsReport {
     var storage = ShardTotals(objects: 0, objectsInR2: 0, inlineBytes: 0, actions: 0, largeObjects: 0, largeBytes: 0)
@@ -270,9 +359,10 @@ func gatherStats(env: Env) async -> StatsReport {
     }
 
     let now = Int(Date().timeIntervalSince1970)
+    let sinceDay = StatsClient.today() - statsWindowDays + 1
     guard let client = StatsClient(env: env),
-          let counters = try? await client.keeper.counters(since: StatsClient.today() - statsWindowDays + 1) else {
-        return StatsReport(enabled: false, generatedAt: now, storage: storage, days: [])
+          let counters = try? await client.keeper.counters(since: sinceDay) else {
+        return StatsReport(enabled: false, generatedAt: now, storage: storage, days: [], topASNs: [], distinctIPs: 0)
     }
     var byDay = [Int: DayStats]()
     for counter in counters {
@@ -281,7 +371,9 @@ func gatherStats(env: Env) async -> StatsReport {
         byDay[counter.day] = day
     }
     let days = byDay.sorted { $0.key > $1.key }.map(\.value)
-    return StatsReport(enabled: true, generatedAt: now, storage: storage, days: days)
+    let topASNs = (try? await client.keeper.topASNs(since: sinceDay, limit: statsTopASNsLimit)) ?? []
+    let distinctIPs = (try? await client.keeper.distinctIPCount(since: sinceDay)) ?? 0
+    return StatsReport(enabled: true, generatedAt: now, storage: storage, days: days, topASNs: topASNs, distinctIPs: distinctIPs)
 }
 
 /// `YYYY-MM-DD` for a day count since 1970-01-01 (proleptic Gregorian).
@@ -375,6 +467,21 @@ private func storedTable(_ storage: ShardTotals) -> Node {
     return .table(.fragment(rows))
 }
 
+private func asnTable(_ topASNs: [ASNStat]) -> Node {
+    guard !topASNs.isEmpty else {
+        return .p(.small("No connections recorded yet."))
+    }
+    var rows: [ChildOf<Tag.Table>] = [.tr(.th("ASN"), .th("Organization"), .th("Country"), .th("Connections"))]
+    for asn in topASNs {
+        rows.append(.tr(
+            .td(.text(String(asn.asn))),
+            .td(.text(asn.asOrganization)),
+            .td(.text(asn.country)),
+            .td(.text(String(asn.connections)))))
+    }
+    return .table(.fragment(rows))
+}
+
 /// Keeps the page current: renders the tiles and tables from `/stats.json`
 /// (the same figures the server rendered), applies the increments pushed over
 /// `/stats/live`, and reloads every 30 seconds because storage totals are not
@@ -406,6 +513,7 @@ private let statsScript: StaticString = """
         ['Downloaded', function (d) { return bytes(d.bytesDown); }]
       ];
       function pct(part, total) { return total === 0 ? 'n/a' : Math.round(part / total * 100) + '%'; }
+      function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
       function sum(key) { return report.days.reduce(function (a, d) { return a + d[key]; }, 0); }
       // Cells with a data-k key are the ones highlighted when their text changes.
       function keyed(key, text) { return '<td data-k="' + key + '">' + text + '</td>'; }
@@ -440,6 +548,7 @@ private let statsScript: StaticString = """
           tile('tile:misses', misses, 'cache misses') +
           tile('tile:lookups', hits + misses, 'cache lookups') +
           tile('tile:connections', sum('connections'), 'client connections') +
+          tile('tile:distinctIPs', report.distinctIPs, 'distinct IPs') +
           tile('tile:transferred', bytes(sum('bytesUp') + sum('bytesDown')), 'transferred'));
         var s = report.storage;
         set('live-stored', '<table>' +
@@ -448,6 +557,11 @@ private let statsScript: StaticString = """
           statRow('Cached actions', s.actions) +
           statRow('Held in the shard databases', bytes(s.inlineBytes)) +
           statRow('Objects with bodies in R2', s.objectsInR2) + '</table>');
+        var asns = report.topASNs || [];
+        set('live-asns', asns.length ? '<table><tr><th>ASN</th><th>Organization</th><th>Country</th><th>Connections</th></tr>' +
+          asns.map(function (a) {
+            return '<tr><td>' + a.asn + '</td><td>' + esc(a.asOrganization) + '</td><td>' + esc(a.country) + '</td><td>' + a.connections + '</td></tr>';
+          }).join('') + '</table>' : '<p><small>No connections recorded yet.</small></p>');
         if (!report.enabled) {
           set('live-days', '<p>Traffic counters are not enabled on this deployment.</p>');
         } else {
@@ -526,12 +640,16 @@ private func statsDocument(_ report: StatsReport) -> Node {
                     tile(String(misses), "cache misses"),
                     tile(String(hits + misses), "cache lookups"),
                     tile(String(connections), "client connections"),
+                    tile(String(report.distinctIPs), "distinct IPs"),
                     tile(formatBytes(up + down), "transferred")
                 ),
 
                 .h2("Stored now"),
                 .div(attributes: [.id("live-stored")], storedTable(report.storage)),
                 .p(.small("Sizes of bodies kept in R2 that are not part of a large object are not tracked, so the byte figures are a lower bound.")),
+
+                .h2("Top networks"),
+                .div(attributes: [.id("live-asns")], asnTable(report.topASNs)),
 
                 .h2("By day"),
                 .div(attributes: [.id("live-days")], byDay),
