@@ -17,6 +17,7 @@ let package = Package(
     products: [
         .library(name: "CASProtocol", targets: ["CASProtocol"]),
         .executable(name: "castool", targets: ["castool"]),
+        .executable(name: "casd", targets: ["casd"]),
         // Loaded by swift-frontend via -cas-plugin-path for compilation caching.
         .library(name: "CASPlugin", type: .dynamic, targets: ["CASPlugin"]),
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
@@ -37,6 +38,8 @@ let package = Package(
             url: "https://github.com/tornikegomareli/swift-lru-cache.git",
             revision: "a4ce798976091ada42d1b22caf1158a185090a3b"
         ),
+        // The daemon's loopback server (already in the graph through WorkerKit).
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
         .package(url: "https://github.com/pointfreeco/swift-html", from: "0.5.0"),
         // SI prefixes (symbol and power of ten) for the sizes the stats page shows.
@@ -58,6 +61,7 @@ let package = Package(
                 .product(name: "WorkerKitDistributed", package: "WorkerKit")
             ]
         ),
+        .executableTarget(name: "casd", dependencies: ["CASDaemon", "CASClient"]),
         .target(name: "CLLCAS"),
         // A local cache in front of the Worker, for many short-lived compiler
         // processes: see docs/daemon.md.
@@ -66,6 +70,10 @@ let package = Package(
             dependencies: [
                 "CASProtocol", "CASClient",
                 .product(name: "SwiftLRUCache", package: "swift-lru-cache"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOWebSocket", package: "swift-nio"),
             ]
         ),
         // Native-only client for the CAS service; shared by castool and the plugin.
@@ -108,7 +116,7 @@ let package = Package(
             "CASProtocol", "CASClient",
             .product(name: "WorkerKitDistributed", package: "WorkerKit"),
         ], swiftSettings: testSwiftSettings),
-        .testTarget(name: "CASDaemonTests", dependencies: ["CASDaemon", "CASProtocol"], swiftSettings: testSwiftSettings),
+        .testTarget(name: "CASDaemonTests", dependencies: ["CASDaemon", "CASProtocol", "CASClient"], swiftSettings: testSwiftSettings),
         .testTarget(name: "CASPluginTests", dependencies: ["CASPlugin", "CASProtocol"], swiftSettings: testSwiftSettings),
     ]
 )
