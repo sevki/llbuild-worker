@@ -75,27 +75,51 @@ distributed actor CASShard {
     }
 
     distributed func getObject(digest: String) async throws -> CASObjectPayload? {
-        let rows = try database().exec("SELECT refs, data, in_r2 FROM objects WHERE digest = ?", digest).rows()
-        guard let row = rows.first, let refs = row["refs", as: String.self],
-              var data = row["data", as: String.self] else { return nil }
-        if row["in_r2", as: Int.self] == 1 {
+        guard let row = try await rowFromDatabase(digest) else { return nil }
+        var data = row.data
+        if row.inR2 {
             data = Data(try await bodyFromR2(digest)).base64EncodedString()
         }
-        return CASObjectPayload(
-            refs: refs.isEmpty ? [] : refs.split(separator: ",").map(String.init), data: data)
+        return CASObjectPayload(refs: row.refs, data: data)
     }
 
-    /// Reads a body this shard's own row says is in R2, retrying briefly.
-    /// `putObject` awaits the R2 write before inserting the row, but that
-    /// only guarantees the write completed from *this* request's point of
-    /// view - R2 is not guaranteed to be immediately consistent for a read
-    /// from a different request (and so, plausibly, a different colo) racing
-    /// right behind it. A `nil` this soon after a put is far more likely to
-    /// be that than a genuinely missing body, so this retries a few times
-    /// before reporting it as one.
+    private struct ObjectRow {
+        var refs: [String]
+        var data: String
+        var inR2: Bool
+    }
+
+    /// Reads this shard's own row for `digest`, retrying briefly. A `putObject`
+    /// that already returned to its caller has definitely committed the row
+    /// from *that* request's point of view, but that is no guarantee a
+    /// different, closely-following request sees it: three "missing object"
+    /// crashes this session (clang's CAS backend hit one for a digest that
+    /// was retrievable again moments later, with no republish in between -
+    /// once for an R2-backed body, once for a row that was not even in R2)
+    /// both fit a transient visibility gap in Durable Object storage more
+    /// than a genuinely missing object, so this retries before reporting one.
+    private func rowFromDatabase(_ digest: String) async throws -> ObjectRow? {
+        for delayMs: UInt64 in [0, 100, 300, 800] {
+            if delayMs > 0 {
+                try await Task.sleep(nanoseconds: delayMs * 1_000_000)
+            }
+            let rows = try database().exec("SELECT refs, data, in_r2 FROM objects WHERE digest = ?", digest).rows()
+            if let row = rows.first, let refs = row["refs", as: String.self],
+               let data = row["data", as: String.self] {
+                return ObjectRow(
+                    refs: refs.isEmpty ? [] : refs.split(separator: ",").map(String.init),
+                    data: data, inR2: row["in_r2", as: Int.self] == 1)
+            }
+        }
+        return nil
+    }
+
+    /// Reads a body this shard's own row says is in R2, retrying briefly -
+    /// see `rowFromDatabase`'s doc comment; the same gap plausibly applies to
+    /// an R2 read racing right behind the write that `putObject` awaited.
     private func bodyFromR2(_ digest: String) async throws -> [UInt8] {
         let key = Self.blobKey(digest)
-        for delayMs: UInt64 in [0, 100, 300] {
+        for delayMs: UInt64 in [0, 100, 300, 800] {
             if delayMs > 0 {
                 try await Task.sleep(nanoseconds: delayMs * 1_000_000)
             }
