@@ -108,11 +108,25 @@ public actor ScopeCache {
     // MARK: Retiring
 
     private var retired = false
+    private var users = 0
+
+    /// Marks the scope as in use (a connection, a request) so it is not retired under
+    /// the user; false if it already has been, and the caller must look the scope up
+    /// again.
+    func beginUse() -> Bool {
+        guard !retired else { return false }
+        users += 1
+        return true
+    }
+
+    func endUse() {
+        users -= 1
+    }
 
     /// Whether everything acknowledged here has reached upstream: nothing waits on
     /// disk and nothing is being forwarded.
     private var isIdle: Bool {
-        forwarding.isEmpty
+        users == 0 && forwarding.isEmpty
             && ((try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path))?.isEmpty ?? true)
     }
 

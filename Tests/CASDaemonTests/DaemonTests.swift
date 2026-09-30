@@ -631,6 +631,54 @@ final class DaemonTests: XCTestCase {
         await busy.close()
     }
 
+    func testScopesThatDifferOnlyInCaseGetDifferentDirectories() async throws {
+        let names = ["Prod", "prod", "PROD", "p_rod", "P_rod", "pRod", "_prod", "__prod", "a.B", "a.b"]
+        let directories = names.map { CASDaemon.directoryName(for: $0).lowercased() }
+        XCTAssertEqual(Set(directories).count, names.count, "no two scopes may meet on a case-insensitive disk: \(directories)")
+
+        let upper = try client("Prod"), lower = try client("prod")
+        let object = blob("belongs to Prod")
+        try await upper.put(object)
+        let seen = try await lower.get(object.digest)
+        XCTAssertNil(seen)
+        await upper.close()
+        await lower.close()
+    }
+
+    func testABurstOfNewScopesNeverExceedsTheCap() async throws {
+        try await restart(maxScopes: 2)
+        let port = self.port
+        let codes = await withTaskGroup(of: Int.self) { group in
+            for index in 0..<12 {
+                group.addTask {
+                    let url = URL(string: "http://127.0.0.1:\(port)/burst\(index)/objects/\(String(repeating: "a", count: 64))")!
+                    let (_, response) = try! await URLSession.shared.data(from: url)
+                    return (response as? HTTPURLResponse)?.statusCode ?? 0
+                }
+            }
+            return await group.reduce(into: [Int]()) { $0.append($1) }
+        }
+        XCTAssertTrue(codes.allSatisfy { $0 == 404 || $0 == 503 }, "\(codes)")
+        let open = daemon.openScopeCount
+        XCTAssertLessThanOrEqual(open, 2, "scopes open: \(open)")
+    }
+
+    func testAScopeWithAnOpenConnectionIsNotRetiredUnderIt() async throws {
+        try await restart(maxScopes: 2)
+        let keep = try client("keep")
+        _ = try await keep.status()                       // a WebSocket to "keep", held open
+        for scope in ["other-one", "other-two", "other-three"] {
+            let served = try await status(ofScope: scope)
+            _ = served
+        }
+        let object = blob("written after the churn")
+        try await keep.put(object)
+        try await keep.actionPut(blob("kept key").digest, value: object.digest)
+        let value = try await keep.actionGet(blob("kept key").digest)
+        XCTAssertEqual(value, object.digest, "the connection still writes to a live scope")
+        await keep.close()
+    }
+
     func testARequestThePathDoesNotServeOpensNoScope() async throws {
         for path in ["/ghost/bogus", "/ghost/objects/not-a-digest", "/ghost"] {
             let (_, response) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)\(path)")!)

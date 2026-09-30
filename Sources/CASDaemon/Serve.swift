@@ -11,7 +11,11 @@ extension CASDaemon {
     // MARK: WebSocket: the control plane
 
     func serveWebSocket(_ channel: NIOAsyncChannel<WebSocketFrame, WebSocketFrame>, scope name: String) async throws {
-        let cache = try await scope(name)
+        // The scope stays in use, and so is not retired, for as long as the connection.
+        try await withScope(name) { cache in try await self.serveWebSocket(channel, in: cache) }
+    }
+
+    private func serveWebSocket(_ channel: NIOAsyncChannel<WebSocketFrame, WebSocketFrame>, in cache: ScopeCache) async throws {
         try await channel.executeThenClose { inbound, outbound in
             try await withThrowingTaskGroup(of: Void.self) { group in
                 var message = ByteBuffer()
@@ -185,13 +189,14 @@ extension CASDaemon {
         default: serves = false
         }
         guard serves else { return Response(status: .notFound) }
-        let opened: ScopeCache
         do {
-            opened = try await scope(scopeName)
+            return try await withScope(scopeName) { cache in await self.handle(request, body: body, rest: rest, in: cache) }
         } catch {
             return Response(status: .serviceUnavailable)
         }
-        let cache = opened
+    }
+
+    private func handle(_ request: HTTPRequestHead, body: ByteBuffer, rest: [String], in cache: ScopeCache) async -> Response {
         switch (request.method, rest.count) {
         case (.GET, 2), (.HEAD, 2):
             guard rest[0] == "objects", let digest = Self.fullDigest(rest[1]) else { return Response(status: .notFound) }

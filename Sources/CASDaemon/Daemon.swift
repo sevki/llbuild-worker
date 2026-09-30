@@ -89,6 +89,48 @@ public final class CASDaemon: @unchecked Sendable {
         return (first, Array(parts.dropFirst()))
     }
 
+    /// The scope's directory name. File systems that ignore case (macOS's default)
+    /// would give `Prod` and `prod` one directory, so a capital is written as `_` and
+    /// its lower-case letter, and a literal `_` as `__`: different names never meet.
+    static func directoryName(for scope: String) -> String {
+        var name = ""
+        for character in scope {
+            if character == "_" {
+                name += "__"
+            } else if character.isUppercase {
+                name += "_" + character.lowercased()
+            } else {
+                name.append(character)
+            }
+        }
+        return name
+    }
+
+    /// Serializes the admission of new scopes, so that the room made and the scope
+    /// added are one step and a burst cannot overshoot `maxScopes`.
+    private let admission = AsyncSemaphore(1)
+
+    /// Runs `body` with the scope held open: one that is in use is never retired.
+    func withScope<T: Sendable>(_ name: String, _ body: @Sendable (ScopeCache) async throws -> T) async throws -> T {
+        for _ in 0..<4 {
+            let cache = try await scope(name)
+            if await cache.beginUse() {
+                do {
+                    let result = try await body(cache)
+                    await cache.endUse()
+                    return result
+                } catch {
+                    await cache.endUse()
+                    throw error
+                }
+            }
+            // Retired just now: wait for the admission that is replacing it, then look again.
+            await admission.acquire()
+            await admission.release()
+        }
+        throw CASDaemonError("scope \(name) is being retired")
+    }
+
     func scope(_ name: String) async throws -> ScopeCache {
         if let existing = lock.withLock({ () -> Task<ScopeCache, Error>? in
             scopes[name]?.used = .now
@@ -96,12 +138,26 @@ public final class CASDaemon: @unchecked Sendable {
         }) {
             return try await existing.value
         }
+        await admission.acquire()
+        do {
+            let cache = try await admit(name)
+            await admission.release()
+            return cache
+        } catch {
+            await admission.release()
+            throw error
+        }
+    }
+
+    /// One new scope, with room made for it, as a single step (see `admission`).
+    private func admit(_ name: String) async throws -> ScopeCache {
+        if let existing = lock.withLock({ scopes[name]?.task }) { return try await existing.value }
         try await makeRoom()
         let task: Task<ScopeCache, Error> = lock.withLock {
             if let existing = scopes[name] { return existing.task }
             let created = Task { [configuration, log] in
                 let cache = try await ScopeCache(
-                    directory: configuration.directory.appendingPathComponent(name),
+                    directory: configuration.directory.appendingPathComponent(Self.directoryName(for: name)),
                     maxBytes: configuration.maxBytes, upstream: configuration.makeUpstream(name),
                     maxActions: configuration.maxActions, retryInterval: configuration.retryInterval,
                     sessionGap: configuration.sessionGap, traceDebounce: configuration.traceDebounce, log: log)
@@ -135,6 +191,9 @@ public final class CASDaemon: @unchecked Sendable {
             }
         }
     }
+
+    /// How many scopes are open right now.
+    var openScopeCount: Int { lock.withLock { scopes.count } }
 
     /// One line per scope about what it asked upstream.
     public func summaries() async -> [String] {
