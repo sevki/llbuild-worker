@@ -29,11 +29,13 @@ public final class CASDaemon: @unchecked Sendable {
         public var maxBytes: Int64
         /// Most action records kept on disk per scope; the oldest go first.
         public var maxActions: Int
+        /// How often actions still waiting for the Worker are tried again.
+        public var retryInterval: Duration
         public var makeUpstream: @Sendable (_ scope: String) -> any CASUpstream
 
         public init(
             host: String = "127.0.0.1", port: Int = 0, directory: URL, maxBytes: Int64 = 4 << 30,
-            maxActions: Int = 1_000_000,
+            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60),
             makeUpstream: @escaping @Sendable (String) -> any CASUpstream
         ) {
             self.host = host
@@ -41,6 +43,7 @@ public final class CASDaemon: @unchecked Sendable {
             self.directory = directory
             self.maxBytes = maxBytes
             self.maxActions = maxActions
+            self.retryInterval = retryInterval
             self.makeUpstream = makeUpstream
         }
     }
@@ -82,7 +85,7 @@ public final class CASDaemon: @unchecked Sendable {
                 let cache = try await ScopeCache(
                     directory: configuration.directory.appendingPathComponent(name),
                     maxBytes: configuration.maxBytes, upstream: configuration.makeUpstream(name),
-                    maxActions: configuration.maxActions, log: log)
+                    maxActions: configuration.maxActions, retryInterval: configuration.retryInterval, log: log)
                 await cache.resumePending()
                 return cache
             }

@@ -334,6 +334,45 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testAnActionQueuedWhileTheWorkerWasDownIsSentWhenItReturns() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20, retryInterval: .milliseconds(200)) { _ in fake })
+        port = try await daemon.start()
+        await upstream.setDown(true)
+        let client = try client()
+        let object = blob("patient")
+        try await client.put(object)
+        let key = blob("pk2").digest
+        try await client.actionPut(key, value: object.digest)
+        try await Task.sleep(for: .seconds(2))   // past the first few attempts
+        let early = await upstream.actions[key]
+        XCTAssertNil(early)
+
+        await upstream.setDown(false)
+        var stored: CASDigest?
+        for _ in 0..<50 where stored == nil {
+            try await Task.sleep(for: .milliseconds(100))
+            stored = await upstream.actions[key]
+        }
+        XCTAssertEqual(stored, object.digest, "retried without a restart")
+        await client.close()
+    }
+
+    func testAnObjectAlreadyUpstreamNeedsNoLocalCopyToForwardItsAction() async throws {
+        let child = blob("already there"), parent = blob("new parent", refs: [child.digest])
+        await upstream.seed(child)            // upstream has it; the daemon never saw it
+        let client = try client()
+        try await client.put(parent)
+        // A daemon that has just restarted knows nothing of `child`.
+        let key = blob("rk").digest
+        try await client.actionPut(key, value: parent.digest)
+        await daemon.drain()
+        let stored = await upstream.actions[key]
+        XCTAssertEqual(stored, parent.digest)
+        await client.close()
+    }
+
     func testOnlyTheLoopbackIsServed() async throws {
         let fake = upstream!
         for host in ["0.0.0.0", "192.168.1.5", "::"] {

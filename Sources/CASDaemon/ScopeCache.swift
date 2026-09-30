@@ -26,6 +26,11 @@ public actor ScopeCache {
     private let spoolDirectory: URL
     private let negativeTTL: Duration
     private let batchWindow: Duration
+    private let retryInterval: Duration
+    private var retrier: Task<Void, Never>?
+    /// Bumped by every action recorded, so a sweep can tell that one arrived while
+    /// it was looking.
+    private var pendingGeneration = 0
     private let log: @Sendable (String) -> Void
 
     private var actions: [CASDigest: CASDigest] = [:]
@@ -56,6 +61,7 @@ public actor ScopeCache {
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
         maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), batchWindow: Duration = .milliseconds(3),
+        retryInterval: Duration = .seconds(60),
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
         self.objects = try await ObjectCache.open(
@@ -67,6 +73,7 @@ public actor ScopeCache {
         self.maxActionFiles = maxActions
         self.negativeTTL = negativeTTL
         self.batchWindow = batchWindow
+        self.retryInterval = retryInterval
         self.log = log
         try FileManager.default.createDirectory(at: actionDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
@@ -76,6 +83,7 @@ public actor ScopeCache {
     /// Re-queues the actions a previous run acknowledged but had not yet
     /// forwarded.
     public func resumePending() async {
+        startRetrying()
         await sweepSpool()
         countActions()
         let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
@@ -234,6 +242,7 @@ public actor ScopeCache {
         try writePending(key)
         actions[key] = value
         misses[key] = nil
+        pendingGeneration += 1
         forward(key: key, value: value)
     }
 
@@ -270,7 +279,7 @@ public actor ScopeCache {
         guard forwarding[key] == nil else { return }
         forwarding[key] = Task { [self] in
             var delay = Duration.milliseconds(250)
-            for attempt in 1...6 {
+            for attempt in 1...3 {
                 if await upload(value), (try? await upstream.actionPut(key, value: value)) != nil {
                     clearPending(key)
                     break
@@ -282,14 +291,35 @@ public actor ScopeCache {
                     clearPending(key)
                     break
                 }
-                if attempt == 6 {
-                    log("giving up for now on action \(key.hex); it stays queued on disk")
+                if attempt == 3 {
+                    log("action \(key.hex) is queued on disk; it will be retried")
                     break
                 }
                 try? await Task.sleep(for: delay)
                 delay *= 2
             }
             forwarding[key] = nil
+        }
+    }
+
+    /// Re-queues what is still pending, every `retryInterval`, for as long as the
+    /// daemon runs: a Worker that was unreachable for a while gets what it missed
+    /// once it is back, without a restart.
+    private func startRetrying() {
+        guard retrier == nil else { return }
+        retrier = Task { [weak self, retryInterval] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: retryInterval)
+                await self?.requeuePending()
+            }
+        }
+    }
+
+    private func requeuePending() {
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? [] {
+            guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
+                  let value = actions[key] ?? readAction(key) else { continue }
+            forward(key: key, value: value)
         }
     }
 
@@ -300,7 +330,14 @@ public actor ScopeCache {
         if let inflight = uploading[digest] { return await inflight.value }
         let task = Task { [self] () -> Bool in
             guard let blob = await objects.get(digest) ?? readSpool(digest) else {
-                log("cannot upload \(digest.hex): not in the local cache")
+                // Not here, but it need not be: an object that came from upstream was
+                // never sent to us, and after a restart nothing remembers that. What
+                // upstream holds has its references too.
+                if (try? await upstream.contains(digest)) == true {
+                    uploaded.insert(digest)
+                    return true
+                }
+                log("cannot upload \(digest.hex): not local and not upstream")
                 return false
             }
             let children = Set(blob.refs)
@@ -434,9 +471,18 @@ public actor ScopeCache {
             }
         }
         guard !old.isEmpty else { return }
-        let keep = await reachableFromPending()
-        for file in old where !keep.contains(file.lastPathComponent) {
-            try? FileManager.default.removeItem(at: file)
+        // Walking what pending actions reach suspends, and an action recorded
+        // meanwhile could claim one of these files. So: delete only if none arrived
+        // during the walk (the deletion itself does not suspend), else look again,
+        // and leave it for the next sweep if it keeps happening.
+        for _ in 0..<3 {
+            let generation = pendingGeneration
+            let keep = await reachableFromPending()
+            guard generation == pendingGeneration else { continue }
+            for file in old where !keep.contains(file.lastPathComponent) {
+                try? FileManager.default.removeItem(at: file)
+            }
+            return
         }
     }
 
