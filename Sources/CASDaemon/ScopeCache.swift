@@ -49,11 +49,14 @@ public actor ScopeCache {
 
     private var lookups = 0
     private var batches = 0
+    private var objectFetches = 0
+    private var objectBytes = 0
+    private var objectFetchTime = Duration.zero
+    private var maxObjectFetchesAtOnce = 0
+    private var objectFetchesNow = 0
+    private var uploadedObjects = 0
+    private var uploadedActions = 0
     private var lookupTime = Duration.zero
-    private var lookupSummary: String {
-        let mean = lookups == 0 ? Duration.zero : lookupTime / lookups
-        return "upstream actionGet: \(lookups) lookups in \(batches) calls, mean \(mean) each"
-    }
 
     static let maxActionsInMemory = 500_000
 
@@ -108,7 +111,14 @@ public actor ScopeCache {
         if let blob = await objects.get(digest) ?? readSpool(digest) { return blob }
         if let inflight = fetching[digest] { return await inflight.value }
         let task = Task { [self] () -> CASBlob? in
+            objectFetchesNow += 1
+            maxObjectFetchesAtOnce = max(maxObjectFetchesAtOnce, objectFetchesNow)
+            let started = ContinuousClock.now
             let blob = try? await upstream.get(digest)
+            objectFetchesNow -= 1
+            objectFetches += 1
+            objectFetchTime += ContinuousClock.now - started
+            objectBytes += blob?.data.count ?? 0
             if let blob, blob.digest == digest {
                 await adopt(blob)
                 return blob
@@ -157,7 +167,6 @@ public actor ScopeCache {
         let found = await lookUpstream(key)
         lookups += 1
         lookupTime += ContinuousClock.now - started
-        if lookups % 50 == 0 { log(lookupSummary) }
         let value: CASDigest
         switch found {
         case .failed:
@@ -261,6 +270,14 @@ public actor ScopeCache {
     }
 
     public var pendingCount: Int { forwarding.count }
+
+    /// What this scope asked of the Worker, for a line in the daemon's log.
+    public var summary: String {
+        let lookupMean = lookups == 0 ? Duration.zero : lookupTime / lookups
+        let fetchMean = objectFetches == 0 ? Duration.zero : objectFetchTime / objectFetches
+        return "\(lookups) action lookups in \(batches) calls (mean \(lookupMean) each); "
+            + "\(objectFetches) objects fetched, \(objectBytes) bytes, mean \(fetchMean) each, at most \(maxObjectFetchesAtOnce) at once"
+    }
 
     private static let maxRememberedMisses = 20_000
 

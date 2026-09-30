@@ -73,4 +73,5 @@ let stopped = AsyncStream<Void> { continuation in
 }
 for await _ in stopped { break }
 await daemon.drain()
+for line in await daemon.summaries() { FileHandle.standardError.write(Data("casd: \(line)\n".utf8)) }
 await daemon.stop()

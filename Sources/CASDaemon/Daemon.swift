@@ -95,6 +95,16 @@ public final class CASDaemon: @unchecked Sendable {
         return try await task.value
     }
 
+    /// One line per scope about what it asked upstream.
+    public func summaries() async -> [String] {
+        let tasks = lock.withLock { scopes.map { ($0.key, $0.value) } }
+        var lines: [String] = []
+        for (name, task) in tasks {
+            if let cache = try? await task.value { lines.append("\(name): \(await cache.summary)") }
+        }
+        return lines
+    }
+
     /// Everything acknowledged has reached upstream, or is queued on disk.
     public func drain() async {
         let tasks = lock.withLock { Array(scopes.values) }
