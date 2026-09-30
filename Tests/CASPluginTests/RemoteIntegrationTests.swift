@@ -144,4 +144,64 @@ final class RemoteIntegrationTests: XCTestCase {
         XCTAssertNil(probe, "the completion was still retained after the call finished")
         tier.close()
     }
+
+    /// Apple's Swift 6.3 `swiftc` passes `globally: false` on every cache call, so
+    /// by default the Worker is never consulted. With `remote-scope=all` an action
+    /// stored "locally" still reaches the Worker and another machine gets it;
+    /// without it, the same call stays local, and the action is really there
+    /// (a `globally: true` lookup finds it), so the miss is down to the scope.
+    func testRemoteScopeAllSharesActionsTheCompilerCalledLocalOnly() throws {
+        guard let text = ProcessInfo.processInfo.environment["LLBUILD_CAS_TEST_URL"] else {
+            throw XCTSkip("set LLBUILD_CAS_TEST_URL to a running Worker")
+        }
+        func makeCAS(scope: String?) throws -> llcas_cas_t {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("plugin-scope-test-\(UUID().uuidString)").path
+            addTeardownBlock { try? FileManager.default.removeItem(atPath: directory) }
+            var failure: UnsafeMutablePointer<CChar>?
+            let options = llcas_cas_options_create()
+            llcas_cas_options_set_ondisk_path(options, directory)
+            XCTAssertFalse(llcas_cas_options_set_option(options, "remote-url", text, &failure))
+            if let scope { XCTAssertFalse(llcas_cas_options_set_option(options, "remote-scope", scope, &failure)) }
+            defer { llcas_cas_options_dispose(options) }
+            return try XCTUnwrap(llcas_cas_create(options, &failure), "cas_create failed")
+        }
+        func lookup(_ cas: llcas_cas_t, _ key: [UInt8], globally: Bool) -> llcas_lookup_result_t {
+            var id = llcas_objectid_t()
+            var error: UnsafeMutablePointer<CChar>?
+            return key.withUnsafeBufferPointer {
+                llcas_actioncache_get_for_digest(
+                    cas, llcas_digest_t(data: $0.baseAddress, size: $0.count), &id, globally, &error)
+            }
+        }
+
+        // A fresh key and value every run, so nothing left in the Worker answers for it.
+        let key = CASBlob(refs: [], data: Array("scope key \(UUID())".utf8)).digest.bytes
+        let value = Array("scope value \(UUID())".utf8)
+
+        let publisher = try makeCAS(scope: "all")
+        defer { llcas_cas_dispose(publisher) }
+        var valueID = llcas_objectid_t()
+        var error: UnsafeMutablePointer<CChar>?
+        XCTAssertFalse(value.withUnsafeBufferPointer {
+            llcas_cas_store_object(publisher, llcas_data_t(data: $0.baseAddress, size: $0.count), nil, 0, &valueID, &error)
+        })
+        // The compiler says local only.
+        XCTAssertFalse(key.withUnsafeBufferPointer {
+            llcas_actioncache_put_for_digest(
+                publisher, llcas_digest_t(data: $0.baseAddress, size: $0.count), valueID, false, &error)
+        })
+
+        // A fresh machine (empty local store) with the same scope finds it, though it too asks locally.
+        let allScope = try makeCAS(scope: "all")
+        defer { llcas_cas_dispose(allScope) }
+        XCTAssertEqual(lookup(allScope, key, globally: false), LLCAS_LOOKUP_RESULT_SUCCESS)
+
+        // The default follows the compiler: local only means the Worker is not asked...
+        let requestedScope = try makeCAS(scope: nil)
+        defer { llcas_cas_dispose(requestedScope) }
+        XCTAssertEqual(lookup(requestedScope, key, globally: false), LLCAS_LOOKUP_RESULT_NOTFOUND)
+        // ...although the action is there for anyone who does ask.
+        XCTAssertEqual(lookup(requestedScope, key, globally: true), LLCAS_LOOKUP_RESULT_SUCCESS)
+    }
 }

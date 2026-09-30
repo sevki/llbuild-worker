@@ -33,6 +33,25 @@ enum RemoteConfig {
         return nil
     }
 
+    /// Whether the shared cache is used for every request, not only the ones the
+    /// compiler marks `globally`. Option `remote-scope`: `requested` (default)
+    /// follows the compiler; `all` overrides it.
+    ///
+    /// The compiler decides per request whether the shared tier is wanted, and
+    /// Apple's Swift 6.3 `swiftc` never does: measured on a macOS runner, 17
+    /// lookups and 7 stores in one compile were all `globally=false`, so with
+    /// the default a remote URL there is silently unused (clang and Swift 6.4
+    /// do pass true). `all` is for that case, when the remote is configured
+    /// deliberately and local-only would defeat it.
+    static func remoteScopeIsAll(options: [String: String]) throws -> Bool {
+        switch options["remote-scope"] {
+        case nil, "requested": return false
+        case "all": return true
+        case .some(let other):
+            throw Failure(description: "remote-scope must be 'requested' or 'all', not '\(other)'")
+        }
+    }
+
     private static func isHTTP(_ value: String) -> Bool {
         value.hasPrefix("http://") || value.hasPrefix("https://")
     }

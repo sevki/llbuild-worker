@@ -58,6 +58,26 @@ final class RemoteConfigTests: XCTestCase {
                 environment: env),
             URL(string: "https://url.example"))
     }
+
+    func testRemoteScope() throws {
+        XCTAssertFalse(try RemoteConfig.remoteScopeIsAll(options: [:]), "follows the compiler by default")
+        XCTAssertFalse(try RemoteConfig.remoteScopeIsAll(options: ["remote-scope": "requested"]))
+        XCTAssertTrue(try RemoteConfig.remoteScopeIsAll(options: ["remote-scope": "all"]))
+        XCTAssertThrowsError(try RemoteConfig.remoteScopeIsAll(options: ["remote-scope": "everything"])) { error in
+            XCTAssertTrue("\(error)".contains("'requested' or 'all'"), "\(error)")
+        }
+    }
+
+    func testTheCompilerDecidesUnlessTheScopeIsAll() {
+        let store = LocalStore(root: FileManager.default.temporaryDirectory
+            .appendingPathComponent("scope-test-\(UUID().uuidString)", isDirectory: true))
+        let requested = Plugin(store: store, remote: nil)
+        XCTAssertTrue(requested.wantsRemote(globally: true))
+        XCTAssertFalse(requested.wantsRemote(globally: false))
+        let all = Plugin(store: store, remote: nil, remoteScopeIsAll: true)
+        XCTAssertTrue(all.wantsRemote(globally: true))
+        XCTAssertTrue(all.wantsRemote(globally: false), "a compiler that only ever says false still uses the Worker")
+    }
 }
 
 final class AuthenticatedURLTests: XCTestCase {

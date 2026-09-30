@@ -43,6 +43,7 @@ swiftc -c main.swift -explicit-module-build -cache-compile-job \
 ```
 
 - The local store under `-cas-path` is always used first. The Worker is consulted when the compiler asks for a *global* lookup, and results are published to it when a compile finishes.
+- Whether the Worker is used is the compiler's call, per request (`globally`). Clang and Swift 6.4's `swiftc` ask for it; **Apple's Swift 6.3 `swiftc` never does** (measured on a macOS CI runner: every one of its 17 lookups and 7 stores in a compile was local-only), so with a Worker configured its Swift results stay local. `-cas-plugin-option remote-scope=all` makes the plugin use the Worker for every request whatever the compiler says. The default is `remote-scope=requested`. Set `LLBUILD_CAS_DEBUG=1` and the plugin logs each lookup and store with the value it was given.
 - An action result is uploaded with everything it references, children first, so another machine never sees a cache entry that points at a missing object.
 - The Worker is best-effort: if it is slow, down or errors, the plugin turns it off for that process and the build carries on with the local cache. Set `LLBUILD_CAS_DEBUG=1` to see what it decided.
 - Without `remote-url` the plugin is a plain local CAS.
