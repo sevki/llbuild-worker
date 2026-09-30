@@ -45,16 +45,31 @@ post() {
 
 median() { grep . | sort -n | awk '{a[NR]=$1} END {if (NR) printf "%.2f", (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2); else printf "n/a"}'; }
 
-failed=0
-for url in "$@"; do
-    base="" ws="" rpc=""
-    for _ in $(seq "$samples"); do
-        base+="$(plain "$url")"$'\n'
-        ws+="$(upgrade "$url")"$'\n'
-        rpc+="$(post "$url")"$'\n'
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+urls=("$@")
+for i in "${!urls[@]}"; do : > "$work/$i.base"; : > "$work/$i.ws"; : > "$work/$i.rpc"; done
+
+# One sample at a time, every URL in turn (in the opposite order on every other
+# sample), so drift in the network or the runner during the run lands on all of them
+# alike instead of favouring whichever was measured first.
+for n in $(seq "$samples"); do
+    order=("${!urls[@]}")
+    if [ $((n % 2)) -eq 0 ]; then
+        order=(); for ((i = ${#urls[@]} - 1; i >= 0; i--)); do order+=("$i"); done
+    fi
+    for i in "${order[@]}"; do
+        plain "${urls[$i]}" >> "$work/$i.base"
+        upgrade "${urls[$i]}" >> "$work/$i.ws"
+        post "${urls[$i]}" >> "$work/$i.rpc"
     done
-    nb="$(grep -c . <<<"$base")"; nw="$(grep -c . <<<"$ws")"; np="$(grep -c . <<<"$rpc")"
-    b="$(median <<<"$base")"; w="$(median <<<"$ws")"; r="$(median <<<"$rpc")"
+done
+
+failed=0
+for i in "${!urls[@]}"; do
+    url="${urls[$i]}"
+    nb="$(grep -c . "$work/$i.base")"; nw="$(grep -c . "$work/$i.ws")"; np="$(grep -c . "$work/$i.rpc")"
+    b="$(median < "$work/$i.base")"; w="$(median < "$work/$i.ws")"; r="$(median < "$work/$i.rpc")"
     line="$url: median first byte, no Durable Object $b s ($nb of $samples ok), new /__rpc WebSocket connection $w s ($nw of $samples ok), one POST /__rpc call $r s ($np of $samples ok; n/a where the Worker has no such endpoint)"
     echo "$line"
     [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo "- $line" >> "$GITHUB_STEP_SUMMARY"
