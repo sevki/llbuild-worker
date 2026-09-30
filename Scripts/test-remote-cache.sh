@@ -78,6 +78,33 @@ echo "ok: object over the maximum size is rejected"
 if "$castool" "$url" has "$(printf '%064d' 0)"; then fail "missing object reported present"; fi
 echo "ok: missing object is not found"
 
+# 1b. A plain POST carries one call, served by the Worker itself with no gateway
+# Durable Object: the same envelope as the WebSocket, the same token check.
+base="${url%%\?*}"
+token="${url##*token=}"
+call() { printf '{"id":"%s","identifier":"$s11CASProtocol10CASServiceC8contains6digestSbSS_tYaKFTE","arguments":["%s"],"genericSubstitutions":[]}' "$1" "$2"; }
+post() { curl -s -m 30 -w ' [%{http_code}]' -X POST "$@" "$base/__rpc"; }
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -d "$(call 1 "$digest")" "$base/__rpc")" = 401 ] || fail "POST without a token was not refused"
+[ "$(post -H "Authorization: Bearer $token" -d "$(call 2 "$digest")")" = '{"id":"2","result":true} [200]' ] || fail "POST did not find a stored object"
+[ "$(post -H "Authorization: Bearer $token" -d "$(call 3 "$(printf '%064d' 0)")")" = '{"id":"3","result":false} [200]' ] || fail "POST found a missing object"
+case "$(post -H "Authorization: Bearer $token" -d "$(call 4 zz)")" in
+    '{"id":"4","error":'*'} [200]') ;;
+    *) fail "POST error did not come back as a 200 envelope under its id" ;;
+esac
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $token" -d '' "$base/__rpc")" = 400 ] || fail "POST with an empty body was not refused with 400"
+# The size limit comes from the declared length, before the body is read.
+head -c 3000000 /dev/zero | tr '\0' 'a' > "$work/oversized-call"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $token" --data-binary "@$work/oversized-call" "$base/__rpc")" = 413 ] || fail "an oversized POST was not refused with 413"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $token" -H 'Transfer-Encoding: chunked' -d "$(call 5 "$digest")" "$base/__rpc")" = 411 ] || fail "a POST without a length was not refused with 411"
+rm "$work/oversized-call"
+# A scope is its own store: the object is in the default scope and not in another,
+# whether the question comes by POST or through a (shared) WebSocket gateway.
+[ "$(post -H "Authorization: Bearer $token" -d "$(call 6 "$digest")")" = '{"id":"6","result":true} [200]' ] || fail "the default scope lost its object"
+[ "$(curl -s -m 30 -w ' [%{http_code}]' -X POST -H "Authorization: Bearer $token" -d "$(call 7 "$digest")" "$base/other-scope/__rpc")" = '{"id":"7","result":false} [200]' ] || fail "POST in another scope found the default scope's object"
+if "$castool" "$base/other-scope?token=$token" has "$digest"; then fail "a WebSocket in another scope found the default scope's object"; fi
+"$castool" "$base?token=$token" has "$digest" || fail "a WebSocket in the default scope lost its object"
+echo "ok: a POST carries one call with no gateway (token required, replies keep their ids, size limited up front, scopes isolated)"
+
 # Informational only, not a pass/fail gate: CI runners are too noisy for a
 # timing threshold to mean anything, and a regression back toward a
 # shared-connection bottleneck would show up as avg_latency growing with n,

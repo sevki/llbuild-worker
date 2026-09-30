@@ -347,8 +347,14 @@ let statsTopASNsLimit = 10
 func gatherStats(env: Env, scope: String) async -> StatsReport {
     var storage = ShardTotals(objects: 0, objectsInR2: 0, inlineBytes: 0, actions: 0, largeObjects: 0, largeBytes: 0)
     if let shards = try? ShardBackend(namespace: env.durableObject("CASSHARD"), scope: scope).allShards() {
-        for shard in shards {
-            guard let totals = try? await shard.totals() else { continue }
+        // Every shard at once: one after another, the round trips added up to seconds.
+        let all = await withTaskGroup(of: ShardTotals?.self) { group in
+            for shard in shards { group.addTask { try? await shard.totals() } }
+            var collected = [ShardTotals]()
+            for await totals in group { if let totals { collected.append(totals) } }
+            return collected
+        }
+        for totals in all {
             storage.objects += totals.objects
             storage.objectsInR2 += totals.objectsInR2
             storage.inlineBytes += totals.inlineBytes
