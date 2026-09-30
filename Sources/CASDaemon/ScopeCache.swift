@@ -31,6 +31,15 @@ public actor ScopeCache {
     private var uploading: [CASDigest: Task<Bool, Never>] = [:]
     private var forwarding: [CASDigest: Task<Void, Never>] = [:]
 
+    private var inflight = 0
+    private var maxInflight = 0
+    private var lookups = 0
+    private var lookupTime = Duration.zero
+    private var lookupSummary: String {
+        let mean = lookups == 0 ? Duration.zero : lookupTime / lookups
+        return "upstream actionGet: \(lookups) calls, mean \(mean), at most \(maxInflight) at once"
+    }
+
     static let maxActionsInMemory = 500_000
 
     public init(
@@ -124,6 +133,15 @@ public actor ScopeCache {
         }
         if let since = misses[key], ContinuousClock.now - since < negativeTTL { return nil }
         let found: CASDigest?
+        inflight += 1
+        maxInflight = max(maxInflight, inflight)
+        let started = ContinuousClock.now
+        defer {
+            inflight -= 1
+            lookups += 1
+            lookupTime += ContinuousClock.now - started
+            if lookups % 50 == 0 { log(lookupSummary) }
+        }
         do {
             found = try await upstream.actionGet(key)
         } catch {
