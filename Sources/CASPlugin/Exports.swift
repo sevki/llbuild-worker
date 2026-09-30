@@ -100,15 +100,17 @@ public func llcas_cas_create(_ opts: llcas_cas_options_t?, _ error: ErrorOut) ->
         return nil
     }
     var remote: RemoteTier?
+    var remoteScopeIsAll = false
     do {
         if let url = try RemoteConfig.resolve(options: configured.options) {
             remote = RemoteTier(url: url)
         }
+        remoteScopeIsAll = try RemoteConfig.remoteScopeIsAll(options: configured.options)
     } catch let failure {
         setError(error, "cannot set up the remote CAS: \(failure)")
         return nil
     }
-    return OpaquePointer(Unmanaged.passRetained(Plugin(store: store, remote: remote)).toOpaque())
+    return OpaquePointer(Unmanaged.passRetained(Plugin(store: store, remote: remote, remoteScopeIsAll: remoteScopeIsAll)).toOpaque())
 }
 
 @_cdecl("llcas_cas_dispose")
@@ -210,7 +212,7 @@ public func llcas_cas_contains_object(
         return LLCAS_LOOKUP_RESULT_ERROR
     }
     if instance.store.contains(digest) { return LLCAS_LOOKUP_RESULT_SUCCESS }
-    if globally, let remote = instance.remote, remote.contains(digest) == true {
+    if instance.wantsRemote(globally: globally), let remote = instance.remote, remote.contains(digest) == true {
         return LLCAS_LOOKUP_RESULT_SUCCESS
     }
     return LLCAS_LOOKUP_RESULT_NOTFOUND
@@ -395,16 +397,28 @@ public func llcas_loaded_object_export_data_to_filepath(
 
 // MARK: - Action cache
 
+/// With LLBUILD_CAS_DEBUG set, says what the compiler asked for. `globally` is
+/// the compiler's choice: only when it is true does the plugin touch the shared
+/// cache, on lookups and on stores, so a compiler that passes false gets a
+/// purely local cache and nothing else in the log explains it.
+private func traceAction(_ what: String, _ key: llcas_digest_t, globally: Bool, _ instance: Plugin) {
+    guard RemoteTier.debug else { return }
+    let remote = instance.remote.map { $0.isEnabled ? "on" : "disabled" } ?? "not configured"
+    FileHandle.standardError.write(Data(
+        "llbuild-worker CAS: \(what) \(digest(key).hex.prefix(12)) globally=\(globally) remote=\(remote)\n".utf8))
+}
+
 private func actionGet(
     _ instance: Plugin, _ key: llcas_digest_t, globally: Bool
 ) -> (result: llcas_lookup_result_t, value: llcas_objectid_t, message: String?) {
     let none = llcas_objectid_t(opaque: 0)
     let keyDigest = digest(key)
+    traceAction("action lookup", key, globally: globally, instance)
     do {
         if let value = try instance.store.actionGet(keyDigest) {
             return (LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
         }
-        if globally, let remote = instance.remote, let fetched = remote.actionGet(keyDigest),
+        if instance.wantsRemote(globally: globally), let remote = instance.remote, let fetched = remote.actionGet(keyDigest),
            let value = fetched {
             try instance.store.actionPut(keyDigest, value: value)
             remote.log("action \(keyDigest.hex) hit remotely")
@@ -436,6 +450,7 @@ public func llcas_actioncache_get_for_digest_async(
     let instance = plugin(cas)
     let none = llcas_objectid_t(opaque: 0)
     let keyDigest = digest(key)
+    traceAction("action lookup", key, globally: globally, instance)
     do {
         if let value = try instance.store.actionGet(keyDigest) {
             callback?(context, LLCAS_LOOKUP_RESULT_SUCCESS, instance.objectID(for: value), nil)
@@ -445,7 +460,7 @@ public func llcas_actioncache_get_for_digest_async(
         callback?(context, LLCAS_LOOKUP_RESULT_ERROR, none, strdup("\(failure)"))
         return
     }
-    guard globally, let remote = instance.remote, remote.isEnabled else {
+    guard instance.wantsRemote(globally: globally), let remote = instance.remote, remote.isEnabled else {
         callback?(context, LLCAS_LOOKUP_RESULT_NOTFOUND, none, nil)
         return
     }
@@ -484,12 +499,13 @@ public func llcas_actioncache_put_for_digest(
     _ error: ErrorOut
 ) -> Bool {
     let instance = plugin(cas)
+    traceAction("action store", key, globally: globally, instance)
     let local = actionPutLocally(instance, key, value)
     if let message = local.message {
         setError(error, message)
         return true
     }
-    if globally, let remote = instance.remote, remote.isEnabled, let valueDigest = local.value {
+    if instance.wantsRemote(globally: globally), let remote = instance.remote, remote.isEnabled, let valueDigest = local.value {
         _ = remote.publish(key: local.key, value: valueDigest, from: instance.store)
     }
     return false
@@ -503,12 +519,13 @@ public func llcas_actioncache_put_for_digest_async(
 ) {
     cancel?.pointee = nil
     let instance = plugin(cas)
+    traceAction("action store", key, globally: globally, instance)
     let local = actionPutLocally(instance, key, value)
     if let message = local.message {
         callback?(context, true, strdup(message))
         return
     }
-    guard globally, let remote = instance.remote, remote.isEnabled, let valueDigest = local.value else {
+    guard instance.wantsRemote(globally: globally), let remote = instance.remote, remote.isEnabled, let valueDigest = local.value else {
         callback?(context, false, nil)
         return
     }

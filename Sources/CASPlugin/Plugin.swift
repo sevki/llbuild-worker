@@ -13,15 +13,24 @@ final class Plugin: @unchecked Sendable {
 
     let store: LocalStore
     let remote: RemoteTier?
+    /// See `RemoteConfig.remoteScopeIsAll`.
+    let remoteScopeIsAll: Bool
     private let lock = NSLock()
     private var digests: [CASDigest] = []
     private var digestBuffers: [UnsafeMutablePointer<UInt8>] = []
     private var indexByDigest: [CASDigest: Int] = [:]
     private var loaded: [Loaded] = []
 
-    init(store: LocalStore, remote: RemoteTier?) {
+    init(store: LocalStore, remote: RemoteTier?, remoteScopeIsAll: Bool = false) {
         self.store = store
         self.remote = remote
+        self.remoteScopeIsAll = remoteScopeIsAll
+    }
+
+    /// Whether a request is served by the shared tier: when the compiler asks
+    /// for it (`globally`), or always when the plugin was configured that way.
+    func wantsRemote(globally: Bool) -> Bool {
+        globally || remoteScopeIsAll
     }
 
     deinit {
