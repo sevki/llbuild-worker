@@ -18,8 +18,12 @@ jobs:
     env:
       # This repo's own compile cache, https://xcache.devtoo.ls: the compiles
       # below go through it (see Scripts/ci-compile-cache.sh). A fork's pull
-      # request gets no secret and builds without it.
+      # request gets no secret and builds without it. Scoped to this lane
+      # (ci-native-linux, distinct from the worker job's ci-wasm below, even
+      # though both run on Linux) so CI's own churn never shares storage with
+      # real users' default scope or another lane's.
       LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
+      LLBUILD_CAS_REMOTE_URL: https://xcache.devtoo.ls/ci-native-linux
     steps:
       - uses: actions/checkout@v4
 
@@ -69,6 +73,7 @@ jobs:
       BUILD_FLAGS: --build-system native
       # See the native job.
       LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
+      LLBUILD_CAS_REMOTE_URL: https://xcache.devtoo.ls/ci-macos
     steps:
       - uses: actions/checkout@v4
 
@@ -117,8 +122,10 @@ jobs:
     # know Swift 6.4.0, so use the official image instead.
     container: swift:6.4-noble
     env:
-      # See the native job.
+      # See the native job. Its own lane, not ci-native-linux: this job
+      # targets wasm32, a different target triple on the same OS.
       LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
+      LLBUILD_CAS_REMOTE_URL: https://xcache.devtoo.ls/ci-wasm
     steps:
       - uses: actions/checkout@v4
 
