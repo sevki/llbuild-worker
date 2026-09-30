@@ -45,6 +45,19 @@ jobs:
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
 
+      - name: Collect crash reproducers
+        if: failure()
+        run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-reproducers-${{ github.job }}
+          path: ${{ runner.temp }}/crash-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
   macos:
     name: Native Swift build and tests (macOS)
     runs-on: macos-latest
@@ -83,6 +96,19 @@ jobs:
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
+
+      - name: Collect crash reproducers
+        if: failure()
+        run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-reproducers-${{ github.job }}
+          path: ${{ runner.temp }}/crash-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
 
   worker:
     name: Build Cloudflare Worker WebAssembly bundle
@@ -126,3 +152,16 @@ jobs:
 
       - name: Distributed CAS end to end (workerd, castool, swiftc plugin)
         run: Scripts/test-remote-cache.sh
+
+      - name: Collect crash reproducers
+        if: failure()
+        run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-reproducers-${{ github.job }}
+          path: ${{ runner.temp }}/crash-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
