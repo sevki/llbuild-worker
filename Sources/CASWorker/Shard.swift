@@ -79,13 +79,31 @@ distributed actor CASShard {
         guard let row = rows.first, let refs = row["refs", as: String.self],
               var data = row["data", as: String.self] else { return nil }
         if row["in_r2", as: Int.self] == 1 {
-            guard let blobs, let body = try await blobs.get(Self.blobKey(digest)) else {
-                throw CASServiceError.invalidManifest("body of \(digest) is missing from R2")
-            }
-            data = Data(try await body.bytes()).base64EncodedString()
+            data = Data(try await bodyFromR2(digest)).base64EncodedString()
         }
         return CASObjectPayload(
             refs: refs.isEmpty ? [] : refs.split(separator: ",").map(String.init), data: data)
+    }
+
+    /// Reads a body this shard's own row says is in R2, retrying briefly.
+    /// `putObject` awaits the R2 write before inserting the row, but that
+    /// only guarantees the write completed from *this* request's point of
+    /// view - R2 is not guaranteed to be immediately consistent for a read
+    /// from a different request (and so, plausibly, a different colo) racing
+    /// right behind it. A `nil` this soon after a put is far more likely to
+    /// be that than a genuinely missing body, so this retries a few times
+    /// before reporting it as one.
+    private func bodyFromR2(_ digest: String) async throws -> [UInt8] {
+        let key = Self.blobKey(digest)
+        for delayMs: UInt64 in [0, 100, 300] {
+            if delayMs > 0 {
+                try await Task.sleep(nanoseconds: delayMs * 1_000_000)
+            }
+            if let blobs, let body = try await blobs.get(key) {
+                return try await body.bytes()
+            }
+        }
+        throw CASServiceError.invalidManifest("body of \(digest) is missing from R2")
     }
 
     distributed func containsObject(digest: String) throws -> Bool {
