@@ -25,6 +25,40 @@
 			"bucket_name": "llbuild-cas-blobs"
 		}
 	],
+	// Worker Previews (`wrangler preview`, https://blog.cloudflare.com/worker-previews/)
+	// inherit everything above and override what is listed here. A preview gets
+	// its own clone of the namespaces named below, not the production ones, so it
+	// can be exercised without touching the live cache.
+	"previews": {
+		"r2_buckets": [
+			{
+				"binding": "CASBLOBS",
+				"bucket_name": "llbuild-cas-blobs"
+			}
+		],
+		"unsafe": {
+			"bindings": [
+				{
+					"name": "CASGATEWAY",
+					"type": "durable_object_namespace",
+					"class_name": "CASGateway",
+					"namespace_id": "a18d40fbefd9480995780030b127b129"
+				},
+				{
+					"name": "CASSHARD",
+					"type": "durable_object_namespace",
+					"class_name": "CASShardObject",
+					"namespace_id": "1a463107617b45c5bfdab834e81daa7e"
+				},
+				{
+					"name": "CASSTATS",
+					"type": "durable_object_namespace",
+					"class_name": "CASStatsObject",
+					"namespace_id": "06c647a4fe2848e383a45e1b7320f233"
+				}
+			]
+		}
+	},
 	"migrations": [
 		{
 			"tag": "v2",
