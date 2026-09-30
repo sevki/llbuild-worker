@@ -18,6 +18,7 @@ import Foundation
 public actor ScopeCache {
     public let objects: ObjectCache
     private let upstream: any CASUpstream
+    private let scopeRoot: URL
     private let actionDirectory: URL
     private let pendingDirectory: URL
     /// Objects a client stored that are not upstream yet. The object cache evicts
@@ -73,6 +74,7 @@ public actor ScopeCache {
         self.objects = try await ObjectCache.open(
             directory: directory.appendingPathComponent("objects"), maxBytes: maxBytes)
         self.upstream = upstream
+        self.scopeRoot = directory
         self.actionDirectory = directory.appendingPathComponent("actions")
         self.pendingDirectory = directory.appendingPathComponent("pending")
         self.spoolDirectory = directory.appendingPathComponent("spool")
@@ -135,11 +137,15 @@ public actor ScopeCache {
     /// scopes to keep the number it holds open bounded.
     func retire() async -> Bool {
         guard isIdle else { return false }
-        await flushTrace()
+        // Marked before anything suspends: between the check above and the flush below
+        // a request must not be able to start using a scope that is going away.
         retired = true
+        // The directory's own time is what the daemon ranks retired scopes by.
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: scopeRoot.path)
         retrier?.cancel()
         retrier = nil
         traceFlush?.cancel()
+        await flushTrace()
         return true
     }
 
@@ -291,9 +297,11 @@ public actor ScopeCache {
     /// Uploads the current session's trace now, unless it is empty, unchanged since
     /// the last upload, or what it was prefetched from.
     public func flushTrace() async {
-        guard let current = session else { return }
-        await upload(trace: current)
-        session?.uploaded = true
+        guard let snapshot = session else { return }
+        await upload(trace: snapshot)
+        // Lookups that arrived while that upload was out are not in it: only a session
+        // that is still what was sent counts as sent.
+        if session?.first == snapshot.first, session?.keys.count == snapshot.keys.count { session?.uploaded = true }
     }
 
     private func upload(trace current: Session) async {

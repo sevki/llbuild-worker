@@ -34,6 +34,10 @@ public final class CASDaemon: @unchecked Sendable {
         /// Most scopes held open at once; beyond it the one unused for longest is
         /// retired to make room, and if every one has work pending a new one is refused.
         public var maxScopes: Int
+        /// Most scope directories kept on disk, open or not: beyond it the ones unused
+        /// for longest are deleted, so the disk the daemon can use is bounded by this
+        /// times `maxBytes` (plus what is spooled and recorded per scope).
+        public var maxScopeDirectories: Int
         /// A pause this long in a scope's lookups ends one build's trace and begins another's; it has to outlast the quiet stretches inside a build (long compiles, linking).
         public var sessionGap: Duration
         /// How long after the last new lookup a build's trace is uploaded.
@@ -42,7 +46,7 @@ public final class CASDaemon: @unchecked Sendable {
 
         public init(
             host: String = "127.0.0.1", port: Int = 0, directory: URL, maxBytes: Int64 = 4 << 30,
-            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60), maxScopes: Int = 32,
+            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60), maxScopes: Int = 32, maxScopeDirectories: Int = 128,
             sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20),
             makeUpstream: @escaping @Sendable (String) -> any CASUpstream
         ) {
@@ -53,6 +57,7 @@ public final class CASDaemon: @unchecked Sendable {
             self.maxActions = maxActions
             self.retryInterval = retryInterval
             self.maxScopes = maxScopes
+            self.maxScopeDirectories = maxScopeDirectories
             self.sessionGap = sessionGap
             self.traceDebounce = traceDebounce
             self.makeUpstream = makeUpstream
@@ -149,10 +154,34 @@ public final class CASDaemon: @unchecked Sendable {
         }
     }
 
+    /// Deletes the scope directories used longest ago until `maxScopeDirectories`
+    /// remain (counting the one about to be opened), never one that is open.
+    private func pruneDirectories(keeping name: String) {
+        let root = configuration.directory
+        let open = Set(lock.withLock { scopes.keys.map(Self.directoryName(for:)) })
+        let protected = open.union([Self.directoryName(for: name)])
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey])) ?? []
+        var directories = entries.compactMap { url -> (url: URL, used: Date)? in
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey])
+            guard values?.isDirectory == true else { return nil }
+            return (url, values?.contentModificationDate ?? .distantPast)
+        }
+        let room = configuration.maxScopeDirectories - (directories.contains { $0.url.lastPathComponent == Self.directoryName(for: name) } ? 0 : 1)
+        guard directories.count > room else { return }
+        directories.sort { $0.used < $1.used }
+        var excess = directories.count - room
+        for directory in directories where excess > 0 && !protected.contains(directory.url.lastPathComponent) {
+            try? FileManager.default.removeItem(at: directory.url)
+            excess -= 1
+        }
+    }
+
     /// One new scope, with room made for it, as a single step (see `admission`).
     private func admit(_ name: String) async throws -> ScopeCache {
         if let existing = lock.withLock({ scopes[name]?.task }) { return try await existing.value }
         try await makeRoom()
+        pruneDirectories(keeping: name)
         let task: Task<ScopeCache, Error> = lock.withLock {
             if let existing = scopes[name] { return existing.task }
             let created = Task { [configuration, log] in

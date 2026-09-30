@@ -663,6 +663,22 @@ final class DaemonTests: XCTestCase {
         XCTAssertLessThanOrEqual(open, 2, "scopes open: \(open)")
     }
 
+    func testScopeDirectoriesOnDiskAreBounded() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20, maxScopes: 1, maxScopeDirectories: 3) { _ in fake })
+        port = try await daemon.start()
+        for scope in ["d1", "d2", "d3", "d4", "d5", "d6"] {
+            let served = try await status(ofScope: scope)
+            XCTAssertTrue(served, scope)
+            try await Task.sleep(for: .milliseconds(30))     // distinct modification times
+        }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        let scopes = names.filter { $0.hasPrefix("d") }
+        XCTAssertLessThanOrEqual(scopes.count, 3, "scope directories on disk: \(scopes.sorted())")
+        XCTAssertTrue(scopes.contains("d6"), "the newest is kept")
+    }
+
     func testAScopeWithAnOpenConnectionIsNotRetiredUnderIt() async throws {
         try await restart(maxScopes: 2)
         let keep = try client("keep")
