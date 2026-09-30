@@ -24,6 +24,10 @@ set -euo pipefail
 : "${GITHUB_ENV:?run this from a GitHub Actions step}"
 : "${RUNNER_TEMP:?run this from a GitHub Actions step}"
 remote="${LLBUILD_CAS_REMOTE_URL:-https://xcache.devtoo.ls}"
+# `all` shares every result with the Worker, including those a compiler marks local-only
+# (Apple's Swift 6.3 swiftc marks all of them, so on macOS nothing would travel otherwise).
+# A plugin release without the option stores and ignores it, so this is safe to pass early.
+scope="${LLBUILD_CAS_REMOTE_SCOPE:-all}"
 
 if [ -z "${LLBUILD_CAS_TOKEN:-}" ]; then
     echo "::notice::No XCACHE_TOKEN (a pull request from a fork?): building without the compile cache"
@@ -55,6 +59,7 @@ flags=(
     -Xswiftc -cas-path -Xswiftc "$RUNNER_TEMP/cas"
     -Xswiftc -cas-plugin-path -Xswiftc "$dir/$lib"
     -Xswiftc -cas-plugin-option -Xswiftc "remote-url=$remote"
+    -Xswiftc -cas-plugin-option -Xswiftc "remote-scope=$scope"
     -Xswiftc -Rcache-compile-job
 )
 echo "SWIFT_CACHE_FLAGS=${flags[*]}" >> "$GITHUB_ENV"
