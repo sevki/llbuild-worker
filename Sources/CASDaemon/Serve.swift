@@ -175,9 +175,23 @@ extension CASDaemon {
     }
 
     func respond(to request: HTTPRequestHead, body: ByteBuffer) async -> Response {
-        guard let (scopeName, rest) = Self.route(request.uri), let cache = try? await scope(scopeName) else {
-            return Response(status: .notFound)
+        // Only a request this daemon serves may open a scope: one for any other path
+        // would leave a scope (and its directory) behind for nothing.
+        guard let (scopeName, rest) = Self.route(request.uri) else { return Response(status: .notFound) }
+        let serves: Bool
+        switch (request.method, rest.count) {
+        case (.GET, 2), (.HEAD, 2), (.PUT, 2): serves = rest[0] == "objects" && Self.fullDigest(rest[1]) != nil
+        case (.POST, 1): serves = rest[0] == "__rpc"
+        default: serves = false
         }
+        guard serves else { return Response(status: .notFound) }
+        let opened: ScopeCache
+        do {
+            opened = try await scope(scopeName)
+        } catch {
+            return Response(status: .serviceUnavailable)
+        }
+        let cache = opened
         switch (request.method, rest.count) {
         case (.GET, 2), (.HEAD, 2):
             guard rest[0] == "objects", let digest = Self.fullDigest(rest[1]) else { return Response(status: .notFound) }

@@ -154,6 +154,41 @@ final class CASChunkingTests: XCTestCase {
         XCTAssertEqual(none, [])
     }
 
+    func testATraceIsKeptUnderItsFirstKeyAndReplacedByTheNext() async throws {
+        let backend = RecordingBackend()
+        let service = CASService(actorSystem: WorkersActorSystem(worker: URL(string: "ws://127.0.0.1:1")!), backend: backend)
+        let first = String(repeating: "a", count: 64)
+        let keys = [first] + ["b", "c", "d"].map { String(repeating: $0, count: 64) }
+        let none = try await service.traceGet(key: first)
+        XCTAssertNil(none)
+
+        try await service.tracePut(key: first, keys: keys)
+        let stored = try await service.traceGet(key: first)
+        XCTAssertEqual(stored, keys)
+        try await service.tracePut(key: first, keys: Array(keys.prefix(2)))
+        let replaced = try await service.traceGet(key: first)
+        XCTAssertEqual(replaced, Array(keys.prefix(2)), "a trace is the latest build's, not a fact to keep")
+    }
+
+    func testATraceRefusesBadKeysAndAnOversizedList() async throws {
+        let service = CASService(
+            actorSystem: WorkersActorSystem(worker: URL(string: "ws://127.0.0.1:1")!), backend: RecordingBackend())
+        let good = String(repeating: "a", count: 64)
+        do {
+            try await service.tracePut(key: good, keys: [good, "nope"])
+            XCTFail("a bad key was accepted")
+        } catch let error as CASServiceError {
+            XCTAssertEqual(error, .invalidDigest("nope"))
+        }
+        let many = Array(repeating: good, count: CASLimits.maxTraceKeys + 1)
+        do {
+            try await service.tracePut(key: good, keys: many)
+            XCTFail("an oversized trace was accepted")
+        } catch let error as CASServiceError {
+            XCTAssertEqual(error, .objectTooLarge(size: many.count, limit: CASLimits.maxTraceKeys))
+        }
+    }
+
     func testActionGetManyRefusesABadKeyAndAnOversizedBatch() async throws {
         let service = CASService(
             actorSystem: WorkersActorSystem(worker: URL(string: "ws://127.0.0.1:1")!), backend: RecordingBackend())
@@ -176,6 +211,10 @@ final class CASChunkingTests: XCTestCase {
 private final class RecordingBackend: CASBackend, @unchecked Sendable {
     var stored = Set<String>()
     var actions = [String: String]()
+    var traces = [String: [String]]()
+
+    func traceGet(key: String) async throws -> [String]? { traces[key] }
+    func tracePut(key: String, keys: [String]) async throws { traces[key] = keys }
 
     func contains(digest: String) async throws -> Bool { stored.contains(digest) }
     func put(digest: String, refs: [String], data: String) async throws {}

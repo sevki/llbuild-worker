@@ -75,6 +75,32 @@ public actor ObjectCache {
         await index.has(digest.hex)
     }
 
+    /// Names of entries read back and checked since this process started.
+    private var verified = Set<String>()
+    private static let maxVerified = 200_000
+
+    /// Like `contains`, for a caller that is about to rely on the copy (an action is
+    /// acknowledged on the strength of it): the first time an entry is asked about,
+    /// its file is read back and checked against its name, and one that fails is
+    /// dropped. `contains` alone trusts the index, which cannot see a damaged file.
+    public func containsVerified(_ digest: CASDigest) async -> Bool {
+        let name = digest.hex
+        guard await index.has(name) else { return false }
+        if verified.contains(name) { return true }
+        let file = Self.path(of: name, in: directory)
+        guard let data = try? Data(contentsOf: file), let blob = Self.decode(data), blob.digest == digest else {
+            _ = await index.delete(name)
+            return false
+        }
+        markVerified(name)
+        return true
+    }
+
+    private func markVerified(_ name: String) {
+        if verified.count >= Self.maxVerified { verified.removeAll() }
+        verified.insert(name)
+    }
+
     /// The object stored under `digest`, which counts as a use, or `nil`.
     public func get(_ digest: CASDigest) async -> CASBlob? {
         let name = digest.hex
@@ -86,6 +112,7 @@ public actor ObjectCache {
             _ = await index.delete(name)
             return nil
         }
+        markVerified(name)
         // So the recency order survives a restart.
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
         return blob
@@ -111,6 +138,7 @@ public actor ObjectCache {
         try? FileManager.default.removeItem(at: file)
         try FileManager.default.moveItem(at: temporary, to: file)
         await index.set(name, value: Int64(encoded.count))
+        markVerified(name)
         return digest
     }
 

@@ -160,6 +160,20 @@ public final class CASClient: @unchecked Sendable {
         }
     }
 
+    /// The trace recorded under `key` (see `CASService.traceGet`), or nil.
+    public func traceGet(_ key: CASDigest) async throws -> [CASDigest]? {
+        guard let names = try await service.traceGet(key: key.hex) else { return nil }
+        return try names.map { name in
+            guard let parsed = CASDigest(hex: name) else { throw CASClientError("trace \(key.hex) has invalid key \(name)") }
+            return parsed
+        }
+    }
+
+    /// Records `keys` as the trace of a build that began with `key`.
+    public func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws {
+        try await service.tracePut(key: key.hex, keys: keys.map(\.hex))
+    }
+
     public func actionPut(_ key: CASDigest, value: CASDigest) async throws {
         try await service.actionPut(key: key.hex, value: value.hex)
     }

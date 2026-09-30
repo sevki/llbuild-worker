@@ -26,6 +26,10 @@ public actor ScopeCache {
     private let spoolDirectory: URL
     private let negativeTTL: Duration
     private let retryInterval: Duration
+    private let sessionGap: Duration
+    private let traceDebounce: Duration
+    private let fetchSlots: AsyncSemaphore
+    private let lookupSlots = AsyncSemaphore(4)
     private var retrier: Task<Void, Never>?
     /// Bumped by every action recorded, so a sweep can tell that one arrived while
     /// it was looking.
@@ -63,6 +67,7 @@ public actor ScopeCache {
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
         maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
+        sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20), maxObjectFetches: Int = 32,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
         self.objects = try await ObjectCache.open(
@@ -74,6 +79,9 @@ public actor ScopeCache {
         self.maxActionFiles = maxActions
         self.negativeTTL = negativeTTL
         self.retryInterval = retryInterval
+        self.sessionGap = sessionGap
+        self.traceDebounce = traceDebounce
+        self.fetchSlots = AsyncSemaphore(maxObjectFetches)
         self.log = log
         try FileManager.default.createDirectory(at: actionDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
@@ -97,10 +105,38 @@ public actor ScopeCache {
         }
     }
 
+    // MARK: Retiring
+
+    private var retired = false
+
+    /// Whether everything acknowledged here has reached upstream: nothing waits on
+    /// disk and nothing is being forwarded.
+    private var isIdle: Bool {
+        forwarding.isEmpty
+            && ((try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path))?.isEmpty ?? true)
+    }
+
+    /// Stops this scope's background work and refuses further writes, if it has
+    /// nothing pending; false, and no change, if it has. The daemon retires idle
+    /// scopes to keep the number it holds open bounded.
+    func retire() async -> Bool {
+        guard isIdle else { return false }
+        await flushTrace()
+        retired = true
+        retrier?.cancel()
+        retrier = nil
+        traceFlush?.cancel()
+        return true
+    }
+
+    private func requireOpen() throws {
+        if retired { throw CASServiceError.storageNotConfigured }
+    }
+
     // MARK: Objects
 
     public func contains(_ digest: CASDigest) async -> Bool {
-        if await objects.contains(digest) || isSpooled(digest) { return true }
+        if await objects.containsVerified(digest) || isSpooled(digest) { return true }
         if uploaded.contains(digest) { return true }
         guard let found = try? await upstream.contains(digest) else { return false }
         if found { uploaded.insert(digest) }
@@ -111,10 +147,16 @@ public actor ScopeCache {
         if let blob = await objects.get(digest) ?? readSpool(digest) { return blob }
         if let inflight = fetching[digest] { return await inflight.value }
         let task = Task { [self] () -> CASBlob? in
+            // The check above can be stale: another fetch may have stored this object
+            // and finished while it was being made. Look once more, here, before going
+            // upstream.
+            if let local = await objects.get(digest) { return local }
             objectFetchesNow += 1
             maxObjectFetchesAtOnce = max(maxObjectFetchesAtOnce, objectFetchesNow)
+            await fetchSlots.acquire()
             let started = ContinuousClock.now
             let blob = try? await upstream.get(digest)
+            await fetchSlots.release()
             objectFetchesNow -= 1
             objectFetches += 1
             objectFetchTime += ContinuousClock.now - started
@@ -149,6 +191,7 @@ public actor ScopeCache {
     /// forwarded with the action that first references it; until then it is kept in
     /// the spool, where the cache's eviction cannot take it.
     public func put(_ blob: CASBlob) async throws {
+        try requireOpen()
         let digest = blob.digest
         await sweepSpoolIfDue()
         if !uploaded.contains(digest) { try writeSpool(blob) }
@@ -158,6 +201,7 @@ public actor ScopeCache {
     // MARK: Actions
 
     public func actionGet(_ key: CASDigest) async -> CASDigest? {
+        noteLookup(key)
         if let value = actions[key] ?? readAction(key) {
             actions[key] = value
             return value
@@ -181,6 +225,113 @@ public actor ScopeCache {
         // The value and what it references follow, ahead of the compiler asking.
         prefetch([value])
         return value
+    }
+
+    // MARK: Traces
+
+    /// The lookups of one build, as the daemon sees it: a build is a run of lookups
+    /// with no pause longer than `sessionGap`. Its keys, in the order they were first
+    /// asked, are uploaded under the first one (debounced, and when the build ends),
+    /// so that the next build that starts with the same action can be prefetched.
+    private struct Session {
+        var first: CASDigest
+        var keys: [CASDigest] = []
+        var seen = Set<CASDigest>()
+        var last = ContinuousClock.now
+        /// The trace this session was prefetched from; uploading an identical one
+        /// would change nothing.
+        var loaded: [CASDigest]?
+        var uploaded = false
+    }
+
+    private var session: Session?
+    private var traceFlush: Task<Void, Never>?
+    private var traceLookups = 0
+    private var traceHits = 0
+    private var tracesUploaded = 0
+
+    private func noteLookup(_ key: CASDigest) {
+        let now = ContinuousClock.now
+        if let current = session, now - current.last > sessionGap {
+            Task { [self] in await upload(trace: current) }
+            session = nil
+        }
+        if session == nil {
+            session = Session(first: key)
+            startPrefetch(from: key)
+        }
+        session?.last = now
+        guard var current = session, !current.seen.contains(key), current.keys.count < CASLimits.maxTraceKeys else { return }
+        current.seen.insert(key)
+        current.keys.append(key)
+        current.uploaded = false
+        session = current
+        traceFlush?.cancel()
+        traceFlush = Task { [self, traceDebounce] in
+            try? await Task.sleep(for: traceDebounce)
+            guard !Task.isCancelled else { return }
+            await flushTrace()
+        }
+    }
+
+    /// Uploads the current session's trace now, unless it is empty, unchanged since
+    /// the last upload, or what it was prefetched from.
+    public func flushTrace() async {
+        guard let current = session else { return }
+        await upload(trace: current)
+        session?.uploaded = true
+    }
+
+    private func upload(trace current: Session) async {
+        guard current.keys.count >= 2, !current.uploaded, current.keys != current.loaded else { return }
+        if (try? await upstream.tracePut(current.first, keys: current.keys)) != nil { tracesUploaded += 1 }
+    }
+
+    /// At the start of a build, reads the trace an earlier one left under its first
+    /// action and asks for everything in it, in order, ahead of the compiler.
+    private func startPrefetch(from first: CASDigest) {
+        Task { [self] in
+            guard let trace = try? await upstream.traceGet(first), !trace.isEmpty else { return }
+            session?.loaded = trace
+            await prefetch(trace: trace)
+        }
+    }
+
+    private func prefetch(trace: [CASDigest]) async {
+        var wanted: [CASDigest] = []
+        for key in trace where actions[key] == nil && readAction(key) == nil { wanted.append(key) }
+        var chunks: [[CASDigest]] = []
+        var index = 0
+        while index < wanted.count {
+            chunks.append(Array(wanted[index..<min(index + CASLimits.maxBatchKeys, wanted.count)]))
+            index += CASLimits.maxBatchKeys
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for chunk in chunks {
+                group.addTask { await self.prefetch(chunk: chunk) }
+            }
+        }
+    }
+
+    private func prefetch(chunk: [CASDigest]) async {
+        await lookupSlots.acquire()
+        let answers = try? await upstream.actionGetMany(chunk)
+        await lookupSlots.release()
+        guard let answers, answers.count == chunk.count else { return }
+        traceLookups += chunk.count
+        for (key, answer) in zip(chunk, answers) {
+            if let value = answer {
+                traceHits += 1
+                remember(key: key, value: value)
+                prefetchObjects(of: value)
+            } else {
+                noteMiss(key)
+            }
+        }
+    }
+
+    private func prefetchObjects(of value: CASDigest) {
+        Task { [self] in _ = await get(value) }
     }
 
     // MARK: Batched lookups
@@ -241,6 +392,7 @@ public actor ScopeCache {
     /// Throws if it could not be recorded on disk (a full or unwritable cache
     /// directory): acknowledging it then would lose it on a restart.
     public func actionPut(_ key: CASDigest, value: CASDigest) throws {
+        try requireOpen()
         // An action key is immutable, as at the Worker: the first value stays, a
         // repeat of it is fine, a different one is refused.
         if let existing = actions[key] ?? readAction(key), existing != value {
@@ -264,6 +416,7 @@ public actor ScopeCache {
     /// Waits until everything acknowledged so far has reached upstream (or
     /// given up); for shutdown and tests.
     public func drain() async {
+        await flushTrace()
         while let task = forwarding.values.first {
             await task.value
         }
@@ -275,7 +428,8 @@ public actor ScopeCache {
     public var summary: String {
         let lookupMean = lookups == 0 ? Duration.zero : lookupTime / lookups
         let fetchMean = objectFetches == 0 ? Duration.zero : objectFetchTime / objectFetches
-        return "\(lookups) action lookups in \(batches) calls (mean \(lookupMean) each); "
+        let trace = "trace: \(traceHits) of \(traceLookups) prefetched actions hit, \(tracesUploaded) uploaded; "
+        return trace + "\(lookups) action lookups in \(batches) calls (mean \(lookupMean) each); "
             + "\(objectFetches) objects fetched, \(objectBytes) bytes, mean \(fetchMean) each, at most \(maxObjectFetchesAtOnce) at once"
     }
 

@@ -31,11 +31,19 @@ public final class CASDaemon: @unchecked Sendable {
         public var maxActions: Int
         /// How often actions still waiting for the Worker are tried again.
         public var retryInterval: Duration
+        /// Most scopes held open at once; beyond it the one unused for longest is
+        /// retired to make room, and if every one has work pending a new one is refused.
+        public var maxScopes: Int
+        /// A pause this long in a scope's lookups ends one build's trace and begins another's; it has to outlast the quiet stretches inside a build (long compiles, linking).
+        public var sessionGap: Duration
+        /// How long after the last new lookup a build's trace is uploaded.
+        public var traceDebounce: Duration
         public var makeUpstream: @Sendable (_ scope: String) -> any CASUpstream
 
         public init(
             host: String = "127.0.0.1", port: Int = 0, directory: URL, maxBytes: Int64 = 4 << 30,
-            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60),
+            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60), maxScopes: Int = 32,
+            sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20),
             makeUpstream: @escaping @Sendable (String) -> any CASUpstream
         ) {
             self.host = host
@@ -44,6 +52,9 @@ public final class CASDaemon: @unchecked Sendable {
             self.maxBytes = maxBytes
             self.maxActions = maxActions
             self.retryInterval = retryInterval
+            self.maxScopes = maxScopes
+            self.sessionGap = sessionGap
+            self.traceDebounce = traceDebounce
             self.makeUpstream = makeUpstream
         }
     }
@@ -55,7 +66,7 @@ public final class CASDaemon: @unchecked Sendable {
 
     private let configuration: Configuration
     private let lock = NSLock()
-    private var scopes: [String: Task<ScopeCache, Error>] = [:]
+    private var scopes: [String: (task: Task<ScopeCache, Error>, used: ContinuousClock.Instant)] = [:]
     private var serving: Task<Void, Never>?
     public let log: @Sendable (String) -> Void
 
@@ -79,25 +90,55 @@ public final class CASDaemon: @unchecked Sendable {
     }
 
     func scope(_ name: String) async throws -> ScopeCache {
+        if let existing = lock.withLock({ () -> Task<ScopeCache, Error>? in
+            scopes[name]?.used = .now
+            return scopes[name]?.task
+        }) {
+            return try await existing.value
+        }
+        try await makeRoom()
         let task: Task<ScopeCache, Error> = lock.withLock {
-            if let existing = scopes[name] { return existing }
+            if let existing = scopes[name] { return existing.task }
             let created = Task { [configuration, log] in
                 let cache = try await ScopeCache(
                     directory: configuration.directory.appendingPathComponent(name),
                     maxBytes: configuration.maxBytes, upstream: configuration.makeUpstream(name),
-                    maxActions: configuration.maxActions, retryInterval: configuration.retryInterval, log: log)
+                    maxActions: configuration.maxActions, retryInterval: configuration.retryInterval,
+                    sessionGap: configuration.sessionGap, traceDebounce: configuration.traceDebounce, log: log)
                 await cache.resumePending()
                 return cache
             }
-            scopes[name] = created
+            scopes[name] = (created, .now)
             return created
         }
         return try await task.value
     }
 
+    /// Keeps the number of open scopes within `maxScopes`: the one used longest ago
+    /// that has nothing pending is retired. If none can be, a new scope is refused.
+    private func makeRoom() async throws {
+        while true {
+            let oldest = lock.withLock { () -> [(String, Task<ScopeCache, Error>)]? in
+                guard scopes.count >= configuration.maxScopes else { return nil }
+                return scopes.sorted { $0.value.used < $1.value.used }.map { ($0.key, $0.value.task) }
+            }
+            guard let candidates = oldest else { return }
+            var freed = false
+            for (name, task) in candidates {
+                guard let cache = try? await task.value, await cache.retire() else { continue }
+                lock.withLock { _ = scopes.removeValue(forKey: name) }
+                freed = true
+                break
+            }
+            guard freed else {
+                throw CASDaemonError("too many scopes open (\(configuration.maxScopes)), all with work pending")
+            }
+        }
+    }
+
     /// One line per scope about what it asked upstream.
     public func summaries() async -> [String] {
-        let tasks = lock.withLock { scopes.map { ($0.key, $0.value) } }
+        let tasks = lock.withLock { scopes.map { ($0.key, $0.value.task) } }
         var lines: [String] = []
         for (name, task) in tasks {
             if let cache = try? await task.value { lines.append("\(name): \(await cache.summary)") }
@@ -107,7 +148,7 @@ public final class CASDaemon: @unchecked Sendable {
 
     /// Everything acknowledged has reached upstream, or is queued on disk.
     public func drain() async {
-        let tasks = lock.withLock { Array(scopes.values) }
+        let tasks = lock.withLock { scopes.values.map(\.task) }
         for task in tasks {
             if let cache = try? await task.value { await cache.drain() }
         }

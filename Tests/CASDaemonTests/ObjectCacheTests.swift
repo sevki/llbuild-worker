@@ -185,4 +185,24 @@ final class ObjectCacheTests: XCTestCase {
         let held = await cache.contains(real.digest)
         XCTAssertFalse(held, "the bad entry is dropped so it can be refetched")
     }
+
+    func testContainsVerifiedDropsAnEntryWhoseFileIsDamaged() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("oc-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let real = CASBlob(refs: [], data: Array("real".utf8))
+        let first = try await ObjectCache.open(directory: directory, maxBytes: 1 << 20)
+        try await first.put(real)
+
+        // A later run of the daemon; the file has been damaged meanwhile.
+        let name = real.digest.hex
+        let file = directory.appendingPathComponent(String(name.prefix(2))).appendingPathComponent(name)
+        try ObjectCache.encode(CASBlob(refs: [], data: Array("forged".utf8))).write(to: file)
+        let cache = try await ObjectCache.open(directory: directory, maxBytes: 1 << 20)
+        let trusting = await cache.contains(real.digest)
+        XCTAssertTrue(trusting, "the index alone cannot see the damage")
+        let verified = await cache.containsVerified(real.digest)
+        XCTAssertFalse(verified)
+        let after = await cache.contains(real.digest)
+        XCTAssertFalse(after, "and the bad entry is gone, so a PUT can replace it")
+    }
 }

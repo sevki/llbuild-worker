@@ -15,6 +15,16 @@ public protocol CASUpstream: Sendable {
     func actionPut(_ key: CASDigest, value: CASDigest) async throws
     /// `actionGet` for many keys at once, answers in the keys' order.
     func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?]
+    /// The trace kept under `key`: what an earlier build that began with that action
+    /// looked up, in order. Nil if there is none.
+    func traceGet(_ key: CASDigest) async throws -> [CASDigest]?
+    func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws
+}
+
+extension CASUpstream {
+    /// For an upstream that keeps no traces.
+    public func traceGet(_ key: CASDigest) async throws -> [CASDigest]? { nil }
+    public func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws {}
 }
 
 extension CASUpstream {
@@ -91,6 +101,32 @@ public actor ClientUpstream: CASUpstream {
 
     public func actionPut(_ key: CASDigest, value: CASDigest) async throws {
         try await call { try await $0.actionPut(key, value: value) }
+    }
+
+    /// A Worker without traces fails these calls; after a few failures in a row they
+    /// are not tried again. Traces are only a hint, so failing quietly is right.
+    private var traceFailures = 0
+
+    public func traceGet(_ key: CASDigest) async throws -> [CASDigest]? {
+        guard traceFailures < 3 else { return nil }
+        do {
+            let trace = try await call { try await $0.traceGet(key) }
+            traceFailures = 0
+            return trace
+        } catch {
+            traceFailures += 1
+            return nil
+        }
+    }
+
+    public func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws {
+        guard traceFailures < 3 else { return }
+        do {
+            try await call { try await $0.tracePut(key, keys: keys) }
+            traceFailures = 0
+        } catch {
+            traceFailures += 1
+        }
     }
 
     /// A Worker that predates the batch call fails it; after that, lookups go one

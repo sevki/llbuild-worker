@@ -20,6 +20,7 @@ actor FakeUpstream: CASUpstream {
     var actionGets = 0
 
     func setDown(_ value: Bool) { down = value }
+    func resetCounters() { gets = []; puts = []; manyCalls = []; actionGets = 0 }
     func seed(_ blob: CASBlob) { objects[blob.digest] = blob }
     func seed(action key: CASDigest, value: CASDigest) { actions[key] = value }
 
@@ -44,6 +45,18 @@ actor FakeUpstream: CASUpstream {
         actionGets += 1
         return actions[key]
     }
+    var traces: [CASDigest: [CASDigest]] = [:]
+    var tracePuts = 0
+    func traceGet(_ key: CASDigest) async throws -> [CASDigest]? {
+        if down { throw Down() }
+        return traces[key]
+    }
+    func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws {
+        if down { throw Down() }
+        tracePuts += 1
+        traces[key] = keys
+    }
+
     var manyCalls: [Int] = []
     func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
         if down { throw Down() }
@@ -454,6 +467,176 @@ final class DaemonTests: XCTestCase {
         let modified = try XCTUnwrap(try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
         XCTAssertGreaterThan(modified, Date().addingTimeInterval(-60), "a sweep that listed it as old must see it as new")
         await client.close()
+    }
+
+    // MARK: Traces
+
+    /// Runs a "build": looks up `keys` in order, through a daemon over `upstream`
+    /// with a fresh cache directory, then stops it so the trace is uploaded.
+    private func build(_ keys: [CASDigest], debounce: Duration = .seconds(20)) async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(
+            directory: directory.appendingPathComponent("build-\(UUID().uuidString)"), maxBytes: 64 << 20,
+            traceDebounce: debounce) { _ in fake })
+        port = try await daemon.start()
+        let client = try self.client()
+        for key in keys { _ = try await client.actionGet(key) }
+        await daemon.drain()
+        await client.close()
+        // The daemon fetches the closures of what it found in the background; let that
+        // settle, so it does not count against whatever the test measures next.
+        var seen = -1
+        while seen != (await upstream.gets.count) {
+            seen = await upstream.gets.count
+            try await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
+    private func seedBuild(_ count: Int) async -> (keys: [CASDigest], objects: [CASBlob]) {
+        var keys: [CASDigest] = [], objects: [CASBlob] = []
+        for index in 0..<count {
+            let leaf = blob("leaf \(index)"), root = blob("root \(index)", refs: [leaf.digest])
+            let key = blob("trace action \(index)").digest
+            await upstream.seed(leaf)
+            await upstream.seed(root)
+            await upstream.seed(action: key, value: root.digest)
+            keys.append(key)
+            objects += [leaf, root]
+        }
+        return (keys, objects)
+    }
+
+    func testABuildLeavesItsTraceUnderItsFirstAction() async throws {
+        let (keys, _) = await seedBuild(12)
+        try await build(keys)
+        let trace = await upstream.traces[keys[0]]
+        XCTAssertEqual(trace, keys, "every action looked up, in order, under the first")
+    }
+
+    func testTheNextBuildIsPrefetchedFromTheTrace() async throws {
+        let (keys, objects) = await seedBuild(30)
+        try await build(keys)
+        await upstream.resetCounters()
+
+        // A new machine: empty cache, same Worker. Only the first action is asked for.
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory.appendingPathComponent("fresh"), maxBytes: 64 << 20) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+        let first = try await client.actionGet(keys[0])
+        XCTAssertNotNil(first)
+
+        // Nothing else is asked for, yet the rest of the build arrives.
+        var fetched = 0
+        for _ in 0..<100 {
+            fetched = await upstream.gets.count
+            if fetched >= objects.count { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(fetched, objects.count, "every object of the build was fetched ahead of the compiler")
+
+        // And the lookups and reads are local now, with the Worker unreachable.
+        await upstream.setDown(true)
+        for key in keys {
+            let value = try await client.actionGet(key)
+            XCTAssertNotNil(value)
+        }
+        for object in objects {
+            let local = try await client.get(object.digest)
+            XCTAssertEqual(local, object)
+        }
+        await client.close()
+    }
+
+    func testAnUnchangedTraceIsNotUploadedAgain() async throws {
+        let (keys, _) = await seedBuild(10)
+        try await build(keys)
+        let once = await upstream.tracePuts
+        try await build(keys)
+        // The second build started from the trace the first left, and looked up the same keys.
+        try await Task.sleep(for: .milliseconds(200))
+        let twice = await upstream.tracePuts
+        XCTAssertEqual(once, 1)
+        XCTAssertEqual(twice, 1, "nothing new to record")
+    }
+
+    func testATraceIsUploadedShortlyAfterTheLastNewLookupWithoutAStop() async throws {
+        let (keys, _) = await seedBuild(6)
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory.appendingPathComponent("debounced"), maxBytes: 64 << 20, traceDebounce: .milliseconds(150)) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+        for key in keys { _ = try await client.actionGet(key) }
+        var trace: [CASDigest]?
+        for _ in 0..<50 where trace == nil {
+            try await Task.sleep(for: .milliseconds(50))
+            trace = await upstream.traces[keys[0]]
+        }
+        XCTAssertEqual(trace, keys)
+        let puts = await upstream.tracePuts
+        XCTAssertEqual(puts, 1, "one upload after the lookups stopped, not one per lookup")
+        await client.close()
+    }
+
+    func testAWorkerWithoutTracesStillServesLookups() async throws {
+        // `ClientUpstream` and the default methods treat a missing trace as nothing to do.
+        let (keys, _) = await seedBuild(3)
+        await upstream.setDown(true)
+        let client = try client()
+        let answer = try await client.actionGet(keys[0])
+        XCTAssertNil(answer, "a failed lookup is a miss, and the trace lookup that follows it fails quietly")
+        await client.close()
+    }
+
+    // MARK: Scopes
+
+    private func restart(maxScopes: Int) async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600), maxScopes: maxScopes) { _ in fake })
+        port = try await daemon.start()
+    }
+
+    private func status(ofScope scope: String) async throws -> Bool {
+        let client = try self.client(scope)
+        defer { Task { await client.close() } }
+        do { return try await client.status().storageConfigured } catch { return false }
+    }
+
+    func testTheOldestIdleScopeIsRetiredToMakeRoomForANewOne() async throws {
+        try await restart(maxScopes: 2)
+        for scope in ["one", "two", "three"] {
+            let served = try await status(ofScope: scope)
+            XCTAssertTrue(served, scope)
+        }
+        // "one" was retired for "three", and is opened again when it is asked for.
+        let again = try await status(ofScope: "one")
+        XCTAssertTrue(again)
+    }
+
+    func testANewScopeIsRefusedWhileEveryOpenOneHasWorkPending() async throws {
+        try await restart(maxScopes: 1)
+        await upstream.setDown(true)
+        let busy = try client("busy")
+        let object = blob("unsent")
+        try await busy.put(object)
+        try await busy.actionPut(blob("pending key").digest, value: object.digest)
+
+        let url = URL(string: "http://127.0.0.1:\(port)/another/objects/\(object.digest.hex)")!
+        let (_, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 503)
+        await busy.close()
+    }
+
+    func testARequestThePathDoesNotServeOpensNoScope() async throws {
+        for path in ["/ghost/bogus", "/ghost/objects/not-a-digest", "/ghost"] {
+            let (_, response) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 404, path)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("ghost").path))
     }
 
     func testOnlyTheLoopbackIsServed() async throws {

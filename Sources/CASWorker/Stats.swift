@@ -279,6 +279,14 @@ struct StatsBackend: CASBackend {
         stats.record([StatsName.actionsPut: 1])
     }
 
+    func traceGet(key: String) async throws -> [String]? {
+        try await inner.traceGet(key: key)
+    }
+
+    func tracePut(key: String, keys: [String]) async throws {
+        try await inner.tracePut(key: key, keys: keys)
+    }
+
     func putLarge(digest: String, refs: [String], manifest: String) async throws {
         try await inner.putLarge(digest: digest, refs: refs, manifest: manifest)
     }

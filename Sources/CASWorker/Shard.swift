@@ -39,6 +39,10 @@ distributed actor CASShard {
                 "CREATE TABLE IF NOT EXISTS objects (digest TEXT PRIMARY KEY, refs TEXT NOT NULL, data TEXT NOT NULL, in_r2 INTEGER NOT NULL DEFAULT 0)")
             try storage.exec(
                 "CREATE TABLE IF NOT EXISTS actions (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            // Build traces: the action keys a build looked up, kept under its first key.
+            // Replaced by each new build, so only the newest few are kept.
+            try storage.exec(
+                "CREATE TABLE IF NOT EXISTS traces (key TEXT PRIMARY KEY, keys TEXT NOT NULL, updated INTEGER NOT NULL)")
             // A large object's entry: the manifest object listing its chunks.
             try storage.exec(
                 "CREATE TABLE IF NOT EXISTS large (digest TEXT PRIMARY KEY, refs TEXT NOT NULL, manifest TEXT NOT NULL, size INTEGER NOT NULL)")
@@ -165,6 +169,25 @@ distributed actor CASShard {
             "INSERT INTO actions (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING", key, value)
     }
 
+    /// How many traces a shard keeps: the newest ones by update time.
+    private static let tracesKept = 32
+
+    distributed func putTrace(key: String, keys: [String]) throws {
+        let db = try database()
+        try db.exec(
+            "INSERT INTO traces (key, keys, updated) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET keys = excluded.keys, updated = excluded.updated",
+            key, keys.joined(separator: ","), Int(Date().timeIntervalSince1970))
+        try db.exec(
+            "DELETE FROM traces WHERE key NOT IN (SELECT key FROM traces ORDER BY updated DESC LIMIT ?)", Self.tracesKept)
+    }
+
+    distributed func getTrace(key: String) throws -> [String]? {
+        guard let text = try database().exec("SELECT keys FROM traces WHERE key = ?", key).rows().first?["keys", as: String.self] else {
+            return nil
+        }
+        return text.isEmpty ? [] : text.split(separator: ",").map(String.init)
+    }
+
     distributed func getAction(key: String) throws -> String? {
         try database().exec("SELECT value FROM actions WHERE key = ?", key).rows().first?["value", as: String.self]
     }
@@ -250,6 +273,14 @@ struct ShardBackend: CASBackend {
 
     func actionPut(key: String, value: String) async throws {
         try await shard(for: key).putAction(key: key, value: value)
+    }
+
+    func traceGet(key: String) async throws -> [String]? {
+        try await shard(for: key).getTrace(key: key)
+    }
+
+    func tracePut(key: String, keys: [String]) async throws {
+        try await shard(for: key).putTrace(key: key, keys: keys)
     }
 
     /// Reassembles the object from its manifest's chunks and refuses unless
