@@ -40,6 +40,14 @@ func origin(of url: String) -> String {
     return String(url[..<schemeEnd.upperBound]) + String(afterScheme[..<hostEnd])
 }
 
+/// How many gateway Durable Objects share the `/__rpc` connections. A compiler
+/// starts a short-lived process per source file, each opening its own connection,
+/// and a brand-new Durable Object per connection cost about 1.4 s to start (a
+/// median 1.59 s upgrade against 0.22 s for a route that touches none). A few
+/// long-lived ones stay warm instead; the gateway keeps no per-connection state,
+/// so connections can share one, and several spread the message handling.
+let gatewayCount = 8
+
 /// Native clients connect to `/{scope}/__rpc` over a WebSocket. Each
 /// connection gets its own `CASGateway`, which hosts a stateless `CASService`
 /// in front of the per-shard Durable Objects. Object bodies instead travel
@@ -102,6 +110,12 @@ private func route(req: Request, env: Env, path: String, scope: String) async th
         return .error("Unauthorized", 401)
     }
 
+    // A plain request carries one call; only the WebSocket needs a gateway.
+    if req.method == "POST" {
+        return await rpcResponse(req, env: env, scope: scope)
+    }
+
     let gateways = env.durableObject("CASGATEWAY")
-    return try await gateways.get(id: gateways.newUniqueID()).fetch(req)
+    let gateway = "gateway-\(Int.random(in: 0..<gatewayCount))"
+    return try await gateways.get(id: gateways.idFromName(gateway)).fetch(req)
 }

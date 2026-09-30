@@ -298,26 +298,25 @@ struct ShardBackend: CASBackend {
     }
 }
 
-/// One WebSocket connection's gateway. Unlike WorkerKit's `RPCGateway`,
-/// which relays to a Worker entry point that has no `env`, this Durable Object
-/// hosts the `CASService` itself so the service can reach the shard namespace.
-///
-/// Its own Durable Object id is a fresh unique one per connection (see
-/// `route(...)` in Worker.swift), not derived from a scope, so the scope
-/// this connection serves is only known once `fetch(_:)` sees the request's
-/// URL — `service`/`stats` are built there, not in `init`.
+/// A gateway for `/{scope}/__rpc` WebSocket connections. Several connections
+/// share one, and it keeps no per-connection state at all: the scope a socket was
+/// upgraded under rides with the socket as a tag, and every message builds the
+/// small `CASService` for that scope itself. Nothing is lost when the object
+/// hibernates between messages or is woken by another connection, and one
+/// connection can never be answered from another scope's service. (Holding the
+/// service in a property set at upgrade, as this used to, broke both: a woken
+/// object had none, and a second upgrade replaced the first one's.) Unlike
+/// WorkerKit's `RPCGateway`, which relays to a Worker entry point that has no
+/// `env`, this Durable Object hosts the service itself so it can reach the shard
+/// namespace.
 @DurableObject
 public final class CASGateway {
     let state: DurableObjectState
     let env: Env
-    let hostSystem: WorkersActorSystem
-    var service: CASService?
-    var stats: StatsClient?
 
     public init(state: DurableObjectState, env: Env) {
         self.state = state
         self.env = env
-        self.hostSystem = WorkersActorSystem()
     }
 
     public func fetch(_ req: Request) async throws -> Response {
@@ -328,23 +327,41 @@ public final class CASGateway {
             return .error("Not Found", 404)
         }
 
-        let shards = ShardBackend(namespace: env.durableObject("CASSHARD"), scope: scope)
         let stats = StatsClient(env: env, scope: scope)
-        self.stats = stats
-        let backend: any CASBackend = stats.map { StatsBackend(inner: shards, stats: $0) } ?? shards
-        let service = CASService(actorSystem: hostSystem, backend: backend)
-        hostSystem.host(service)
-        self.service = service
-
         stats?.record([StatsName.connections: 1])
         stats?.recordConnection(ip: req.headers.get("cf-connecting-ip"), cf: req.cf)
-        return .webSocketUpgrade(state.acceptWebSocket(tags: ["rpc"]))
+        return .webSocketUpgrade(state.acceptWebSocket(tags: ["rpc", scopeTag(scope)]))
     }
 
     public func webSocketMessage(_ ws: WebSocket, _ message: WebSocketMessage) async throws {
         guard case .text(let text) = message else { return }
-        ws.send(await hostSystem.receiveJSON(text))
+        let hosted = hostCASService(env: env, scope: scope(fromTags: state.getTags(ws)))
+        ws.send(await hosted.system.receiveJSON(text))
     }
+}
+
+/// The WebSocket tag that carries a connection's scope.
+private let scopeTagPrefix = "scope:"
+
+func scopeTag(_ scope: String) -> String { scopeTagPrefix + scope }
+
+/// The scope a socket's tags name, `"default"` for a socket that has none.
+func scope(fromTags tags: [String]) -> String {
+    tags.first { $0.hasPrefix(scopeTagPrefix) }.map { String($0.dropFirst(scopeTagPrefix.count)) } ?? "default"
+}
+
+/// A `CASService` for `scope` hosted on a fresh actor system in front of the
+/// shard Durable Objects, with traffic counted when statistics are enabled. The
+/// service keeps no state of its own, so this is cheap enough to do per message
+/// (the gateway) and per request (`rpcResponse`).
+func hostCASService(env: Env, scope: String) -> (system: WorkersActorSystem, service: CASService, stats: StatsClient?) {
+    let system = WorkersActorSystem()
+    let shards = ShardBackend(namespace: env.durableObject("CASSHARD"), scope: scope)
+    let stats = StatsClient(env: env, scope: scope)
+    let backend: any CASBackend = stats.map { StatsBackend(inner: shards, stats: $0) } ?? shards
+    let service = CASService(actorSystem: system, backend: backend)
+    system.host(service)
+    return (system, service, stats)
 }
 
 /// `GET`/`PUT /{scope}/objects/{digest}`: object bodies over plain HTTP
