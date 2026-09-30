@@ -54,13 +54,17 @@ for size in 1000 200000 524288 524289 3000000; do
     cmp "$work/blob-$size" "$work/out-$size" || fail "$size-byte round trip differs"
     echo "ok: $size-byte object round-trips through the shard actors"
 done
-echo "ok: objects over 512 KiB go up as chunks and come back verified"
+echo "ok: objects of any size up to the limit go up as one streamed body and come back verified"
 
-# Bodies of 32 KiB and up live in R2; the 1000-byte object and manifests stay
-# in the shard's SQLite. The stand-in bucket logs each put it receives.
-grep -q '^R2PUT obj/[0-9a-f]* 262144$' "$work/serve.log" || fail "chunk bodies did not reach R2"
+# Bodies of 32 KiB and up live in R2, each as one write (the client no longer
+# chunks at all, so there is no per-256 KiB-piece split to check for); the
+# 1000-byte object stays in the shard's SQLite. The stand-in bucket logs each
+# put it receives.
+for size in 200000 524288 524289 3000000; do
+    grep -q "^R2PUT obj/[0-9a-f]* $size\$" "$work/serve.log" || fail "$size-byte object did not reach R2"
+done
 if grep -q '^R2PUT obj/[0-9a-f]* 1000$' "$work/serve.log"; then fail "a small object went to R2"; fi
-echo "ok: chunk bodies are stored in R2, small objects stay in SQLite"
+echo "ok: bodies 32 KiB and up are stored in R2, small objects stay in SQLite"
 
 # The largest logical object is 64 MiB; the client refuses more before uploading.
 head -c 67108865 /dev/urandom > "$work/too-big"
@@ -73,6 +77,18 @@ echo "ok: object over the maximum size is rejected"
 
 if "$castool" "$url" has "$(printf '%064d' 0)"; then fail "missing object reported present"; fi
 echo "ok: missing object is not found"
+
+# Informational only, not a pass/fail gate: CI runners are too noisy for a
+# timing threshold to mean anything, and a regression back toward a
+# shared-connection bottleneck would show up as avg_latency growing with n,
+# not as a hard failure here. The read path is what many concurrent compile
+# jobs actually exercise (one CASClient, many concurrent gets), so that is
+# what is timed; the seed puts before it are not.
+bench="$("$castool" "$url" bench 100 65536)" || fail "bench command itself failed"
+echo "$bench"
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    { echo "### CAS read-path benchmark"; echo '```'; echo "$bench"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+fi
 
 # The async entry points, called the way Swift Build calls them: from many
 # Swift-concurrency tasks at once. A blocking implementation starves the pool.
