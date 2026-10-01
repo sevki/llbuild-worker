@@ -582,6 +582,29 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testABuildThatStartsWithAnotherActionStillFindsTheTrace() async throws {
+        let (keys, objects) = await seedBuild(30)
+        try await build(keys)
+        await upstream.resetCounters()
+
+        // The compile jobs started in a different order: the first lookup is not the old first.
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory.appendingPathComponent("shuffled"), maxBytes: 64 << 20) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+        for key in [keys[5], keys[2], keys[0]] { _ = try await client.actionGet(key) }
+
+        var fetched = 0
+        for _ in 0..<100 {
+            fetched = await upstream.gets.count
+            if fetched >= objects.count { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(fetched, objects.count, "found under a later lookup, and the whole build was fetched")
+        await client.close()
+    }
+
     func testAnUnchangedTraceIsNotUploadedAgain() async throws {
         let (keys, _) = await seedBuild(10)
         try await build(keys)
@@ -590,8 +613,8 @@ final class DaemonTests: XCTestCase {
         // The second build started from the trace the first left, and looked up the same keys.
         try await Task.sleep(for: .milliseconds(200))
         let twice = await upstream.tracePuts
-        XCTAssertEqual(once, 1)
-        XCTAssertEqual(twice, 1, "nothing new to record")
+        XCTAssertEqual(once, 8, "one trace, kept under each of the first 8 lookups")
+        XCTAssertEqual(twice, 8, "nothing new to record")
     }
 
     func testATraceIsUploadedShortlyAfterTheLastNewLookupWithoutAStop() async throws {
@@ -610,7 +633,7 @@ final class DaemonTests: XCTestCase {
         }
         XCTAssertEqual(trace, keys, "uploaded without a stop, once the lookups paused")
         let puts = await upstream.tracePuts
-        XCTAssertLessThan(puts, keys.count, "uploads are debounced, not one per lookup")
+        XCTAssertLessThanOrEqual(puts, keys.count, "one round of uploads (one per anchor), not one per lookup")
         await client.close()
     }
 

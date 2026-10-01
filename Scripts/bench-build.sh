@@ -15,6 +15,7 @@
 # cannot answer this one. `-Rcache-compile-job` is not used: the remark slows the
 # compiler several times over (issue #6) and would measure itself.
 #
+# CASD_ARGS passes more flags to it (--transport post|websocket).
 # With CASD=/path/to/casd the plugin talks to a local cache daemon (started fresh for each
 # mode, its cache wiped for cold and remote) instead of the Worker, and the time the daemon
 # then needs to finish its uploads is shown as "drain": the build does not wait for it, but
@@ -56,7 +57,7 @@ extra=(${BENCH_FLAGS:-})
 
 start_casd() {
     [ -n "$casd" ] || return 0
-    "$casd" --upstream "${host%/}" --listen "127.0.0.1:$port" --cache "$RUNNER_TEMP/casd" \
+    "$casd" --upstream "${host%/}" --listen "127.0.0.1:$port" --cache "$RUNNER_TEMP/casd" ${CASD_ARGS:-} \
         > "$RUNNER_TEMP/casd.log" 2>&1 &
     casd_pid=$!
     for _ in $(seq 1 50); do grep -q listening "$RUNNER_TEMP/casd.log" 2>/dev/null && return 0; sleep 0.1; done

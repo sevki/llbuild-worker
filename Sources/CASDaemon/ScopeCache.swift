@@ -287,12 +287,13 @@ public actor ScopeCache {
             }
             session = nil
         }
-        if session == nil {
-            session = Session(first: key)
-            startPrefetch(from: key)
-        }
+        if session == nil { session = Session(first: key) }
         session?.last = now
         guard var current = session, !current.seen.contains(key), current.keys.count < CASLimits.maxTraceKeys else { return }
+        // Which action a build asks for first varies from run to run (its compile jobs
+        // start in parallel), so a trace is kept under each of a build's first few
+        // lookups, and looked for under each of the next build's, until one is found.
+        if current.loaded == nil, current.keys.count < Self.traceAnchors { startPrefetch(from: key) }
         current.seen.insert(key)
         current.keys.append(key)
         current.uploaded = false
@@ -317,8 +318,19 @@ public actor ScopeCache {
 
     private func upload(trace current: Session) async {
         guard current.keys.count >= 2, !current.uploaded, current.keys != current.loaded else { return }
-        if (try? await upstream.tracePut(current.first, keys: current.keys)) != nil { tracesUploaded += 1 }
+        let anchors = Array(current.keys.prefix(Self.traceAnchors))
+        var stored = false
+        await withTaskGroup(of: Bool.self) { group in
+            for anchor in anchors {
+                group.addTask { (try? await self.upstream.tracePut(anchor, keys: current.keys)) != nil }
+            }
+            for await ok in group where ok { stored = true }
+        }
+        if stored { tracesUploaded += 1 }
     }
+
+    /// How many of a build's first lookups a trace is kept under.
+    static let traceAnchors = 8
 
     /// At the start of a build, reads the trace an earlier one left under its first
     /// action and asks for everything in it, in order, ahead of the compiler.
@@ -327,6 +339,8 @@ public actor ScopeCache {
         Task { [self] in
             defer { background -= 1 }
             guard let trace = try? await upstream.traceGet(first), !trace.isEmpty else { return }
+            // Several probes can find the same trace; only the first is followed.
+            guard session?.loaded == nil else { return }
             session?.loaded = trace
             await prefetch(trace: trace)
         }
