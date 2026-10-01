@@ -99,7 +99,14 @@ public actor ClientUpstream: CASUpstream {
             switch transport {
             case .webSocket: created = try CASClient(workerURL: url)
             case .httpPost: created = try CASClient(workerURL: url, transport: .httpPost)
-            case .automatic: created = try await automatic()
+            case .automatic:
+                // While a failed probe is fresh, go straight to the WebSocket: POST is looked
+                // for again at `postRetryAt`, not on every reconnect.
+                if postServed == false, let at = postRetryAt, Date() < at {
+                    created = try CASClient(workerURL: url)
+                } else {
+                    created = try await automatic()
+                }
             }
             return created
         }

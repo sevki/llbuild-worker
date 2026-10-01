@@ -774,6 +774,17 @@ final class DaemonTests: XCTestCase {
         XCTAssertTrue(recovered, "the filesystem recovered, and so did the scope")
     }
 
+    func testReservedNamesAreScopesWhenThePathIsLongerThanTheDefaultRoutes() {
+        XCTAssertEqual(CASDaemon.route("/__rpc")?.scope, "default")
+        XCTAssertEqual(CASDaemon.route("/objects/abc")?.scope, "default")
+        let nested = CASDaemon.route("/objects/objects/abc")
+        XCTAssertEqual(nested?.scope, "objects")
+        XCTAssertEqual(nested?.rest, ["objects", "abc"])
+        let rpc = CASDaemon.route("/__rpc/__rpc")
+        XCTAssertEqual(rpc?.scope, "__rpc")
+        XCTAssertEqual(rpc?.rest, ["__rpc"])
+    }
+
     func testPruningKeepsAScopeWhosePendingDirectoryCannotBeListed() async throws {
         await daemon.stop()
         let fake = upstream!

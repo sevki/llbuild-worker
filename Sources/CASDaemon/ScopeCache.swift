@@ -158,8 +158,12 @@ public actor ScopeCache {
     /// Whether everything acknowledged here has reached upstream: nothing waits on
     /// disk and nothing is being forwarded.
     private var isIdle: Bool {
-        users == 0 && background == 0 && fetching.isEmpty && uploading.isEmpty && forwarding.isEmpty
-            && ((try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path))?.isEmpty ?? true)
+        guard users == 0 && background == 0 && fetching.isEmpty && uploading.isEmpty && forwarding.isEmpty else { return false }
+        // Only an absent pending directory is empty; one that cannot be listed may hold
+        // acknowledged actions, so the scope is not idle (and keeps retrying them).
+        guard FileManager.default.fileExists(atPath: pendingDirectory.path) else { return true }
+        guard let pending = try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path) else { return false }
+        return pending.isEmpty
     }
 
     /// Stops this scope's background work and refuses further writes, if it has
