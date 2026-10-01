@@ -72,6 +72,14 @@ let stopped = AsyncStream<Void> { continuation in
     }
 }
 for await _ in stopped { break }
+// Acknowledged writes get a little time to reach the Worker; what has not is queued on
+// disk and goes on the next run. A Worker that is not answering must not hold the exit,
+// so the deadline ends the process outright rather than waiting for the drain to notice.
+Task {
+    try? await Task.sleep(for: .seconds(30))
+    FileHandle.standardError.write(Data("casd: stopping with writes still queued on disk\n".utf8))
+    exit(0)
+}
 await daemon.drain()
 for line in await daemon.summaries() { FileHandle.standardError.write(Data("casd: \(line)\n".utf8)) }
 await daemon.stop()

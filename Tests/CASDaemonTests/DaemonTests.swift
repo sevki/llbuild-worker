@@ -73,6 +73,38 @@ actor FakeUpstream: CASUpstream {
     }
 }
 
+/// A TCP listener that completes connections at the kernel and then says nothing,
+/// like a Worker that has stopped answering.
+final class SilentServer {
+    private let descriptor: Int32
+    let port: Int
+
+    init() {
+        #if canImport(Glibc)
+        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        #else
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        #endif
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        address.sin_port = 0
+        withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        listen(fd, 16)
+        var bound = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(fd, $0, &length) }
+        }
+        descriptor = fd
+        port = Int(UInt16(bigEndian: bound.sin_port))
+    }
+
+    deinit { close(descriptor) }
+}
+
 final class DaemonTests: XCTestCase {
     var directory: URL!
     var upstream: FakeUpstream!
@@ -702,6 +734,18 @@ final class DaemonTests: XCTestCase {
             XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 404, path)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("ghost").path))
+    }
+
+    func testACallToAWorkerThatNeverAnswersFailsInsteadOfHanging() async throws {
+        let silent = SilentServer()
+        let upstream = ClientUpstream(url: URL(string: "http://127.0.0.1:\(silent.port)/s")!, timeout: .milliseconds(400))
+        let started = ContinuousClock.now
+        do {
+            _ = try await upstream.actionGet(blob("anything").digest)
+            XCTFail("a call with no answer succeeded")
+        } catch {}
+        let took = ContinuousClock.now - started
+        XCTAssertLessThan(took, .seconds(10), "the call gave up after \(took)")
     }
 
     func testOnlyTheLoopbackIsServed() async throws {

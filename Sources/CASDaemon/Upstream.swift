@@ -41,6 +41,10 @@ extension CASUpstream {
     }
 }
 
+struct UpstreamTimeout: Error, CustomStringConvertible {
+    var description: String { "the Worker did not answer in time" }
+}
+
 /// The Worker, over `CASClient`. One client is held and shared by every call; if
 /// a call fails (a connection the Worker dropped, say) it is replaced and the
 /// call retried once, since every call here is idempotent.
@@ -48,8 +52,9 @@ public actor ClientUpstream: CASUpstream {
     private let url: URL
     private var client: CASClient?
 
-    public init(url: URL) {
+    public init(url: URL, timeout: Duration = .seconds(30)) {
         self.url = url
+        self.callTimeout = timeout
     }
 
     private func current() throws -> CASClient {
@@ -67,15 +72,27 @@ public actor ClientUpstream: CASUpstream {
         Task { await failed.close() }
     }
 
-    private func call<T: Sendable>(_ operation: @Sendable (CASClient) async throws -> T) async throws -> T {
+    /// No call to the Worker may wait forever: a connection it has stopped answering
+    /// (it does not always say so) would hold the call, and with it a build or the
+    /// daemon's shutdown. A call that is not answered in `timeout` is failed by closing
+    /// its connection, which also fails anything else waiting on it.
+    private let callTimeout: Duration
+
+    private func attempt<T: Sendable>(
+        _ client: CASClient, _ operation: @escaping @Sendable (CASClient) async throws -> T
+    ) async throws -> T {
+        try await withDeadline(callTimeout, { try await operation(client) }, onTimeout: { [self] in await discard(client) })
+    }
+
+    private func call<T: Sendable>(_ operation: @escaping @Sendable (CASClient) async throws -> T) async throws -> T {
         let first = try current()
         do {
-            return try await operation(first)
+            return try await attempt(first, operation)
         } catch {
             discard(first)
             let second = try current()
             do {
-                return try await operation(second)
+                return try await attempt(second, operation)
             } catch {
                 discard(second)
                 throw error
@@ -151,6 +168,55 @@ public actor ClientUpstream: CASUpstream {
             var answers = [CASDigest?](repeating: nil, count: keys.count)
             for try await (index, value) in group { answers[index] = value }
             return answers
+        }
+    }
+}
+
+/// Reports the first of two outcomes, once.
+private final class FirstResult<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+
+    init(_ continuation: CheckedContinuation<T, Error>) {
+        self.continuation = continuation
+    }
+
+    /// True if this result was the one reported.
+    @discardableResult
+    func report(_ result: Result<T, Error>) -> Bool {
+        lock.lock()
+        let taken = continuation
+        continuation = nil
+        lock.unlock()
+        guard let taken else { return false }
+        taken.resume(with: result)
+        return true
+    }
+}
+
+/// Runs `operation`, but gives up on it after `timeout`. Unlike a task group's timer,
+/// this returns on time even if the operation cannot be cancelled and never finishes
+/// (a connection that was never answered): it is left behind, and `onTimeout` is the
+/// chance to cut whatever it is waiting on.
+func withDeadline<T: Sendable>(
+    _ timeout: Duration, _ operation: @escaping @Sendable () async throws -> T,
+    onTimeout: @escaping @Sendable () async -> Void
+) async throws -> T {
+    try await withCheckedThrowingContinuation { continuation in
+        let first = FirstResult(continuation)
+        let work = Task {
+            do {
+                first.report(.success(try await operation()))
+            } catch {
+                first.report(.failure(error))
+            }
+        }
+        Task {
+            try? await Task.sleep(for: timeout)
+            if first.report(.failure(UpstreamTimeout())) {
+                work.cancel()
+                await onTimeout()
+            }
         }
     }
 }
