@@ -132,9 +132,11 @@ jobs:
     # A pull request's preview is one deployment, `pr-<number>`, and every push
     # deploys it from its own run: without this, runs for older commits finish
     # after newer ones and leave old code live on the preview. Only the newest
-    # push's run is worth finishing; pushes to main are never cancelled.
+    # push's run is worth finishing. A run for main has a group of its own here: the
+    # workflow-level group already orders those, and a shared one would let a re-run
+    # replace the newest push's pending job.
     concurrency:
-      group: worker-${{ github.head_ref || github.ref }}
+      group: worker-${{ github.event_name == 'pull_request' && github.head_ref || format('{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     # -noble matches the ubuntu-24.04 host's glibc. setup-swift@v2 does not
     # know Swift 6.4.0, so use the official image instead.
