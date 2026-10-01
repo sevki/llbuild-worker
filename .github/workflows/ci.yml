@@ -60,6 +60,13 @@ jobs:
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
 
+      # The installer the Worker serves at /setup: installs casd, starts it as a service, and
+      # falls back to the Worker when it cannot. A stub systemctl stands in for the service manager.
+      - name: Installer sets up casd
+        run: |
+          apt-get install -y -q --no-install-recommends python3
+          Scripts/test-setup.sh
+
       - name: Collect crash reproducers
         if: failure()
         run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
@@ -112,6 +119,10 @@ jobs:
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
+
+      # The same, with the real launchctl loading the real launchd agent.
+      - name: Installer sets up casd
+        run: Scripts/test-setup.sh
 
       - name: Collect crash reproducers
         if: failure()
