@@ -166,6 +166,7 @@ run G "$(withsvc)"
 check "G: exit 0" "[ \$(cat $work/rc-G) = 0 ]"
 check "G: the plugin is pointed at the Worker" "[ \"\$(cfg G)\" = https://cache.example/default ]"
 check "G: says the port is in use by another program" "grep -q 'is already in use by another program' $work/out-G.txt"
+check "G: the hand-run command names the port" "grep -q -- \"--listen 127.0.0.1:$port\" $work/out-G.txt && grep -q 'set LLBUILD_CASD_PORT to another' $work/out-G.txt"
 kill "$other" 2>/dev/null || true; sleep 1
 
 # H: running the installer again replaces the daemon it started before and still works.

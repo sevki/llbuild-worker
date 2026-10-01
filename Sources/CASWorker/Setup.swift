@@ -287,8 +287,9 @@ fi
 
 if [ "$CACHE_URL" = "$REMOTE_URL" ]; then
     cache_note="The local cache daemon is NOT in use ($daemon_note), so the plugin talks to the Worker directly, which is much slower.
-Run it yourself with:  $CASD_BIN --upstream $UPSTREAM
-and then write http://127.0.0.1:$CASD_PORT/\#(scope) into $CONFIG_FILE."
+Run it yourself with:  $CASD_BIN --upstream $UPSTREAM --listen 127.0.0.1:$CASD_PORT
+and then write http://127.0.0.1:$CASD_PORT/\#(scope) into $CONFIG_FILE.
+(If port $CASD_PORT is taken, set LLBUILD_CASD_PORT to another and run the installer again.)"
 else
     cache_note="Started the local cache daemon ($CASD_BIN, listening on 127.0.0.1:$CASD_PORT, upstream $UPSTREAM)."
 fi
