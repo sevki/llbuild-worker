@@ -38,11 +38,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable the compile cache
+      - name: Install curl
         run: |
           apt-get update -q
           apt-get install -y -q --no-install-recommends curl ca-certificates
-          Scripts/ci-compile-cache.sh
+
+      # The compile cache goes through a local cache daemon (casd, docs/daemon.md) instead of
+      # straight to the Worker: this job's compiles are nearly all cache hits, and each one was a
+      # round trip. The binary is built here (no release has it yet) and cached by what it is
+      # built from, so it is rebuilt only when casd changes. A fork's pull request has no token
+      # and skips all of this.
+      - name: Restore casd
+        id: casd-cache
+        if: env.LLBUILD_CAS_TOKEN != ''
+        uses: actions/cache@v4
+        with:
+          path: .casd-bin
+          key: casd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Sources/casd/**', 'Sources/CASDaemon/**', 'Sources/CASClient/**', 'Sources/CASProtocol/**', 'Package.swift', 'Package.resolved') }}
+
+      - name: Build casd
+        if: env.LLBUILD_CAS_TOKEN != '' && steps.casd-cache.outputs.cache-hit != 'true'
+        run: |
+          swift build -c release --product casd --build-system native
+          mkdir -p .casd-bin
+          cp "$(swift build -c release --build-system native --show-bin-path)/casd" .casd-bin/casd
+
+      - name: Point the compile cache at casd
+        if: env.LLBUILD_CAS_TOKEN != ''
+        run: echo "LLBUILD_CASD_BIN=$PWD/.casd-bin/casd" >> "$GITHUB_ENV"
+
+      - name: Enable the compile cache
+        run: Scripts/ci-compile-cache.sh
 
       - name: Run tests
         run: swift test ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
@@ -59,6 +85,11 @@ jobs:
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
+
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
 
       - name: Collect crash reproducers
         if: failure()
@@ -94,6 +125,30 @@ jobs:
           sudo xcode-select -s "$xcode"
           swift --version
 
+      # The compile cache goes through a local cache daemon (casd, docs/daemon.md) instead of
+      # straight to the Worker: this job's compiles are nearly all cache hits, and each one was a
+      # round trip. The binary is built here (no release has it yet) and cached by what it is
+      # built from, so it is rebuilt only when casd changes. A fork's pull request has no token
+      # and skips all of this.
+      - name: Restore casd
+        id: casd-cache
+        if: env.LLBUILD_CAS_TOKEN != ''
+        uses: actions/cache@v4
+        with:
+          path: .casd-bin
+          key: casd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Sources/casd/**', 'Sources/CASDaemon/**', 'Sources/CASClient/**', 'Sources/CASProtocol/**', 'Package.swift', 'Package.resolved') }}
+
+      - name: Build casd
+        if: env.LLBUILD_CAS_TOKEN != '' && steps.casd-cache.outputs.cache-hit != 'true'
+        run: |
+          swift build -c release --product casd --build-system native
+          mkdir -p .casd-bin
+          cp "$(swift build -c release --build-system native --show-bin-path)/casd" .casd-bin/casd
+
+      - name: Point the compile cache at casd
+        if: env.LLBUILD_CAS_TOKEN != ''
+        run: echo "LLBUILD_CASD_BIN=$PWD/.casd-bin/casd" >> "$GITHUB_ENV"
+
       - name: Enable the compile cache
         run: Scripts/ci-compile-cache.sh
 
@@ -112,6 +167,11 @@ jobs:
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
+
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
 
       - name: Collect crash reproducers
         if: failure()

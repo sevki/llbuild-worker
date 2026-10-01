@@ -57,6 +57,40 @@ elif ! curl -fsSL "https://github.com/${GITHUB_REPOSITORY:-sevki/llbuild-worker}
     exit 0
 fi
 
+# A local cache daemon (docs/daemon.md) in front of the Worker, when the job built one
+# (LLBUILD_CASD_BIN). Every compile asks the cache about many small results, and straight to the
+# Worker each of those is a network round trip; through the daemon they share one connection, a
+# local copy and a prefetched trace of the previous build. The compiler flags and the C wrapper
+# below use $cache_url; CAS_REMOTE_URL stays the Worker's, for the scripts that test it directly.
+# Scripts/ci-stop-casd.sh stops it at the end of the job, so its queued writes reach the Worker.
+cache_url="$remote"
+if [ -n "${LLBUILD_CASD_BIN:-}" ]; then
+    if [[ "$remote" =~ ^(https?://[^/]+)/([^/]+)$ ]] && [ -x "$LLBUILD_CASD_BIN" ]; then
+        origin="${BASH_REMATCH[1]}"
+        scope_name="${BASH_REMATCH[2]}"
+        port="${LLBUILD_CASD_PORT:-4170}"
+        nohup "$LLBUILD_CASD_BIN" --upstream "$origin" --listen "127.0.0.1:$port" \
+            --cache "$RUNNER_TEMP/casd-cache" > "$RUNNER_TEMP/casd.log" 2>&1 < /dev/null &
+        echo $! > "$RUNNER_TEMP/casd.pid"
+        up=0
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            code="$(curl -s --noproxy 127.0.0.1 -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
+            if [ -n "$code" ] && [ "$code" != 000 ]; then up=1; break; fi
+            sleep 1
+        done
+        if [ "$up" = 1 ]; then
+            cache_url="http://127.0.0.1:$port/$scope_name"
+            echo "Compiling through the local cache daemon $cache_url, upstream $origin"
+        else
+            echo "::warning::The local cache daemon did not answer: compiling straight against $remote ($(tail -n 2 "$RUNNER_TEMP/casd.log" 2>/dev/null | tr '\n' ' '))"
+            kill "$(cat "$RUNNER_TEMP/casd.pid")" 2>/dev/null || true
+            rm -f "$RUNNER_TEMP/casd.pid"
+        fi
+    else
+        echo "::notice::Not using the local cache daemon: $remote has no scope in its path, or $LLBUILD_CASD_BIN is not executable"
+    fi
+fi
+
 # -explicit-module-build is what makes compile jobs cacheable; -Rcache-compile-job
 # leaves a hit or miss line per compile in the log.
 flags=(
@@ -64,7 +98,7 @@ flags=(
     -Xswiftc -explicit-module-build
     -Xswiftc -cas-path -Xswiftc "$RUNNER_TEMP/cas"
     -Xswiftc -cas-plugin-path -Xswiftc "$dir/$lib"
-    -Xswiftc -cas-plugin-option -Xswiftc "remote-url=$remote"
+    -Xswiftc -cas-plugin-option -Xswiftc "remote-url=$cache_url"
     -Xswiftc -cas-plugin-option -Xswiftc "remote-scope=$scope"
     -Xswiftc -Rcache-compile-job
 )
@@ -72,7 +106,7 @@ echo "SWIFT_CACHE_FLAGS=${flags[*]}" >> "$GITHUB_ENV"
 # For Scripts/check-swift-cache.sh, which needs the plugin and the Worker on their own.
 echo "CAS_PLUGIN_PATH=$dir/$lib" >> "$GITHUB_ENV"
 echo "CAS_REMOTE_URL=$remote" >> "$GITHUB_ENV"
-echo "Compiling Swift through $remote with $dir/$lib"
+echo "Compiling Swift through $cache_url with $dir/$lib"
 
 # The C targets (swift-nio's shims, BoringSSL, ...) are compiled by clang
 # itself, which takes the same plugin through its own -fcas-* options. They
@@ -147,7 +181,7 @@ exec "$clang" "\$@" -fno-modules -Wno-unused-command-line-argument \\
     -fdepscan -Rcompile-job-cache -Xclang -fcache-compile-job \\
     -Xclang -fcas-path -Xclang "$RUNNER_TEMP/cas-c" \\
     -Xclang -fcas-plugin-path -Xclang "$dir/$lib" \\
-    -Xclang -fcas-plugin-option -Xclang "remote-url=$remote"
+    -Xclang -fcas-plugin-option -Xclang "remote-url=$cache_url"
 WRAPPER
 chmod +x "$wrapper"
 
