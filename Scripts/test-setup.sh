@@ -67,6 +67,7 @@ check "https flags dropped only in the test copy" "! grep -q -- \"--proto\" $wor
 cat > "$work/fakecasd" <<EOF
 #!/bin/sh
 while [ \$# -gt 0 ]; do case "\$1" in --listen) addr="\$2"; shift 2;; *) shift;; esac; done
+echo "fakecasd: listening on \$addr with $py" >&2
 exec "$py" -m http.server "\${addr##*:}" --bind "\${addr%:*}"
 EOF
 chmod +x "$work/fakecasd"

@@ -210,6 +210,10 @@ casd_diagnostics() {
     case "$(uname -s)" in
         Darwin)
             { launchctl print "gui/$(id -u)/llbuild.casd" 2>&1 || launchctl print "user/$(id -u)/llbuild.casd" 2>&1; } | head -n 30 >&2 || true
+            echo "What listens on port $CASD_PORT:" >&2
+            lsof -nP -iTCP:"$CASD_PORT" 2>&1 | head -n 5 >&2 || true
+            ps -ax -o pid,stat,etime,command 2>&1 | grep '[c]asd' | head -n 5 >&2 || true
+            curl -sS -m 2 -o /dev/null -w 'curl: http %{http_code}\n' "http://127.0.0.1:$CASD_PORT/" 2>&1 | head -n 3 >&2 || true
             echo "Its log ($HOME/Library/Logs/llbuild-casd.log):" >&2
             tail -n 15 "$HOME/Library/Logs/llbuild-casd.log" >&2 2>&1 || true
             ;;
