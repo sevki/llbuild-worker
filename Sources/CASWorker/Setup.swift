@@ -213,7 +213,7 @@ casd_diagnostics() {
             echo "What listens on port $CASD_PORT:" >&2
             lsof -nP -iTCP:"$CASD_PORT" 2>&1 | head -n 5 >&2 || true
             ps -ax -o pid,stat,etime,command 2>&1 | grep '[c]asd' | head -n 5 >&2 || true
-            curl -sS -m 2 -o /dev/null -w 'curl: http %{http_code}\n' "http://127.0.0.1:$CASD_PORT/" 2>&1 | head -n 3 >&2 || true
+            curl -sS --noproxy 127.0.0.1 -m 2 -o /dev/null -w 'curl: http %{http_code}\n' "http://127.0.0.1:$CASD_PORT/" 2>&1 | head -n 3 >&2 || true
             echo "Its log ($HOME/Library/Logs/llbuild-casd.log):" >&2
             tail -n 15 "$HOME/Library/Logs/llbuild-casd.log" >&2 2>&1 || true
             ;;
@@ -225,7 +225,7 @@ casd_diagnostics() {
 
 # True once something answers HTTP on the daemon's port.
 casd_up() {
-    code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$CASD_PORT/" 2>/dev/null) || code=000
+    code=$(curl -s --noproxy 127.0.0.1 -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$CASD_PORT/" 2>/dev/null) || code=000
     [ "$code" != 000 ]
 }
 

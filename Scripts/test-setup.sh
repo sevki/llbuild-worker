@@ -191,6 +191,12 @@ check "G: says the port is in use by another program" "grep -q 'is already in us
 check "G: the hand-run command names the port" "grep -q -- \"--listen 127.0.0.1:$port\" $work/out-G.txt && grep -q 'set LLBUILD_CASD_PORT to another' $work/out-G.txt"
 kill "$other" 2>/dev/null || true; sleep 1
 
+# J: a proxy in the environment must not be used for the loopback probe of the daemon.
+# The release downloads go to localhost, which no_proxy exempts; the probe of 127.0.0.1 is not exempt.
+run J "$(withsvc)" http_proxy=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 no_proxy=localhost NO_PROXY=localhost LLBUILD_CAS_RELEASE_URL=http://localhost:$relport
+check "J: with a dead proxy configured, the daemon is still found" "[ \"\$(cfg J)\" = http://127.0.0.1:$port/default ]"
+stopcasd
+
 # H: running the installer again replaces the daemon it started before and still works.
 run H1 "$(withsvc)"
 run H2 "$(withsvc)"
@@ -225,7 +231,7 @@ check "I: no service was left behind" "[ ! -e $work/home-I/.config/systemd/user/
 
 if [ "$fail" = 0 ]; then echo "ALL OK"; else
     echo "SOME FAILED"
-    for n in A B C D E F G H1 H2 I; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; cat "$work/out-$n.txt"; }; done
+    for n in A B C D E F G H1 H2 I J; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; cat "$work/out-$n.txt"; }; done
     if [ "$(uname -s)" = Darwin ]; then
         echo "--- launchd"; id -u; launchctl managername 2>&1; launchctl print "gui/$(id -u)" 2>&1 | head -5; launchctl print "user/$(id -u)" 2>&1 | head -5
     fi
