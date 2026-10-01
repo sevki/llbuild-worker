@@ -15,6 +15,12 @@ import Foundation
 ///   actions are files, so a restart carries on where it stopped.
 /// - Upstream trouble is a miss, never an error: a build without the remote is
 ///   slower, not broken.
+/// The write-behind spool is full: nothing more can be acknowledged until what it holds
+/// has been sent to the Worker.
+struct SpoolFull: Error, CustomStringConvertible {
+    var description: String { "the daemon's queue of writes for the Worker is full" }
+}
+
 public actor ScopeCache {
     public let objects: ObjectCache
     private let upstream: any CASUpstream
@@ -25,6 +31,9 @@ public actor ScopeCache {
     /// whatever is least recently used, so it cannot be what an acknowledged write
     /// waits in: a file here stays until it has been uploaded.
     private let spoolDirectory: URL
+    private let maxSpoolBytes: Int64
+    /// Bytes in the spool, kept in step with its files and counted afresh when the scope opens.
+    private var spoolBytes: Int64 = 0
     private let negativeTTL: Duration
     private let retryInterval: Duration
     private let sessionGap: Duration
@@ -67,7 +76,7 @@ public actor ScopeCache {
 
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
-        maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
+        maxSpoolBytes: Int64? = nil, maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
         sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20), maxObjectFetches: Int = 32,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
@@ -78,6 +87,7 @@ public actor ScopeCache {
         self.actionDirectory = directory.appendingPathComponent("actions")
         self.pendingDirectory = directory.appendingPathComponent("pending")
         self.spoolDirectory = directory.appendingPathComponent("spool")
+        self.maxSpoolBytes = maxSpoolBytes ?? max(maxBytes, 64 << 20)
         self.maxActionFiles = maxActions
         self.negativeTTL = negativeTTL
         self.retryInterval = retryInterval
@@ -94,6 +104,7 @@ public actor ScopeCache {
     /// forwarded.
     public func resumePending() async {
         startRetrying()
+        recountSpool()
         await sweepSpool()
         countActions()
         let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
@@ -223,6 +234,18 @@ public actor ScopeCache {
         await sweepSpoolIfDue()
         if !uploaded.contains(digest) { try writeSpool(blob) }
         _ = try await objects.put(blob)
+    }
+
+    // MARK: Traces for a client of this daemon
+
+    /// For a daemon in front of another daemon: the trace calls go on upstream. A failure
+    /// is no trace, never an error.
+    public func traceGet(_ key: CASDigest) async -> [CASDigest]? {
+        (try? await upstream.traceGet(key)) ?? nil
+    }
+
+    public func tracePut(_ key: CASDigest, keys: [CASDigest]) async {
+        _ = try? await upstream.tracePut(key, keys: keys)
     }
 
     // MARK: Actions
@@ -698,7 +721,7 @@ public actor ScopeCache {
         let file = shard(spoolDirectory, digest.hex)
         guard FileManager.default.fileExists(atPath: file.path) else { return false }
         if readSpool(digest) != nil { return true }
-        try? FileManager.default.removeItem(at: file)
+        removeSpoolFile(file)
         return false
     }
 
@@ -710,8 +733,30 @@ public actor ScopeCache {
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
             return
         }
+        let encoded = ObjectCache.encode(blob)
+        // Acknowledging a write promises it will be kept until it is sent, so there must
+        // be room for that promise: when the spool is full the write is refused instead.
+        guard spoolBytes + Int64(encoded.count) <= maxSpoolBytes else { throw SpoolFull() }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try ObjectCache.encode(blob).write(to: file, options: .atomic)
+        try encoded.write(to: file, options: .atomic)
+        spoolBytes += Int64(encoded.count)
+    }
+
+    /// Removes a spool file and takes its size off the count.
+    private func removeSpoolFile(_ file: URL) {
+        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        if (try? FileManager.default.removeItem(at: file)) != nil { spoolBytes = max(0, spoolBytes - Int64(size)) }
+    }
+
+    private func recountSpool() {
+        var total: Int64 = 0
+        let files = FileManager.default.enumerator(
+            at: spoolDirectory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])
+        while let file = files?.nextObject() as? URL {
+            let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            if values?.isRegularFile == true { total += Int64(values?.fileSize ?? 0) }
+        }
+        spoolBytes = total
     }
 
     private func readSpool(_ digest: CASDigest) -> CASBlob? {
@@ -721,7 +766,7 @@ public actor ScopeCache {
     }
 
     private func removeSpool(_ digest: CASDigest) {
-        try? FileManager.default.removeItem(at: shard(spoolDirectory, digest.hex))
+        removeSpoolFile(shard(spoolDirectory, digest.hex))
     }
 
     private var lastSweep = Date()
@@ -755,7 +800,7 @@ public actor ScopeCache {
                 // Still as old as when it was listed? A PUT since then refreshed it.
                 let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
                 guard let modified, modified < cutoff else { continue }
-                try? FileManager.default.removeItem(at: file)
+                removeSpoolFile(file)
             }
             return
         }

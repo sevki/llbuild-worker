@@ -34,6 +34,9 @@ public final class CASDaemon: @unchecked Sendable {
         /// Most scopes held open at once; beyond it the one unused for longest is
         /// retired to make room, and if every one has work pending a new one is refused.
         public var maxScopes: Int
+        /// Most bytes of acknowledged-but-unsent objects a scope keeps; a PUT that would pass
+        /// it is refused (507). Defaults to `maxBytes`, and at least 64 MiB.
+        public var maxSpoolBytes: Int64?
         /// Most scope directories kept on disk, open or not: beyond it the ones unused
         /// for longest are deleted, so the disk the daemon can use is bounded by this
         /// times `maxBytes` (plus what is spooled and recorded per scope).
@@ -46,7 +49,7 @@ public final class CASDaemon: @unchecked Sendable {
 
         public init(
             host: String = "127.0.0.1", port: Int = 0, directory: URL, maxBytes: Int64 = 4 << 30,
-            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60), maxScopes: Int = 32, maxScopeDirectories: Int = 128,
+            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60), maxScopes: Int = 32, maxScopeDirectories: Int = 128, maxSpoolBytes: Int64? = nil,
             sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20),
             makeUpstream: @escaping @Sendable (String) -> any CASUpstream
         ) {
@@ -57,6 +60,7 @@ public final class CASDaemon: @unchecked Sendable {
             self.maxActions = maxActions
             self.retryInterval = retryInterval
             self.maxScopes = maxScopes
+            self.maxSpoolBytes = maxSpoolBytes
             self.maxScopeDirectories = maxScopeDirectories
             self.sessionGap = sessionGap
             self.traceDebounce = traceDebounce
@@ -218,7 +222,7 @@ public final class CASDaemon: @unchecked Sendable {
                 let cache = try await ScopeCache(
                     directory: configuration.directory.appendingPathComponent(Self.directoryName(for: name)),
                     maxBytes: configuration.maxBytes, upstream: configuration.makeUpstream(name),
-                    maxActions: configuration.maxActions, retryInterval: configuration.retryInterval,
+                    maxSpoolBytes: configuration.maxSpoolBytes, maxActions: configuration.maxActions, retryInterval: configuration.retryInterval,
                     sessionGap: configuration.sessionGap, traceDebounce: configuration.traceDebounce, log: log)
                 await cache.resumePending()
                 return cache

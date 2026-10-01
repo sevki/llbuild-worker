@@ -943,6 +943,52 @@ final class DaemonTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: spooled.path), "the unclaimed object survived pruning")
     }
 
+    func testTheDaemonForwardsTraceCallsLikeTheWorker() async throws {
+        let (keys, _) = await seedBuild(5)
+        let client = try client()
+        try await client.tracePut(keys[0], keys: keys)
+        let stored = await upstream.traces[keys[0]]
+        XCTAssertEqual(stored, keys, "the trace went upstream")
+        let back = try await client.traceGet(keys[0])
+        XCTAssertEqual(back, keys)
+        let none = try await client.traceGet(blob("no trace").digest)
+        XCTAssertNil(none)
+        await client.close()
+    }
+
+    func testTheSpoolIsBoundedAndRefusesWritesWhenFull() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600), maxSpoolBytes: 2500) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+
+        var accepted: [CASBlob] = []
+        var refused = 0
+        for index in 0..<6 {
+            let object = CASBlob(refs: [], data: Array(repeating: UInt8(index), count: 1000))
+            do {
+                try await client.put(object)
+                accepted.append(object)
+            } catch {
+                refused += 1
+            }
+        }
+        XCTAssertEqual(accepted.count, 2, "room for two 1000-byte objects in 2500 bytes")
+        XCTAssertEqual(refused, 4)
+
+        // Once what is spooled has been sent, there is room again.
+        let root = CASBlob(refs: accepted.map(\.digest), data: Array("root".utf8))
+        try await client.put(root)
+        await upstream.setDown(false)
+        for index in 0..<2 { _ = index }
+        try await client.actionPut(blob("spool key").digest, value: root.digest)
+        await daemon.drain()
+        let fresh = CASBlob(refs: [], data: Array(repeating: 9, count: 1000))
+        try await client.put(fresh)
+        await client.close()
+    }
+
     func testACallToAWorkerThatNeverAnswersFailsInsteadOfHanging() async throws {
         let silent = SilentServer()
         let upstream = ClientUpstream(url: URL(string: "http://127.0.0.1:\(silent.port)/s")!, timeout: .milliseconds(400))

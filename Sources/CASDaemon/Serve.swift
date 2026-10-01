@@ -107,6 +107,19 @@ extension CASDaemon {
             }
             return Self.reply(id: id, result: answers)
         }
+        if identifier.contains("8traceGet3key") {
+            guard let k = digest(0) else { return Self.reply(id: id, error: "invalid digest") }
+            guard let trace = await cache.traceGet(k) else { return Self.reply(id: id, result: NSNull()) }
+            return Self.reply(id: id, result: trace.map(\.hex))
+        }
+        if identifier.contains("8tracePut3key4keys") {
+            guard let k = digest(0), let names = arguments.dropFirst().first as? [String],
+                  names.count <= CASLimits.maxTraceKeys else { return Self.reply(id: id, error: "invalid trace") }
+            let keys = names.compactMap(Self.fullDigest)
+            guard keys.count == names.count else { return Self.reply(id: id, error: "invalid digest") }
+            await cache.tracePut(k, keys: keys)
+            return Self.reply(id: id, result: nil)
+        }
         if identifier.contains("9actionPut3key5value") {
             guard let k = digest(0), let v = digest(1) else { return Self.reply(id: id, error: "invalid digest") }
             // The Worker refuses an action whose value it does not hold; so does
@@ -239,6 +252,8 @@ extension CASDaemon {
             guard blob.digest == digest else { return Response(status: .badRequest) }
             do {
                 try await cache.put(blob)
+            } catch is SpoolFull {
+                return Response(status: .insufficientStorage)
             } catch {
                 return Response(status: .badGateway)
             }
