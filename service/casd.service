@@ -1,6 +1,6 @@
 # systemd user unit for casd, the local cache daemon (docs/daemon.md).
 #
-#   install -m 755 casd ~/.local/bin/casd
+#   install -D -m 755 casd ~/.local/bin/casd
 #   install -D -m 644 service/casd.service ~/.config/systemd/user/casd.service
 #   edit --upstream below to your Worker, put the access token in
 #   ~/.config/llbuild-cas-remote-token (mode 600; casd reads it itself)
