@@ -834,10 +834,13 @@ public actor ScopeCache {
         // Acknowledging a write promises it will be kept until it is sent, so there must
         // be room for that promise: when the spool is full the write is refused instead.
         if spoolIncomplete, Date().timeIntervalSince(lastRecount) > 30 { recountSpool() }
-        guard !spoolIncomplete, spoolBytes + Int64(encoded.count) <= maxSpoolBytes else { throw SpoolFull() }
+        // A file that is there but could not be read (see `isSpooled`) is replaced by this write,
+        // and its bytes are already in the count.
+        let replaced = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        guard !spoolIncomplete, spoolBytes - replaced + Int64(encoded.count) <= maxSpoolBytes else { throw SpoolFull() }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try encoded.write(to: file, options: .atomic)
-        spoolBytes += Int64(encoded.count)
+        spoolBytes = max(0, spoolBytes - replaced) + Int64(encoded.count)
     }
 
     /// Removes a spool file and takes its size off the count.
