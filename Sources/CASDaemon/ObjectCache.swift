@@ -46,7 +46,8 @@ public actor ObjectCache {
             // shard directories' names.
             guard values.isRegularFile == true, name.count == CASIdentity.digestSize * 2, CASDigest(hex: name) != nil else {
                 // A temporary file left by a store that never finished.
-                if name.hasSuffix(".tmp") { try? FileManager.default.removeItem(at: file) }
+                // One that cannot be removed still occupies disk, and stays counted.
+                if name.hasSuffix(".tmp") { cache.leftovers.remove(name, at: file, size: Int64(values.fileSize ?? 0)) }
                 continue
             }
             found.append((name, Int64(values.fileSize ?? 0), values.contentModificationDate ?? .distantPast))
