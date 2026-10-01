@@ -785,6 +785,8 @@ public actor ScopeCache {
     }
 
     private func pruneActions() {
+        // Which actions are pending is not known while the queue cannot be listed: nothing is pruned.
+        if pendingUncounted { return }
         let target = maxActionFiles * 9 / 10
         let listing = actionFileList()
         actionsUncounted = !listing.complete
@@ -817,7 +819,10 @@ public actor ScopeCache {
     private func isSpooled(_ digest: CASDigest) -> Bool {
         let file = shard(spoolDirectory, digest.hex)
         guard FileManager.default.fileExists(atPath: file.path) else { return false }
-        if readSpool(digest) != nil { return true }
+        // A file that cannot be read now (a transient error) is kept for a retry: it may be the
+        // only durable copy. Only one that was read and is not this object is removed.
+        guard let data = FileManager.default.contents(atPath: file.path) else { return false }
+        if let blob = ObjectCache.decode(data), blob.digest == digest { return true }
         removeSpoolFile(file)
         return false
     }

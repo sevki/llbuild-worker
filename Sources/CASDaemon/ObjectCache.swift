@@ -190,7 +190,13 @@ public actor ObjectCache {
         // Whatever an earlier eviction left at this path is gone now, and a retry must not delete
         // the file installed next. (If it is still there, it stays on the books and the move fails.)
         if !FileManager.default.fileExists(atPath: file.path) { leftovers.forget(name) }
-        try FileManager.default.moveItem(at: temporary, to: file)
+        do {
+            try FileManager.default.moveItem(at: temporary, to: file)
+        } catch {
+            // The temporary file must not stay uncounted: removed, or kept on the books.
+            leftovers.remove(name + ".tmp", at: temporary, size: Int64(encoded.count))
+            throw error
+        }
         await index.set(name, value: Int64(encoded.count))
         // Making room may have let go of entries whose files could not be removed. If those now
         // leave the cache over its bound, this entry is the one to give up.
