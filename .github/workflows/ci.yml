@@ -70,7 +70,6 @@ jobs:
           swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
           swift build -c release --product casd --swift-sdk x86_64-swift-linux-musl --build-system native
           bin=$(swift build -c release --swift-sdk x86_64-swift-linux-musl --build-system native --show-bin-path)
-          file "$bin/casd"
           if ldd "$bin/casd" 2>&1 | grep -qv 'not a dynamic executable'; then
               echo "::error::casd is dynamically linked"
               exit 1
