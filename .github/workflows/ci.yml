@@ -213,11 +213,10 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [native, macos, worker]
     runs-on: ubuntu-24.04
-    # One deploy at a time, and a newer merge waits for the one in flight rather than
-    # cancelling it half way.
-    concurrency:
-      group: deploy-production
-      cancel-in-progress: false
+    # No concurrency group on purpose: a group keeps one pending job and cancels the
+    # older pending one when another queues, which could evict the deploy of the newest
+    # commit. Ordering comes from the tip check below instead, which lets only the run
+    # for the tip of main deploy.
     steps:
       - uses: actions/checkout@v4
 
@@ -230,9 +229,8 @@ jobs:
         with:
           node-version: 22
 
-      # Runs for consecutive merges can reach this point out of order (a concurrency group
-      # does not order its waiting runs), and an older one deploying last would roll
-      # production back. Only the run for the tip of main deploys.
+      # Runs for consecutive merges can reach this point out of order, and an older one
+      # deploying last would roll production back. Only the run for the tip of main deploys.
       - name: Check this commit is still the tip of main
         id: fresh
         run: |
