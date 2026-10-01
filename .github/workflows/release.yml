@@ -76,7 +76,8 @@ jobs:
       # casd is built with the Swift runtime and Foundation linked in, so it runs on a machine
       # with no Swift toolchain (the plugin is loaded by the compiler, which has one). Static
       # Foundation networking needs libcurl's development files; ci.yml checks this link on
-      # every pull request. The result still needs libcurl.so.4 and libc on the host.
+      # every pull request. The result still needs libcurl.so.4 and libc on the host, and, being
+      # built here on Ubuntu 24.04, glibc 2.38 or newer (see docs/daemon.md).
       - name: Build casd
         run: |
           apt-get install -y -q --no-install-recommends libcurl4-openssl-dev
