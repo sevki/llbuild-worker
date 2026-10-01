@@ -91,54 +91,6 @@ jobs:
 
       - name: Package
         run: |
-          bin=$(swift build -c release --build-system native --show-bin-path)
-          tar -C "$bin" -czf CASPlugin-macos-arm64.tar.gz libCASPlugin.dylib
-          tar -C "$bin" -czf casd-macos-arm64.tar.gz casd
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: CASPlugin-macos-arm64
-          path: CASPlugin-macos-arm64.tar.gz
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: casd-macos-arm64
-          path: casd-macos-arm64.tar.gz
-
-  build-linux:
-    name: Build CASPlugin (Linux x86_64)
-    runs-on: ubuntu-24.04
-    # -noble matches the ubuntu-24.04 host's glibc.
-    container: swift:6.4-noble
-    env:
-      # See the macOS job.
-      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Enable the compile cache
-        run: |
-          apt-get update -q
-          apt-get install -y -q --no-install-recommends curl ca-certificates
-          Scripts/ci-compile-cache.sh
-
-      # The bin path depends on the build backend, so the build and the path
-      # lookup below must agree: native when the cache is on, else the default.
-      - name: Build CASPlugin
-        run: swift build -c release --product CASPlugin ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
-
-      # casd is built with the Swift runtime and Foundation linked in, so it runs on a machine
-      # with no Swift toolchain (the plugin is loaded by the compiler, which has one). Static
-      # Foundation networking needs libcurl's development files; ci.yml checks this link on
-      # every pull request. The result still needs libcurl.so.4 and libc on the host, and, being
-      # built here on Ubuntu 24.04, glibc 2.38 or newer (see docs/daemon.md).
-      - name: Build casd
-        run: |
-          apt-get install -y -q --no-install-recommends libcurl4-openssl-dev
-          swift build -c release --product casd --static-swift-stdlib ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
-
-      - name: Package
-        run: |
           bin=$(swift build -c release ${SWIFT_CACHE_FLAGS:+--build-system native} --show-bin-path)
           tar -C "$bin" -czf CASPlugin-linux-x86_64.tar.gz libCASPlugin.so
           tar -czf casd-linux-x86_64.tar.gz casd
