@@ -11,6 +11,8 @@ permissions:
 jobs:
   build-macos:
     name: Build CASPlugin (macOS arm64)
+    # The artifacts inherit the package's deployment target (.macOS(.v15) in
+    # Package.swift), so they need macOS 15 or later.
     runs-on: macos-latest
     env:
       # Builds through the previous release's plugin and the live cache; see

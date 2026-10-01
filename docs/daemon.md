@@ -114,12 +114,16 @@ casd --upstream https://your-worker.example.workers.dev [--listen 127.0.0.1:4170
 
 - **Token.** `LLBUILD_CAS_TOKEN`, or the file `~/.config/llbuild-cas-remote-token`. The
   daemon uses it only towards the Worker.
+- **macOS 15 or later.** The macOS `casd` and plugin are built with the package's
+  deployment target (`.macOS(.v15)`); older systems will not run them.
 - **Point the compiler at it** by using `http://127.0.0.1:4170/<scope>` where the Worker's
   URL was (`remote-url`, or `LLBUILD_CAS_REMOTE_URL`). One daemon serves any number of
   scopes; each scope has its own cache directory under `--cache`.
 - **As a service.** `service/casd.service` (a systemd user unit) and
   `service/llbuild.casd.plist` (a launchd agent) run it at login and restart it after a
-  failure. Edit the upstream URL in them. On stop (SIGTERM) the daemon waits up to 30 s for
+  failure. Edit the upstream URL in them; the launchd file expects `casd` at
+  `~/.local/bin/casd` and its install comment shows the `sed` that fills in `__HOME__`.
+  On stop (SIGTERM) the daemon waits up to 30 s for
   queued uploads and then exits; what is still unsent stays on disk and goes out the next
   time it runs. The launchd file has not been tried on a Mac by the author.
 - **Diagnostics.** On exit it prints, per scope, what it asked of the Worker: lookups and
