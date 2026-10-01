@@ -174,11 +174,11 @@ distributed actor CASShard {
 
     distributed func putTrace(key: String, keys: [String]) throws {
         let db = try database()
+        // `Int` is 32 bits on wasm32, so the time is in seconds (it fits until 2038), and writes in
+        // one second are ordered by row id: REPLACE gives an updated trace a new one.
         try db.exec(
-            "INSERT INTO traces (key, keys, updated) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET keys = excluded.keys, updated = excluded.updated",
-            key, keys.joined(separator: ","), Int(Date().timeIntervalSince1970 * 1000))
-        // Milliseconds, with the row id as a tie-break, so writes in one instant still have an
-        // order. (Rows written earlier in seconds are smaller, so they are older here as well.)
+            "INSERT OR REPLACE INTO traces (key, keys, updated) VALUES (?, ?, ?)",
+            key, keys.joined(separator: ","), Int(Date().timeIntervalSince1970))
         try db.exec(
             "DELETE FROM traces WHERE key NOT IN (SELECT key FROM traces ORDER BY updated DESC, rowid DESC LIMIT ?)", Self.tracesKept)
     }
