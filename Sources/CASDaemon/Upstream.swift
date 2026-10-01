@@ -66,13 +66,19 @@ public actor ClientUpstream: CASUpstream {
     }
 
     private let transport: Transport
-    /// Whether the Worker serves POST, once known (only asked under `.automatic`).
+    /// Whether the connection in use is POST (`.automatic` starts with POST if the Worker
+    /// answers it, else falls back to the WebSocket, and looks again from time to time).
+    private(set) var usesPost = false
     private var postServed: Bool?
+    private var postRetryAt: Date?
+    private var postRetryDelay: Duration
+    private var upgrading = false
 
-    public init(url: URL, timeout: Duration = .seconds(30), transport: Transport = .automatic) {
+    public init(url: URL, timeout: Duration = .seconds(30), transport: Transport = .automatic, postRetryDelay: Duration = .seconds(300)) {
         self.url = url
         self.callTimeout = timeout
         self.transport = transport
+        self.postRetryDelay = postRetryDelay
     }
 
     private var connecting: Task<CASClient, Error>?
@@ -81,7 +87,10 @@ public actor ClientUpstream: CASUpstream {
     private(set) var clientsCreated = 0
 
     private func current() async throws -> CASClient {
-        if let client { return client }
+        if let client {
+            if transport == .automatic, !usesPost, !upgrading, let at = postRetryAt, Date() >= at { await tryUpgradeToPost() }
+            return self.client ?? client
+        }
         // One connection attempt at a time: calls that arrive together wait for it, rather
         // than each opening (and probing) a client of its own.
         if let connecting { return try await connecting.value }
@@ -98,6 +107,7 @@ public actor ClientUpstream: CASUpstream {
         do {
             let created = try await attempt.value
             clientsCreated += 1
+            if transport == .httpPost { usesPost = true }
             client = created
             connecting = nil
             return created
@@ -110,19 +120,45 @@ public actor ClientUpstream: CASUpstream {
     /// POST if the Worker answers it, which is learned once: a stateless call has no
     /// connection that can go stale. A Worker without the endpoint gets the WebSocket.
     private func automatic() async throws -> CASClient {
-        if postServed != false {
-            let candidate = try CASClient(workerURL: url, transport: .httpPost)
-            if postServed == true { return candidate }
-            do {
-                _ = try await withDeadline(callTimeout, { try await candidate.status() }, onTimeout: { await candidate.close() })
-                postServed = true
-                return candidate
-            } catch {
-                postServed = false
-                await candidate.close()
-            }
+        let candidate = try CASClient(workerURL: url, transport: .httpPost)
+        do {
+            _ = try await withDeadline(callTimeout, { try await candidate.status() }, onTimeout: { await candidate.close() })
+            postServed = true
+            usesPost = true
+            postRetryAt = nil
+            return candidate
+        } catch {
+            // Not necessarily "unsupported": the Worker may have been away. The WebSocket serves
+            // for now, and POST is tried again later (see `tryUpgradeToPost`).
+            await candidate.close()
+            postServed = false
+            usesPost = false
+            postRetryAt = Date().addingTimeInterval(Double(postRetryDelay.components.seconds)
+                + Double(postRetryDelay.components.attoseconds) / 1e18)
+            return try CASClient(workerURL: url)
         }
-        return try CASClient(workerURL: url)
+    }
+
+    /// While on the WebSocket by fallback, asks again whether the Worker serves POST, and moves
+    /// over if it does. At most one probe at a time, and not more often than the retry delay.
+    private func tryUpgradeToPost() async {
+        upgrading = true
+        defer { upgrading = false }
+        postRetryAt = Date().addingTimeInterval(Double(postRetryDelay.components.seconds)
+            + Double(postRetryDelay.components.attoseconds) / 1e18)
+        guard let candidate = try? CASClient(workerURL: url, transport: .httpPost) else { return }
+        do {
+            _ = try await withDeadline(callTimeout, { try await candidate.status() }, onTimeout: { await candidate.close() })
+        } catch {
+            await candidate.close()
+            return
+        }
+        let old = client
+        client = candidate
+        usesPost = true
+        postServed = true
+        postRetryAt = nil
+        if let old { Task { await old.close() } }
     }
 
     private func discard(_ failed: CASClient) {

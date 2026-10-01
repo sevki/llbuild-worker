@@ -1116,6 +1116,31 @@ final class DaemonTests: XCTestCase {
         }
     }
 
+    func testAProbeThatFailedIsRepeatedAndPostIsUsedOnceTheWorkerAnswers() async throws {
+        // A port with nothing behind it yet.
+        var reserved: SilentServer? = SilentServer()
+        let freePort = reserved!.port
+        reserved = nil
+        let client = ClientUpstream(
+            url: URL(string: "http://127.0.0.1:\(freePort)/s")!, timeout: .milliseconds(300), transport: .automatic,
+            postRetryDelay: .milliseconds(300))
+        do {
+            _ = try await client.actionGet(blob("x").digest)
+            XCTFail("nothing was listening")
+        } catch {}
+        let first = await client.usesPost
+        XCTAssertFalse(first, "the probe failed, so the WebSocket was used")
+        // A Worker comes up on that port; after the retry time POST is used.
+        let fake = upstream!
+        let late = CASDaemon(.init(port: freePort, directory: directory.appendingPathComponent("late"), maxBytes: 64 << 20) { _ in fake })
+        _ = try await late.start()
+        try await Task.sleep(for: .milliseconds(500))
+        _ = try await client.actionGet(blob("x").digest)
+        let second = await client.usesPost
+        XCTAssertTrue(second, "the probe was repeated and POST is now used")
+        await late.stop()
+    }
+
     func testACallToAWorkerThatNeverAnswersFailsInsteadOfHanging() async throws {
         let silent = SilentServer()
         let upstream = ClientUpstream(url: URL(string: "http://127.0.0.1:\(silent.port)/s")!, timeout: .milliseconds(400))

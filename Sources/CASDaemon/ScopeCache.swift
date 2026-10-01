@@ -175,7 +175,10 @@ public actor ScopeCache {
         retrier?.cancel()
         retrier = nil
         traceFlush?.cancel()
-        await flushTrace()
+        // The trace is only a hint: it is sent on its own, after this returns, so that a slow or
+        // absent Worker cannot hold up whoever is retiring the scope (the daemon does it while
+        // admitting another one).
+        Task { [self] in await flushTrace() }
         return true
     }
 
