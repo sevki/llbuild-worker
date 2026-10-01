@@ -211,10 +211,12 @@ public final class CASDaemon: @unchecked Sendable {
             guard !FileManager.default.fileExists(atPath: root.path) else { return false }
             entries = []
         }
-        var directories = entries.compactMap { url -> (url: URL, used: Date)? in
-            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey])
-            guard values?.isDirectory == true else { return nil }
-            return (url, values?.contentModificationDate ?? .distantPast)
+        var directories: [(url: URL, used: Date)] = []
+        for url in entries {
+            // A directory whose status cannot be read cannot be counted: nothing is admitted.
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey]) else { return false }
+            guard values.isDirectory == true else { continue }
+            directories.append((url, values.contentModificationDate ?? .distantPast))
         }
         let isNew = !directories.contains { $0.url.lastPathComponent == Self.directoryName(for: name) }
         let room = configuration.maxScopeDirectories - (isNew ? 1 : 0)

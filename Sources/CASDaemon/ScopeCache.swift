@@ -732,6 +732,10 @@ public actor ScopeCache {
     private func writeAction(_ key: CASDigest, _ value: CASDigest) throws {
         let file = shard(actionDirectory, key.hex)
         let existed = FileManager.default.fileExists(atPath: file.path)
+        if !existed, actionsUncounted {
+            if Date().timeIntervalSince(lastActionCount) > 30 { countActions() }
+            if actionsUncounted { throw CASDaemonError("the action records could not be counted; no new record is stored") }
+        }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(value.hex.utf8).write(to: file, options: .atomic)
         guard !existed else { return }
@@ -742,26 +746,41 @@ public actor ScopeCache {
     private var actionFiles = 0
     private let maxActionFiles: Int
 
-    private func actionFileList() -> [(url: URL, modified: Date)] {
-        var found: [(URL, Date)] = []
-        let files = FileManager.default.enumerator(
-            at: actionDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
-        while let file = files?.nextObject() as? URL {
-            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
-            guard values?.isRegularFile == true else { continue }
-            found.append((file, values?.contentModificationDate ?? .distantPast))
+    /// The action files, and whether the listing is complete: one that is not leaves files
+    /// outside the count, and new records are refused until a listing is.
+    private func actionFileList() -> (files: [(url: URL, modified: Date)], complete: Bool) {
+        var found: [(url: URL, modified: Date)] = []
+        var complete = true
+        guard let files = FileManager.default.enumerator(
+            at: actionDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            errorHandler: { _, _ in complete = false; return true }) else { return ([], false) }
+        while let file = files.nextObject() as? URL {
+            guard let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]) else {
+                complete = false
+                continue
+            }
+            guard values.isRegularFile == true else { continue }
+            found.append((file, values.contentModificationDate ?? .distantPast))
         }
-        return found
+        return (found, complete)
     }
 
+    private var actionsUncounted = false
+    private var lastActionCount = Date.distantPast
+
     private func countActions() {
-        actionFiles = actionFileList().count
+        lastActionCount = Date()
+        let listing = actionFileList()
+        actionsUncounted = !listing.complete
+        actionFiles = listing.files.count
         if actionFiles > maxActionFiles { pruneActions() }
     }
 
     private func pruneActions() {
         let target = maxActionFiles * 9 / 10
-        var excess = actionFileList().sorted { $0.modified < $1.modified }
+        let listing = actionFileList()
+        actionsUncounted = !listing.complete
+        var excess = listing.files.sorted { $0.modified < $1.modified }
         var remaining = excess.count
         excess.removeAll { FileManager.default.fileExists(atPath: pendingDirectory.appendingPathComponent($0.url.lastPathComponent).path) }
         for entry in excess where remaining > target {
