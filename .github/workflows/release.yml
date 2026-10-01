@@ -73,8 +73,14 @@ jobs:
       - name: Build CASPlugin
         run: swift build -c release --product CASPlugin ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
+      # casd is built with the Swift runtime and Foundation linked in, so it runs on a machine
+      # with no Swift toolchain (the plugin is loaded by the compiler, which has one). Static
+      # Foundation networking needs libcurl's development files; ci.yml checks this link on
+      # every pull request. The result still needs libcurl.so.4 and libc on the host.
       - name: Build casd
-        run: swift build -c release --product casd ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
+        run: |
+          apt-get install -y -q --no-install-recommends libcurl4-openssl-dev
+          swift build -c release --product casd --static-swift-stdlib ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
       - name: Package
         run: |

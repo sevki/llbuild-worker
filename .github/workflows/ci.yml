@@ -60,6 +60,25 @@ jobs:
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
 
+      # The Linux release build of casd links the Swift runtime and Foundation statically, so it runs
+      # without a Swift toolchain. A release only builds on a tag, so check the link here.
+      - name: casd links without the Swift runtime
+        run: |
+          apt-get install -y -q --no-install-recommends libcurl4-openssl-dev
+          swift build -c release --product casd --static-swift-stdlib ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
+          bin=$(swift build -c release ${SWIFT_CACHE_FLAGS:+--build-system native} --show-bin-path)
+          if ldd "$bin/casd" | grep -E 'libswift|libFoundation'; then
+              echo "::error::casd still needs the Swift runtime on the host"
+              exit 1
+          fi
+          # And it runs, here, where only the container's own libraries are on the path.
+          "$bin/casd" --upstream https://example.invalid --listen 127.0.0.1:4777 &
+          pid=$!
+          sleep 3
+          code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:4777/ || true)
+          kill "$pid" 2>/dev/null || true
+          [ "$code" = 404 ] || { echo "::error::casd did not answer HTTP (got $code)"; exit 1; }
+
       - name: Collect crash reproducers
         if: failure()
         run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
