@@ -45,7 +45,13 @@ esac
 
 dir="$RUNNER_TEMP/cas-plugin"
 mkdir -p "$dir"
-if ! curl -fsSL "https://github.com/${GITHUB_REPOSITORY:-sevki/llbuild-worker}/releases/latest/download/$asset.tar.gz" \
+if [ -n "${LLBUILD_CAS_PLUGIN:-}" ]; then
+    # A plugin to use instead of the latest release (a checkout's build, for
+    # instance; Scripts/bench-build.sh measures one).
+    [ -f "$LLBUILD_CAS_PLUGIN" ] || { echo "::error::LLBUILD_CAS_PLUGIN $LLBUILD_CAS_PLUGIN does not exist"; exit 1; }
+    dir="$(cd "$(dirname "$LLBUILD_CAS_PLUGIN")" && pwd)"
+    lib="$(basename "$LLBUILD_CAS_PLUGIN")"
+elif ! curl -fsSL "https://github.com/${GITHUB_REPOSITORY:-sevki/llbuild-worker}/releases/latest/download/$asset.tar.gz" \
         | tar -xz -C "$dir" || [ ! -f "$dir/$lib" ]; then
     echo "::warning::Could not download $asset from the latest release: building without the compile cache"
     exit 0

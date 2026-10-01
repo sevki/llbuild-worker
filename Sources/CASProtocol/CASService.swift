@@ -97,6 +97,12 @@ public enum CASLimits {
     /// `chunkBytes` pieces. Bounded by the Worker isolate's memory, same as
     /// `maxLargeObjectBytes`.
     public static let maxHTTPObjectBytes = 64 * 1024 * 1024
+
+    /// Most keys one `actionGetMany` may carry: a reply is one short string per key.
+    public static let maxBatchKeys = 256
+
+    /// Most action keys one trace may hold (a key is 64 hex characters).
+    public static let maxTraceKeys = 8192
 }
 
 /// A large object's entry: its references, the manifest object that lists its
@@ -129,6 +135,15 @@ public protocol CASBackend: Sendable {
     /// reassemble to content with exactly this identity.
     func putLarge(digest: String, refs: [String], manifest: String) async throws
     func getLarge(digest: String) async throws -> CASLargeObject?
+    /// The keys a build looked up, in order, recorded under the first of them (see
+    /// `CASService.tracePut`). A backend that keeps no traces inherits these.
+    func traceGet(key: String) async throws -> [String]?
+    func tracePut(key: String, keys: [String]) async throws
+}
+
+extension CASBackend {
+    public func traceGet(key: String) async throws -> [String]? { nil }
+    public func tracePut(key: String, keys: [String]) async throws {}
 }
 
 /// The llbuild-worker CAS: the distributed actor a Worker hosts and a native
@@ -187,6 +202,44 @@ public distributed actor CASService {
 
     public distributed func actionGet(key: String) async throws -> String? {
         try await requireBackend().actionGet(key: try Self.validated(key))
+    }
+
+    /// Many `actionGet`s in one call, for a client with many lookups outstanding:
+    /// one round trip instead of one each. The answers are in the order of the
+    /// keys, nil for an action that is not stored. Objects are not part of it; they
+    /// stay on the plain HTTP endpoints.
+    public distributed func actionGetMany(keys: [String]) async throws -> [String?] {
+        guard keys.count <= CASLimits.maxBatchKeys else {
+            throw CASServiceError.objectTooLarge(size: keys.count, limit: CASLimits.maxBatchKeys)
+        }
+        let backend = try requireBackend()
+        let valid = try keys.map(Self.validated)
+        return try await withThrowingTaskGroup(of: (Int, String?).self) { group in
+            for (index, key) in valid.enumerated() {
+                group.addTask { (index, try await backend.actionGet(key: key)) }
+            }
+            var answers = [String?](repeating: nil, count: valid.count)
+            for try await (index, value) in group { answers[index] = value }
+            return answers
+        }
+    }
+
+    /// The trace recorded under `key`: the action keys a build looked up, in the
+    /// order it first looked them up, which started with `key`. A client about to
+    /// repeat that build reads it to ask for what comes next before the compiler
+    /// does. Nil if there is none.
+    public distributed func traceGet(key: String) async throws -> [String]? {
+        try await requireBackend().traceGet(key: try Self.validated(key))
+    }
+
+    /// Records a trace under its first key, replacing any earlier one: unlike an
+    /// action, a trace is a hint about the latest build, not a fact about content.
+    /// A wrong or stale trace costs a client some unneeded lookups, nothing more.
+    public distributed func tracePut(key: String, keys: [String]) async throws {
+        guard keys.count <= CASLimits.maxTraceKeys else {
+            throw CASServiceError.objectTooLarge(size: keys.count, limit: CASLimits.maxTraceKeys)
+        }
+        try await requireBackend().tracePut(key: try Self.validated(key), keys: try keys.map(Self.validated))
     }
 
     public distributed func actionPut(key: String, value: String) async throws {

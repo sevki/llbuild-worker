@@ -1,0 +1,98 @@
+import CASClient
+import CASDaemon
+import Foundation
+
+func usage() -> Never {
+    FileHandle.standardError.write(Data("""
+    usage: casd --upstream <worker-url> [--listen <host:port>] [--cache <dir>] [--max-gb <n>]
+                [--transport auto|post|websocket]
+
+    Serves the Worker's protocol on the loopback and forwards to <worker-url>
+    (a scope is taken from the request path: <worker-url>/<scope>). Point the
+    plugin's remote-url at http://<host>:<port>/<scope>. The access token comes
+    from LLBUILD_CAS_TOKEN or ~/.config/llbuild-cas-remote-token.
+
+      --listen    default 127.0.0.1:4170
+      --cache     default ~/.cache/llbuild-casd
+      --max-gb    local cache size per scope, default 4
+      --transport how to reach the Worker: post (one request per call, no connection to
+                  go stale), websocket, or auto (post if the Worker serves it), default auto
+
+    """.utf8))
+    exit(64)
+}
+
+var upstream: URL?
+var host = "127.0.0.1"
+var port = 4170
+var cache = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cache/llbuild-casd")
+var cacheBytes: Int64 = 4 << 30
+var transport = ClientUpstream.Transport.automatic
+
+var arguments = CommandLine.arguments.dropFirst()
+while let flag = arguments.popFirst() {
+    guard let value = arguments.popFirst() else { usage() }
+    switch flag {
+    case "--upstream": upstream = URL(string: value)
+    case "--listen":
+        guard let parsed = CASDaemon.parseListenAddress(value) else { usage() }
+        host = parsed.host
+        port = parsed.port
+    case "--cache": cache = URL(fileURLWithPath: value)
+    case "--max-gb":
+        guard let bytes = CASDaemon.cacheBytes(gigabytes: value) else { usage() }
+        cacheBytes = bytes
+    case "--transport":
+        switch value {
+        case "auto": transport = .automatic
+        case "post": transport = .httpPost
+        case "websocket": transport = .webSocket
+        default: usage()
+        }
+    default: usage()
+    }
+}
+guard let upstream, ["http", "https"].contains(upstream.scheme ?? "") else { usage() }
+
+let chosenTransport = transport
+let verbose = ProcessInfo.processInfo.environment["LLBUILD_CAS_DEBUG"] != nil
+let daemon = CASDaemon(
+    .init(host: host, port: port, directory: cache, maxBytes: cacheBytes) { scope in
+        ClientUpstream(url: upstream.appendingPathComponent(scope), transport: chosenTransport)
+    },
+    log: { message in
+        if verbose { FileHandle.standardError.write(Data("casd: \(message)\n".utf8)) }
+    })
+
+do {
+    let bound = try await daemon.start()
+    FileHandle.standardOutput.write(Data("casd listening on \(host):\(bound), upstream \(upstream.absoluteString)\n".utf8))
+} catch {
+    FileHandle.standardError.write(Data("casd: cannot listen on \(host):\(port): \(error)\n".utf8))
+    exit(1)
+}
+
+// Until told to stop; on a signal, let acknowledged writes reach the Worker first.
+signal(SIGTERM, SIG_IGN)
+signal(SIGINT, SIG_IGN)
+nonisolated(unsafe) var signalSources: [DispatchSourceSignal] = []
+let stopped = AsyncStream<Void> { continuation in
+    for signo in [SIGTERM, SIGINT] {
+        let source = DispatchSource.makeSignalSource(signal: signo, queue: .main)
+        source.setEventHandler { continuation.yield() }
+        source.resume()
+        signalSources.append(source)
+    }
+}
+for await _ in stopped { break }
+// Acknowledged writes get a little time to reach the Worker; what has not is queued on
+// disk and goes on the next run. A Worker that is not answering must not hold the exit,
+// so the deadline ends the process outright rather than waiting for the drain to notice.
+Task {
+    try? await Task.sleep(for: .seconds(30))
+    FileHandle.standardError.write(Data("casd: stopping with writes still queued on disk\n".utf8))
+    exit(0)
+}
+await daemon.drain()
+for line in await daemon.summaries() { FileHandle.standardError.write(Data("casd: \(line)\n".utf8)) }
+await daemon.stop()

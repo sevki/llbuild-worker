@@ -1,5 +1,5 @@
 {
-  "originHash" : "adff6d0aaf021428db5d618c44e40e4a1ca204c7d7c35a02cd6174046ccd5caf",
+  "originHash" : "8bebf2dfe9fce2017ec1b8dbbe5d362be81e0dce48d909e1f3c52ffd4043f5c2",
   "pins" : [
     {
       "identity" : "compress-nio",
@@ -137,6 +137,14 @@
       }
     },
     {
+      "identity" : "swift-lru-cache",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tornikegomareli/swift-lru-cache.git",
+      "state" : {
+        "revision" : "a4ce798976091ada42d1b22caf1158a185090a3b"
+      }
+    },
+    {
       "identity" : "swift-nio",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio.git",
@@ -249,7 +257,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sevki/WorkerKit.git",
       "state" : {
-        "revision" : "4821611f07708cb4402922b584323dec5668a5b4"
+        "revision" : "ab5131a25f025ba4dba688443af24f181f53ab85"
       }
     }
   ],

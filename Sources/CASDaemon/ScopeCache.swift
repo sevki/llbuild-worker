@@ -1,0 +1,957 @@
+import CASProtocol
+import Foundation
+
+/// One scope's cache: what a build in that scope sees instead of the Worker.
+///
+/// - Objects are served from the local `ObjectCache`; a miss is fetched from
+///   upstream once (concurrent requests share the fetch), stored, and the
+///   object's references are fetched right behind it, because whoever asked for
+///   an object is about to ask for what it points at.
+/// - A looked-up action pulls its whole value closure the same way, so the
+///   compiler's following reads are local.
+/// - Writes are acknowledged once local. An action is forwarded upstream only
+///   after everything it references is there (the Worker refuses an action whose
+///   value it does not hold), by a background task that retries; the pending
+///   actions are files, so a restart carries on where it stopped.
+/// - Upstream trouble is a miss, never an error: a build without the remote is
+///   slower, not broken.
+/// The write-behind spool is full: nothing more can be acknowledged until what it holds
+/// has been sent to the Worker.
+struct PendingFull: Error, CustomStringConvertible {
+    var description: String { "the daemon's queue of actions for the Worker is full" }
+}
+
+struct SpoolFull: Error, CustomStringConvertible {
+    var description: String { "the daemon's queue of writes for the Worker is full" }
+}
+
+public actor ScopeCache {
+    public let objects: ObjectCache
+    private let upstream: any CASUpstream
+    private let scopeRoot: URL
+    private let actionDirectory: URL
+    private let pendingDirectory: URL
+    /// Objects a client stored that are not upstream yet. The object cache evicts
+    /// whatever is least recently used, so it cannot be what an acknowledged write
+    /// waits in: a file here stays until it has been uploaded.
+    private let spoolDirectory: URL
+    private let maxSpoolBytes: Int64
+    private let maxPendingActions: Int
+    /// Actions acknowledged and not yet sent: the markers in `pending`, counted when the scope
+    /// opens and kept in step.
+    private var pendingActions = 0
+    /// Set when the pending queue could not be counted: new actions are refused until it can be.
+    private var pendingUncounted = false
+    /// Bytes in the spool, kept in step with its files and counted afresh when the scope opens.
+    private var spoolBytes: Int64 = 0
+    /// Set when the spool could not be counted in full: writes are refused until a recount succeeds.
+    private var spoolIncomplete = false
+    private var lastRecount = Date.distantPast
+    private let negativeTTL: Duration
+    private let retryInterval: Duration
+    private let sessionGap: Duration
+    private let traceDebounce: Duration
+    private let fetchSlots: AsyncSemaphore
+    private let lookupSlots = AsyncSemaphore(4)
+    private var retrier: Task<Void, Never>?
+    /// Bumped by every action recorded, so a sweep can tell that one arrived while
+    /// it was looking.
+    private var pendingGeneration = 0
+    private let log: @Sendable (String) -> Void
+
+    private var actions: [CASDigest: CASDigest] = [:]
+    private var misses: [CASDigest: ContinuousClock.Instant] = [:]
+    /// Objects known to be upstream, so they are never asked about twice.
+    private var uploaded = Set<CASDigest>() {
+        didSet {
+            // Forgetting only costs another upstream check, so a long-lived
+            // daemon's set is kept from growing without bound.
+            if uploaded.count > Self.maxKnownUpstream { uploaded.removeAll(keepingCapacity: false) }
+        }
+    }
+    private static let maxKnownUpstream = 500_000
+    private var fetching: [CASDigest: Task<CASBlob?, Never>] = [:]
+    private var uploading: [CASDigest: Task<Bool, Never>] = [:]
+    private var forwarding: [CASDigest: Task<Void, Never>] = [:]
+
+    private var lookups = 0
+    private var batches = 0
+    private var objectFetches = 0
+    private var objectBytes = 0
+    private var objectFetchTime = Duration.zero
+    private var maxObjectFetchesAtOnce = 0
+    private var objectFetchesNow = 0
+    private var uploadedObjects = 0
+    private var uploadedActions = 0
+    private var lookupTime = Duration.zero
+
+    private let maxActionsInMemory: Int
+    /// How many actions are held in memory, for tests.
+    var actionsInMemory: Int { actions.count }
+
+    public init(
+        directory: URL, maxBytes: Int64, upstream: any CASUpstream,
+        maxSpoolBytes: Int64? = nil, maxPendingActions: Int = 100_000, maxActionsInMemory: Int = 500_000, maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
+        sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20), maxObjectFetches: Int = 32,
+        log: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws {
+        self.objects = try await ObjectCache.open(
+            directory: directory.appendingPathComponent("objects"), maxBytes: maxBytes)
+        self.upstream = upstream
+        self.scopeRoot = directory
+        self.actionDirectory = directory.appendingPathComponent("actions")
+        self.pendingDirectory = directory.appendingPathComponent("pending")
+        self.spoolDirectory = directory.appendingPathComponent("spool")
+        self.maxSpoolBytes = maxSpoolBytes ?? max(maxBytes, 64 << 20)
+        self.maxPendingActions = maxPendingActions
+        self.maxActionsInMemory = maxActionsInMemory
+        self.maxActionFiles = maxActions
+        self.negativeTTL = negativeTTL
+        self.retryInterval = retryInterval
+        self.sessionGap = sessionGap
+        self.traceDebounce = traceDebounce
+        self.fetchSlots = AsyncSemaphore(maxObjectFetches)
+        self.log = log
+        try FileManager.default.createDirectory(at: actionDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: spoolDirectory, withIntermediateDirectories: true)
+    }
+
+    /// Re-queues the actions a previous run acknowledged but had not yet
+    /// forwarded.
+    public func resumePending() async {
+        startRetrying()
+        recountSpool()
+        countPending()
+        await sweepSpool()
+        countActions()
+        requeuePending()
+    }
+
+    // MARK: Retiring
+
+    private var retired = false
+    private var users = 0
+    /// Background work started on this scope's behalf (prefetches, uploads of a trace,
+    /// lookups in flight) that has not finished: a scope is not retired under it.
+    private var background = 0
+
+    /// Marks the scope as in use (a connection, a request) so it is not retired under
+    /// the user; false if it already has been, and the caller must look the scope up
+    /// again.
+    func beginUse() -> Bool {
+        guard !retired else { return false }
+        users += 1
+        return true
+    }
+
+    func endUse() {
+        users -= 1
+    }
+
+    /// Whether everything acknowledged here has reached upstream: nothing waits on
+    /// disk and nothing is being forwarded.
+    private var isIdle: Bool {
+        guard users == 0 && background == 0 && fetching.isEmpty && uploading.isEmpty && forwarding.isEmpty else { return false }
+        // Only an absent pending directory is empty; one that cannot be listed may hold
+        // acknowledged actions, so the scope is not idle (and keeps retrying them).
+        guard FileManager.default.fileExists(atPath: pendingDirectory.path) else { return true }
+        guard let pending = try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path) else { return false }
+        return pending.isEmpty
+    }
+
+    /// Stops this scope's background work and refuses further writes, if it has
+    /// nothing pending; false, and no change, if it has. The daemon retires idle
+    /// scopes to keep the number it holds open bounded.
+    func retire() async -> Bool {
+        guard isIdle else { return false }
+        // Marked before anything suspends: between the check above and the flush below
+        // a request must not be able to start using a scope that is going away.
+        retired = true
+        // The directory's own time is what the daemon ranks retired scopes by.
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: scopeRoot.path)
+        retrier?.cancel()
+        retrier = nil
+        traceFlush?.cancel()
+        // The trace is only a hint: it is sent on its own, after this returns, so that a slow or
+        // absent Worker cannot hold up whoever is retiring the scope (the daemon does it while
+        // admitting another one).
+        Task { [self] in await flushTrace() }
+        return true
+    }
+
+    private func requireOpen() throws {
+        if retired { throw CASServiceError.storageNotConfigured }
+    }
+
+    // MARK: Objects
+
+    public func contains(_ digest: CASDigest) async -> Bool {
+        if await objects.containsVerified(digest) || isSpooled(digest) { return true }
+        if uploaded.contains(digest) { return true }
+        guard let found = try? await upstream.contains(digest) else { return false }
+        if found { uploaded.insert(digest) }
+        return found
+    }
+
+    public func get(_ digest: CASDigest) async -> CASBlob? {
+        if let blob = await objects.get(digest) ?? readSpool(digest) { return blob }
+        if let inflight = fetching[digest] { return await inflight.value }
+        let task = Task { [self] () -> CASBlob? in
+            // The check above can be stale: another fetch may have stored this object
+            // and finished while it was being made. Look once more, here, before going
+            // upstream.
+            if let local = await objects.get(digest) { return local }
+            await fetchSlots.acquire()
+            // Counted once a slot is held: waiting fetches are not "at once".
+            objectFetchesNow += 1
+            maxObjectFetchesAtOnce = max(maxObjectFetchesAtOnce, objectFetchesNow)
+            let started = ContinuousClock.now
+            let blob = try? await upstream.get(digest)
+            objectFetchesNow -= 1
+            await fetchSlots.release()
+            objectFetches += 1
+            objectFetchTime += ContinuousClock.now - started
+            objectBytes += blob?.data.count ?? 0
+            if let blob, blob.digest == digest {
+                await adopt(blob)
+                return blob
+            }
+            return nil
+        }
+        fetching[digest] = task
+        let blob = await task.value
+        fetching[digest] = nil
+        return blob
+    }
+
+    /// Keeps an object that came from upstream and starts on what it references.
+    private func adopt(_ blob: CASBlob) async {
+        let digest = blob.digest
+        uploaded.insert(digest)
+        _ = try? await objects.put(blob)
+        prefetch(blob.refs)
+    }
+
+    private func prefetch(_ digests: [CASDigest]) {
+        for digest in digests {
+            background += 1
+            Task { [self] in
+                _ = await get(digest)
+                background -= 1
+            }
+        }
+    }
+
+    /// Stores an object a client made, acknowledged once it is on disk. It is
+    /// forwarded with the action that first references it; until then it is kept in
+    /// the spool, where the cache's eviction cannot take it.
+    public func put(_ blob: CASBlob) async throws {
+        try requireOpen()
+        let digest = blob.digest
+        await sweepSpoolIfDue()
+        if !uploaded.contains(digest) { try writeSpool(blob) }
+        _ = try await objects.put(blob)
+    }
+
+    // MARK: Traces for a client of this daemon
+
+    /// For a daemon in front of another daemon: the trace calls go on upstream. A failure
+    /// is no trace, never an error.
+    public func traceGet(_ key: CASDigest) async -> [CASDigest]? {
+        (try? await upstream.traceGet(key)) ?? nil
+    }
+
+    public func tracePut(_ key: CASDigest, keys: [CASDigest]) async {
+        _ = try? await upstream.tracePut(key, keys: keys)
+    }
+
+    // MARK: Actions
+
+    public func actionGet(_ key: CASDigest) async -> CASDigest? {
+        noteLookup(key)
+        if let value = actions[key] ?? readAction(key) {
+            holdInMemory(key, value)
+            // The action may have outlived its object (cache pressure, a smaller limit after a
+            // restart): then the value and what it references are fetched ahead of the compiler.
+            if !(await objects.contains(value)) { prefetch([value]) }
+            return value
+        }
+        if let since = misses[key], ContinuousClock.now - since < negativeTTL { return nil }
+        let started = ContinuousClock.now
+        let found = await lookUpstream(key)
+        lookups += 1
+        lookupTime += ContinuousClock.now - started
+        let value: CASDigest
+        switch found {
+        case .failed:
+            return nil
+        case .miss:
+            noteMiss(key)
+            return nil
+        case .hit(let hit):
+            value = hit
+        }
+        remember(key: key, value: value)
+        // The value and what it references follow, ahead of the compiler asking.
+        prefetch([value])
+        return value
+    }
+
+    // MARK: Traces
+
+    /// The lookups of one build, as the daemon sees it: a build is a run of lookups
+    /// with no pause longer than `sessionGap`. Its keys, in the order they were first
+    /// asked, are uploaded under the first one (debounced, and when the build ends),
+    /// so that the next build that starts with the same action can be prefetched.
+    private struct Session {
+        var first: CASDigest
+        var keys: [CASDigest] = []
+        var seen = Set<CASDigest>()
+        var last = ContinuousClock.now
+        /// The trace this session was prefetched from; uploading an identical one
+        /// would change nothing.
+        var loaded: [CASDigest]?
+        var uploaded = false
+    }
+
+    private var session: Session?
+    private var traceFlush: Task<Void, Never>?
+    private var traceLookups = 0
+    private var traceHits = 0
+    private var tracesUploaded = 0
+    private var traceProbes = 0
+    private var traceFound = 0
+    private var traceErrors = 0
+    private var lastTraceError = ""
+
+    private func noteLookup(_ key: CASDigest) {
+        let now = ContinuousClock.now
+        if let current = session, now - current.last > sessionGap {
+            background += 1
+            Task { [self] in
+                _ = await upload(trace: current)
+                background -= 1
+            }
+            session = nil
+        }
+        if session == nil { session = Session(first: key) }
+        session?.last = now
+        guard var current = session, !current.seen.contains(key), current.keys.count < CASLimits.maxTraceKeys else { return }
+        // Which action a build asks for first varies from run to run (its compile jobs
+        // start in parallel), so a trace is kept under each of a build's first few
+        // lookups, and looked for under each of the next build's, until one is found.
+        if current.loaded == nil, current.keys.count < Self.traceAnchors { startPrefetch(from: key) }
+        current.seen.insert(key)
+        current.keys.append(key)
+        current.uploaded = false
+        session = current
+        traceFlush?.cancel()
+        traceFlush = Task { [self, traceDebounce] in
+            try? await Task.sleep(for: traceDebounce)
+            guard !Task.isCancelled else { return }
+            await flushTrace()
+        }
+    }
+
+    /// Uploads the current session's trace now, unless it is empty, unchanged since
+    /// the last upload, or what it was prefetched from.
+    public func flushTrace() async {
+        guard let snapshot = session else { return }
+        let sent = await upload(trace: snapshot)
+        // Lookups that arrived while that upload was out are not in it: only a session
+        // that is still what was sent counts as sent. And one that could not be sent (the
+        // Worker was away) is not marked, so the next flush tries again.
+        if sent, session?.first == snapshot.first, session?.keys.count == snapshot.keys.count {
+            session?.uploaded = true
+        }
+    }
+
+    /// True if there is nothing to send or the trace is now stored (under at least one of
+    /// its anchors); false if it could not be sent.
+    private func upload(trace current: Session) async -> Bool {
+        guard current.keys.count >= 2, !current.uploaded, current.keys != current.loaded else { return true }
+        let anchors = Array(current.keys.prefix(Self.traceAnchors))
+        var stored = false
+        await withTaskGroup(of: String?.self) { group in
+            for anchor in anchors {
+                group.addTask {
+                    do {
+                        try await self.upstream.tracePut(anchor, keys: current.keys)
+                        return nil
+                    } catch {
+                        return "\(error)"
+                    }
+                }
+            }
+            for await failure in group {
+                if let failure { traceErrors += 1; lastTraceError = failure } else { stored = true }
+            }
+        }
+        if stored { tracesUploaded += 1 }
+        return stored
+    }
+
+    /// How many of a build's first lookups a trace is kept under.
+    static let traceAnchors = 8
+
+    /// At the start of a build, reads the trace an earlier one left under its first
+    /// action and asks for everything in it, in order, ahead of the compiler.
+    private func startPrefetch(from first: CASDigest) {
+        background += 1
+        Task { [self] in
+            defer { background -= 1 }
+            traceProbes += 1
+            let found: [CASDigest]?
+            do {
+                found = try await upstream.traceGet(first)
+            } catch {
+                traceErrors += 1
+                lastTraceError = "\(error)"
+                return
+            }
+            guard let trace = found, !trace.isEmpty else { return }
+            traceFound += 1
+            // Several probes can find the same trace; only the first is followed.
+            guard session?.loaded == nil else { return }
+            session?.loaded = trace
+            await prefetch(trace: trace)
+        }
+    }
+
+    private func prefetch(trace: [CASDigest]) async {
+        var wanted: [CASDigest] = []
+        for key in trace where actions[key] == nil && readAction(key) == nil { wanted.append(key) }
+        var chunks: [[CASDigest]] = []
+        var index = 0
+        while index < wanted.count {
+            chunks.append(Array(wanted[index..<min(index + CASLimits.maxBatchKeys, wanted.count)]))
+            index += CASLimits.maxBatchKeys
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for chunk in chunks {
+                group.addTask { await self.prefetch(chunk: chunk) }
+            }
+        }
+    }
+
+    private func prefetch(chunk: [CASDigest]) async {
+        await lookupSlots.acquire()
+        let answers = try? await upstream.actionGetMany(chunk)
+        await lookupSlots.release()
+        guard let answers, answers.count == chunk.count else { return }
+        traceLookups += chunk.count
+        for (key, answer) in zip(chunk, answers) {
+            if let value = answer {
+                traceHits += 1
+                remember(key: key, value: value)
+                prefetchObjects(of: value)
+            } else {
+                noteMiss(key)
+            }
+        }
+    }
+
+    private func prefetchObjects(of value: CASDigest) {
+        background += 1
+        Task { [self] in
+            _ = await get(value)
+            background -= 1
+        }
+    }
+
+    // MARK: Batched lookups
+
+    private enum Lookup: Sendable {
+        case hit(CASDigest), miss, failed
+    }
+
+    private var waiting: [CASDigest: [CheckedContinuation<Lookup, Never>]] = [:]
+    private var callsInFlight = 0
+    private static let maxCallsInFlight = 2
+
+    /// Lookups are batched by what piles up while a call is out, not by a timer: one
+    /// that finds the upstream idle goes at once (no added latency), and while calls
+    /// are in flight new ones accumulate and go together when one returns. So the
+    /// longer the round trip, the larger the batches, which is when they pay.
+    private func lookUpstream(_ key: CASDigest) async -> Lookup {
+        await withCheckedContinuation { continuation in
+            waiting[key, default: []].append(continuation)
+            sendWaiting()
+        }
+    }
+
+    private func sendWaiting() {
+        while !waiting.isEmpty, callsInFlight < Self.maxCallsInFlight {
+            var batch: [CASDigest: [CheckedContinuation<Lookup, Never>]] = [:]
+            for key in waiting.keys.prefix(CASLimits.maxBatchKeys) { batch[key] = waiting.removeValue(forKey: key) }
+            callsInFlight += 1
+            batches += 1
+            background += 1
+            Task { [self] in
+                await send(batch)
+                callsInFlight -= 1
+                background -= 1
+                sendWaiting()
+            }
+        }
+    }
+
+    private func send(_ batch: [CASDigest: [CheckedContinuation<Lookup, Never>]]) async {
+        let keys = Array(batch.keys)
+        let answers: [CASDigest?]?
+        do {
+            answers = try await upstream.actionGetMany(keys)
+        } catch {
+            answers = nil
+        }
+        for (index, key) in keys.enumerated() {
+            let result: Lookup
+            if let answers, answers.count == keys.count {
+                result = answers[index].map { .hit($0) } ?? .miss
+            } else {
+                result = .failed
+            }
+            for waiter in batch[key] ?? [] { waiter.resume(returning: result) }
+        }
+    }
+
+    /// Acknowledged when recorded locally; the upload happens behind it.
+    /// Throws if it could not be recorded on disk (a full or unwritable cache
+    /// directory): acknowledging it then would lose it on a restart.
+    public func actionPut(_ key: CASDigest, value: CASDigest) throws {
+        try requireOpen()
+        // An action key is immutable, as at the Worker: the first value stays, a
+        // repeat of it is fine, a different one is refused.
+        if let existing = actions[key] ?? readAction(key), existing != value {
+            throw CASServiceError.invalidDigest(key.hex)
+        }
+        // A record that exists but cannot be read now might hold another value: it is not
+        // overwritten blind.
+        let recordPath = shard(actionDirectory, key.hex).path
+        if actions[key] == nil, FileManager.default.fileExists(atPath: recordPath),
+           FileManager.default.contents(atPath: recordPath) == nil {
+            throw CASDaemonError("the action record for \(key.hex) cannot be read")
+        }
+        // The pending marker first: pruning old records (inside `writeAction`) spares
+        // what is pending, and this record must be spared too.
+        // A marker an earlier call left stays whatever happens here: it is the only
+        // durable sign that an acknowledged action still has to be sent.
+        let alreadyPending = FileManager.default.fileExists(
+            atPath: pendingDirectory.appendingPathComponent(key.hex).path)
+        // Pending actions are exempt from the action cap (they must not be lost), so they
+        // need a cap of their own: a Worker that stays away does not get an unbounded queue.
+        if !alreadyPending, pendingUncounted || pendingActions >= maxPendingActions { throw PendingFull() }
+        try writePending(key)
+        if !alreadyPending { pendingActions += 1 }
+        do {
+            try writeAction(key, value)
+        } catch {
+            if !alreadyPending { clearPending(key) }
+            throw error
+        }
+        holdInMemory(key, value)
+        misses[key] = nil
+        pendingGeneration += 1
+        forward(key: key, value: value)
+    }
+
+    /// Waits until everything acknowledged so far has reached upstream (or
+    /// given up); for shutdown and tests.
+    public func drain() async {
+        await flushTrace()
+        while let task = forwarding.values.first {
+            await task.value
+        }
+    }
+
+    public var pendingCount: Int { forwarding.count }
+
+    /// What this scope asked of the Worker, for a line in the daemon's log.
+    public var summary: String {
+        let lookupMean = lookups == 0 ? Duration.zero : lookupTime / lookups
+        let fetchMean = objectFetches == 0 ? Duration.zero : objectFetchTime / objectFetches
+        var trace = "trace: \(traceProbes) probes found \(traceFound); \(traceHits) of \(traceLookups) prefetched actions hit, \(tracesUploaded) uploaded"
+        if traceErrors > 0 { trace += ", \(traceErrors) errors (last: \(lastTraceError))" }
+        trace += "; "
+        return trace + "\(lookups) action lookups in \(batches) calls (mean \(lookupMean) each); "
+            + "\(objectFetches) objects fetched, \(objectBytes) bytes, mean \(fetchMean) each, at most \(maxObjectFetchesAtOnce) at once"
+    }
+
+    private static let maxRememberedMisses = 20_000
+
+    /// A miss is remembered briefly; past `maxRememberedMisses` the expired ones
+    /// are dropped, and if the rest are all fresh the table starts over.
+    private func noteMiss(_ key: CASDigest) {
+        if misses.count >= Self.maxRememberedMisses {
+            let now = ContinuousClock.now
+            misses = misses.filter { now - $0.value < negativeTTL }
+            if misses.count >= Self.maxRememberedMisses { misses.removeAll() }
+        }
+        misses[key] = .now
+    }
+
+    /// The one way an action enters the in-memory map, so the bound holds on every path.
+    private func holdInMemory(_ key: CASDigest, _ value: CASDigest) {
+        if actions.count >= maxActionsInMemory, actions[key] == nil { actions.removeAll(keepingCapacity: true) }
+        actions[key] = value
+    }
+
+    private func remember(key: CASDigest, value: CASDigest) {
+        holdInMemory(key, value)
+        try? writeAction(key, value)
+    }
+
+    private func forward(key: CASDigest, value: CASDigest) {
+        guard forwarding[key] == nil else { return }
+        forwarding[key] = Task { [self] in
+            var delay = Duration.milliseconds(250)
+            for attempt in 1...3 {
+                if await upload(value), (try? await upstream.actionPut(key, value: value)) != nil {
+                    clearPending(key)
+                    break
+                }
+                // Upstream may already hold a different value for this key (another
+                // machine got there first): it wins, and this write is moot.
+                if let held = try? await upstream.actionGet(key), held != value {
+                    // The marker goes only once the winning value is on disk: otherwise the stale
+                    // local record would be served after a restart. It stays, and is retried.
+                    holdInMemory(key, held)
+                    if (try? writeAction(key, held)) != nil {
+                        clearPending(key)
+                        break
+                    }
+                }
+                if attempt == 3 {
+                    log("action \(key.hex) is queued on disk; it will be retried")
+                    break
+                }
+                try? await Task.sleep(for: delay)
+                delay *= 2
+            }
+            forwarding[key] = nil
+        }
+    }
+
+    /// Re-queues what is still pending, every `retryInterval`, for as long as the
+    /// daemon runs: a Worker that was unreachable for a while gets what it missed
+    /// once it is back, without a restart.
+    private func startRetrying() {
+        guard retrier == nil else { return }
+        retrier = Task { [weak self, retryInterval] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: retryInterval)
+                await self?.requeuePending()
+            }
+        }
+    }
+
+    private func countPending() {
+        if let listed = try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path) {
+            pendingActions = listed.count
+            pendingUncounted = false
+        } else {
+            pendingUncounted = true
+        }
+    }
+
+    /// Sends what is pending, at start and then on every retry tick. A marker with no usable
+    /// record (it was not a pending action after all: a crash between the marker and the record)
+    /// goes, and no longer counts; one whose record exists but cannot be read now stays.
+    private func requeuePending() {
+        if pendingUncounted { countPending() }
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? [] {
+            if let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
+               FileManager.default.fileExists(atPath: shard(actionDirectory, key.hex).path),
+               FileManager.default.contents(atPath: shard(actionDirectory, key.hex).path) == nil {
+                continue
+            }
+            guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
+                  let value = actions[key] ?? readAction(key) else {
+                if (try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(name))) != nil {
+                    pendingActions = max(0, pendingActions - 1)
+                }
+                continue
+            }
+            forward(key: key, value: value)
+        }
+    }
+
+    /// Uploads `digest` and everything below it, children first. False if any
+    /// of it could not be sent.
+    private func upload(_ digest: CASDigest) async -> Bool {
+        if uploaded.contains(digest) { return true }
+        if let inflight = uploading[digest] { return await inflight.value }
+        let task = Task { [self] () -> Bool in
+            guard let blob = await objects.get(digest) ?? readSpool(digest) else {
+                // Not here, but it need not be: an object that came from upstream was
+                // never sent to us, and after a restart nothing remembers that. What
+                // upstream holds has its references too.
+                if (try? await upstream.contains(digest)) == true {
+                    uploaded.insert(digest)
+                    return true
+                }
+                log("cannot upload \(digest.hex): not local and not upstream")
+                return false
+            }
+            let children = Set(blob.refs)
+            let childrenSent = await withTaskGroup(of: Bool.self) { group in
+                for child in children { group.addTask { await self.upload(child) } }
+                var all = true
+                for await sent in group where !sent { all = false }
+                return all
+            }
+            guard childrenSent else { return false }
+            do {
+                if try await !upstream.contains(digest) { try await upstream.put(blob) }
+            } catch {
+                return false
+            }
+            uploaded.insert(digest)
+            removeSpool(digest)
+            return true
+        }
+        uploading[digest] = task
+        let sent = await task.value
+        uploading[digest] = nil
+        return sent
+    }
+
+    // MARK: Files
+
+    private func shard(_ directory: URL, _ name: String) -> URL {
+        directory.appendingPathComponent(String(name.prefix(2)), isDirectory: true).appendingPathComponent(name)
+    }
+
+    private func readAction(_ key: CASDigest) -> CASDigest? {
+        guard let data = FileManager.default.contents(atPath: shard(actionDirectory, key.hex).path),
+              let text = String(data: data, encoding: .utf8),
+              let value = CASDigest(hex: text), value.bytes.count == CASIdentity.digestSize else { return nil }
+        return value
+    }
+
+    /// One small file per action. The count is capped (`maxActionFiles`): past it
+    /// the oldest are deleted, except those still waiting to be forwarded.
+    private func writeAction(_ key: CASDigest, _ value: CASDigest) throws {
+        let file = shard(actionDirectory, key.hex)
+        let existed = FileManager.default.fileExists(atPath: file.path)
+        if !existed, actionsUncounted {
+            if Date().timeIntervalSince(lastActionCount) > 30 { countActions() }
+            if actionsUncounted { throw CASDaemonError("the action records could not be counted; no new record is stored") }
+        }
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(value.hex.utf8).write(to: file, options: .atomic)
+        guard !existed else { return }
+        actionFiles += 1
+        if actionFiles > maxActionFiles + maxActionFiles / 10 { pruneActions() }
+    }
+
+    private var actionFiles = 0
+    private let maxActionFiles: Int
+
+    /// The action files, and whether the listing is complete: one that is not leaves files
+    /// outside the count, and new records are refused until a listing is.
+    private func actionFileList() -> (files: [(url: URL, modified: Date)], complete: Bool) {
+        var found: [(url: URL, modified: Date)] = []
+        var complete = true
+        guard let files = FileManager.default.enumerator(
+            at: actionDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            errorHandler: { _, _ in complete = false; return true }) else { return ([], false) }
+        while let file = files.nextObject() as? URL {
+            guard let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]) else {
+                complete = false
+                continue
+            }
+            guard values.isRegularFile == true else { continue }
+            found.append((file, values.contentModificationDate ?? .distantPast))
+        }
+        return (found, complete)
+    }
+
+    private var actionsUncounted = false
+    private var lastActionCount = Date.distantPast
+
+    private func countActions() {
+        lastActionCount = Date()
+        let listing = actionFileList()
+        actionsUncounted = !listing.complete
+        actionFiles = listing.files.count
+        if actionFiles > maxActionFiles { pruneActions() }
+    }
+
+    private func pruneActions() {
+        // Which actions are pending is not known while the queue cannot be listed: nothing is pruned.
+        if pendingUncounted { return }
+        let target = maxActionFiles * 9 / 10
+        let listing = actionFileList()
+        actionsUncounted = !listing.complete
+        var excess = listing.files.sorted { $0.modified < $1.modified }
+        var remaining = excess.count
+        excess.removeAll { FileManager.default.fileExists(atPath: pendingDirectory.appendingPathComponent($0.url.lastPathComponent).path) }
+        for entry in excess where remaining > target {
+            // Counted, and dropped from memory, only if the file is really gone.
+            guard (try? FileManager.default.removeItem(at: entry.url)) != nil else { continue }
+            if let key = CASDigest(hex: entry.url.lastPathComponent) { actions[key] = nil }
+            remaining -= 1
+        }
+        actionFiles = remaining
+    }
+
+    private func writePending(_ key: CASDigest) throws {
+        try Data().write(to: pendingDirectory.appendingPathComponent(key.hex), options: .atomic)
+    }
+
+    private func clearPending(_ key: CASDigest) {
+        if (try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(key.hex))) != nil {
+            pendingActions = max(0, pendingActions - 1)
+        }
+    }
+
+    // The spool
+
+    /// Whether a good copy is spooled: a file that is cut short or is another object
+    /// does not count, and is removed so it can be replaced.
+    private func isSpooled(_ digest: CASDigest) -> Bool {
+        let file = shard(spoolDirectory, digest.hex)
+        guard FileManager.default.fileExists(atPath: file.path) else { return false }
+        // A file that cannot be read now (a transient error) is kept for a retry: it may be the
+        // only durable copy. Only one that was read and is not this object is removed.
+        guard let data = FileManager.default.contents(atPath: file.path) else { return false }
+        if let blob = ObjectCache.decode(data), blob.digest == digest { return true }
+        removeSpoolFile(file)
+        return false
+    }
+
+    private func writeSpool(_ blob: CASBlob) throws {
+        let file = shard(spoolDirectory, blob.digest.hex)
+        if isSpooled(blob.digest) {
+            // Already held, but it now has a new claim on it: refresh its age so a
+            // sweep that listed it as old does not take it (see `sweepSpool`).
+            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
+            return
+        }
+        let encoded = ObjectCache.encode(blob)
+        // Acknowledging a write promises it will be kept until it is sent, so there must
+        // be room for that promise: when the spool is full the write is refused instead.
+        if spoolIncomplete, Date().timeIntervalSince(lastRecount) > 30 { recountSpool() }
+        // A file that is there but could not be read (see `isSpooled`) is replaced by this write,
+        // and its bytes are already in the count.
+        let replaced = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        guard !spoolIncomplete, spoolBytes - replaced + Int64(encoded.count) <= maxSpoolBytes else { throw SpoolFull() }
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try encoded.write(to: file, options: .atomic)
+        spoolBytes = max(0, spoolBytes - replaced) + Int64(encoded.count)
+    }
+
+    /// Removes a spool file and takes its size off the count.
+    private func removeSpoolFile(_ file: URL) {
+        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        if (try? FileManager.default.removeItem(at: file)) != nil { spoolBytes = max(0, spoolBytes - Int64(size)) }
+    }
+
+    private func recountSpool() {
+        lastRecount = Date()
+        spoolIncomplete = false
+        guard FileManager.default.fileExists(atPath: spoolDirectory.path) else { spoolBytes = 0; return }
+        var total: Int64 = 0
+        // A spool that cannot be counted in full is taken to be full: writes are refused rather
+        // than allowed to grow it past `maxSpoolBytes` unseen.
+        var incomplete = false
+        guard let files = FileManager.default.enumerator(
+            at: spoolDirectory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            errorHandler: { _, _ in incomplete = true; return true }) else { spoolBytes = maxSpoolBytes; spoolIncomplete = true; return }
+        while let file = files.nextObject() as? URL {
+            guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]) else { incomplete = true; continue }
+            if values.isRegularFile == true {
+                if let size = values.fileSize { total += Int64(size) } else { incomplete = true }
+            }
+        }
+        spoolBytes = total
+        spoolIncomplete = incomplete
+    }
+
+    private func readSpool(_ digest: CASDigest) -> CASBlob? {
+        guard let data = FileManager.default.contents(atPath: shard(spoolDirectory, digest.hex).path),
+              let blob = ObjectCache.decode(data), blob.digest == digest else { return nil }
+        return blob
+    }
+
+    private func removeSpool(_ digest: CASDigest) {
+        removeSpoolFile(shard(spoolDirectory, digest.hex))
+    }
+
+    private var lastSweep = Date()
+    static let spoolMaxAge: TimeInterval = 24 * 3600
+
+    /// Spooled objects that no action ever claimed (the client died between storing
+    /// and recording) are dropped after a day, at start-up and then hourly while the
+    /// daemon runs. What a pending action can still reach is kept however old.
+    private func sweepSpool() async {
+        lastSweep = Date()
+        let cutoff = Date().addingTimeInterval(-Self.spoolMaxAge)
+        var old: [URL] = []
+        let files = FileManager.default.enumerator(
+            at: spoolDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+        while let file = files?.nextObject() as? URL {
+            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+            if values?.isRegularFile == true, (values?.contentModificationDate ?? .distantFuture) < cutoff {
+                old.append(file)
+            }
+        }
+        guard !old.isEmpty else { return }
+        // Walking what pending actions reach suspends, and an action recorded
+        // meanwhile could claim one of these files. So: delete only if none arrived
+        // during the walk (the deletion itself does not suspend), else look again,
+        // and leave it for the next sweep if it keeps happening.
+        for _ in 0..<3 {
+            let generation = pendingGeneration
+            // Unknown what pending actions reach: nothing is deleted this time.
+            guard let keep = await reachableFromPending() else { return }
+            guard generation == pendingGeneration else { continue }
+            for file in old where !keep.contains(file.lastPathComponent) {
+                // Still as old as when it was listed? A PUT since then refreshed it.
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                guard let modified, modified < cutoff else { continue }
+                removeSpoolFile(file)
+            }
+            return
+        }
+    }
+
+    /// Hex digests of everything the pending actions' values reach.
+    /// Nil if the pending directory exists but cannot be listed.
+    private func reachableFromPending() async -> Set<String>? {
+        var seen = Set<String>()
+        var queue: [CASDigest] = []
+        var names: [String] = []
+        if FileManager.default.fileExists(atPath: pendingDirectory.path) {
+            guard let listed = try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path) else { return nil }
+            names = listed
+        }
+        for name in names {
+            guard let key = CASDigest(hex: name) else { continue }
+            let record = shard(actionDirectory, key.hex).path
+            // A record that exists but cannot be read now: what the action reaches is unknown.
+            if FileManager.default.fileExists(atPath: record), FileManager.default.contents(atPath: record) == nil { return nil }
+            if let value = readAction(key) { queue.append(value) }
+        }
+        while let digest = queue.popLast() {
+            guard seen.insert(digest.hex).inserted else { continue }
+            if let blob = await objects.get(digest) {
+                queue.append(contentsOf: blob.refs)
+            } else {
+                let file = shard(spoolDirectory, digest.hex)
+                if FileManager.default.fileExists(atPath: file.path) {
+                    // Spooled but unreadable now: what it references is unknown, so nothing is swept.
+                    guard let data = FileManager.default.contents(atPath: file.path) else { return nil }
+                    if let blob = ObjectCache.decode(data), blob.digest == digest { queue.append(contentsOf: blob.refs) }
+                }
+            }
+        }
+        return seen
+    }
+
+    private func sweepSpoolIfDue() async {
+        if Date().timeIntervalSince(lastSweep) > 3600 { await sweepSpool() }
+    }
+}

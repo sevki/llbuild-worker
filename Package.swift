@@ -17,6 +17,7 @@ let package = Package(
     products: [
         .library(name: "CASProtocol", targets: ["CASProtocol"]),
         .executable(name: "castool", targets: ["castool"]),
+        .executable(name: "casd", targets: ["casd"]),
         // Loaded by swift-frontend via -cas-plugin-path for compilation caching.
         .library(name: "CASPlugin", type: .dynamic, targets: ["CASPlugin"]),
         .executable(name: "CASWorkerWasm", targets: ["CASWorkerWasm"]),
@@ -24,12 +25,21 @@ let package = Package(
     dependencies: [
         // WorkerKit's native WebSocket transport (PR #12) with the client
         // frame-size fix (PR #13), R2 bindings (PR #14), worker-build's `--`
-        // pass-through (PR #16) and Request.cf (PR #17), pinned at its merge
-        // commit on main.
+        // pass-through (PR #16), Request.cf (PR #17) and the HTTP POST transport
+        // (PR #19), pinned at its merge commit on main.
         .package(
             url: "https://github.com/sevki/WorkerKit.git",
-            revision: "4821611f07708cb4402922b584323dec5668a5b4"
+            revision: "ab5131a25f025ba4dba688443af24f181f53ab85"
         ),
+        // The recency index of the daemon's on-disk object cache: O(1) gets and
+        // evictions, a byte limit, and a callback when an entry is evicted (to delete
+        // its file). Pinned to a commit: a small project, so updates are reviewed.
+        .package(
+            url: "https://github.com/tornikegomareli/swift-lru-cache.git",
+            revision: "a4ce798976091ada42d1b22caf1158a185090a3b"
+        ),
+        // The daemon's loopback server (already in the graph through WorkerKit).
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
         .package(url: "https://github.com/swiftwasm/JavaScriptKit.git", from: "0.59.0"),
         .package(url: "https://github.com/pointfreeco/swift-html", from: "0.5.0"),
         // SI prefixes (symbol and power of ten) for the sizes the stats page shows.
@@ -51,7 +61,21 @@ let package = Package(
                 .product(name: "WorkerKitDistributed", package: "WorkerKit")
             ]
         ),
+        .executableTarget(name: "casd", dependencies: ["CASDaemon", "CASClient"]),
         .target(name: "CLLCAS"),
+        // A local cache in front of the Worker, for many short-lived compiler
+        // processes: see docs/daemon.md.
+        .target(
+            name: "CASDaemon",
+            dependencies: [
+                "CASProtocol", "CASClient",
+                .product(name: "SwiftLRUCache", package: "swift-lru-cache"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOWebSocket", package: "swift-nio"),
+            ]
+        ),
         // Native-only client for the CAS service; shared by castool and the plugin.
         .target(
             name: "CASClient",
@@ -92,6 +116,7 @@ let package = Package(
             "CASProtocol", "CASClient",
             .product(name: "WorkerKitDistributed", package: "WorkerKit"),
         ], swiftSettings: testSwiftSettings),
+        .testTarget(name: "CASDaemonTests", dependencies: ["CASDaemon", "CASProtocol", "CASClient"], swiftSettings: testSwiftSettings),
         .testTarget(name: "CASPluginTests", dependencies: ["CASPlugin", "CASProtocol"], swiftSettings: testSwiftSettings),
     ]
 )

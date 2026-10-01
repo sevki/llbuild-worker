@@ -60,12 +60,39 @@ public final class CASClient: @unchecked Sendable {
         return components.url ?? workerURL
     }
 
-    public init(workerURL: URL) throws {
+    /// How calls reach the Worker.
+    public enum Transport: Sendable {
+        /// One WebSocket to `/{scope}/__rpc`: the original path, which every Worker serves.
+        /// The Worker may stop answering a connection that sits idle.
+        case webSocket
+        /// One `POST /{scope}/__rpc` per call, over however many connections the HTTP
+        /// stack keeps (HTTP/2 shares one). Needs a Worker that serves the endpoint, and
+        /// has no connection that can go stale.
+        case httpPost
+    }
+
+    public init(workerURL: URL, transport: Transport = .webSocket) throws {
         let authenticatedURL = Self.authenticated(workerURL)
-        system = WorkersActorSystem(worker: authenticatedURL)
+        let presented = presentedToken(url: authenticatedURL.absoluteString, authorization: nil)
+        switch transport {
+        case .webSocket:
+            system = WorkersActorSystem(worker: authenticatedURL)
+        case .httpPost:
+            var components = URLComponents(url: authenticatedURL, resolvingAgainstBaseURL: false)!
+            let base = components.path.hasSuffix("/") ? String(components.path.dropLast()) : components.path
+            components.path = base + "/__rpc"
+            components.query = nil
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.httpMaximumConnectionsPerHost = 16
+            configuration.timeoutIntervalForRequest = 30
+            system = WorkersActorSystem(
+                httpPost: components.url!,
+                headers: presented.map { ["Authorization": "Bearer \($0)"] } ?? [:],
+                session: URLSession(configuration: configuration))
+        }
         service = try CASService.resolve(id: "cas-service", using: system)
         self.workerURL = authenticatedURL
-        token = presentedToken(url: authenticatedURL.absoluteString, authorization: nil)
+        token = presented
         session = URLSession(configuration: .ephemeral)
     }
 
@@ -143,6 +170,35 @@ public final class CASClient: @unchecked Sendable {
             throw CASClientError("action \(key.hex) has invalid value \(value)")
         }
         return parsed
+    }
+
+    /// `actionGet` for many keys in one round trip; answers are in the keys' order.
+    public func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
+        let replies = try await service.actionGetMany(keys: keys.map(\.hex))
+        guard replies.count == keys.count else {
+            throw CASClientError("asked for \(keys.count) actions, got \(replies.count) answers")
+        }
+        return try zip(keys, replies).map { key, reply in
+            guard let reply else { return nil }
+            guard let parsed = CASDigest(hex: reply) else {
+                throw CASClientError("action \(key.hex) has invalid value \(reply)")
+            }
+            return parsed
+        }
+    }
+
+    /// The trace recorded under `key` (see `CASService.traceGet`), or nil.
+    public func traceGet(_ key: CASDigest) async throws -> [CASDigest]? {
+        guard let names = try await service.traceGet(key: key.hex) else { return nil }
+        return try names.map { name in
+            guard let parsed = CASDigest(hex: name) else { throw CASClientError("trace \(key.hex) has invalid key \(name)") }
+            return parsed
+        }
+    }
+
+    /// Records `keys` as the trace of a build that began with `key`.
+    public func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws {
+        try await service.tracePut(key: key.hex, keys: keys.map(\.hex))
     }
 
     public func actionPut(_ key: CASDigest, value: CASDigest) async throws {
