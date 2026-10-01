@@ -128,7 +128,10 @@ stopcasd
 
 # B (Linux): no systemd user session, so no daemon; falls back to the Worker and says why.
 if [ "$os" = linux ]; then
-    run B
+    # A runner may have a real systemd user session; a stub that reports none makes B the same everywhere.
+    mkdir -p "$work/nosession"
+    printf '#!/bin/sh\nexit 1\n' > "$work/nosession/systemctl"; chmod +x "$work/nosession/systemctl"
+    run B "PATH=$work/nosession:$PATH"
     check "B: exit 0" "[ \$(cat $work/rc-B) = 0 ]"
     check "B: the plugin is pointed at the Worker" "[ \"\$(cfg B)\" = https://cache.example/default ]"
     check "B: says it is not in use, and why" "grep -q 'NOT in use (there is no systemd user session' $work/out-B.txt"
