@@ -183,9 +183,25 @@ run F "$(withsvc)"
 check "F: exit 0" "[ \$(cat $work/rc-F) = 0 ]"
 check "F: the plugin is pointed at the Worker" "[ \"\$(cfg F)\" = https://cache.example/default ]"
 check "F: says it did not answer" "grep -q 'did not answer on 127.0.0.1:$port' $work/out-F.txt"
+if [ "$os" = linux ]; then
+    check "F: the failed service's unit is removed" "[ ! -e $work/home-F/.config/systemd/user/casd.service ]"
+else
+    check "F: the failed service's agent is removed" "[ ! -e $work/home-F/Library/LaunchAgents/llbuild.casd.plist ]"
+fi
+
+# I: a step of the install fails (the directory for the binary cannot be made): falls back,
+# starts nothing, and says so.
+mkdir -p "$work/home-I" && : > "$work/home-I/.local"
+tar -C "$work/stage" -czf "$work/rel/casd-$platform.tar.gz" casd
+sums CASPlugin-$platform.tar.gz casd-$platform.tar.gz
+run I "$(withsvc)"
+check "I: exit 0" "[ \$(cat $work/rc-I) = 0 ]"
+check "I: the plugin is pointed at the Worker" "[ \"\$(cfg I)\" = https://cache.example/default ]"
+check "I: says it could not install the binary" "grep -q 'could not install' $work/out-I.txt"
+check "I: no service was left behind" "[ ! -e $work/home-I/.config/systemd/user/casd.service ] && [ ! -e $work/home-I/Library/LaunchAgents/llbuild.casd.plist ]"
 
 if [ "$fail" = 0 ]; then echo "ALL OK"; else
     echo "SOME FAILED"
-    for n in A B C D E F G H1 H2; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; tail -15 "$work/out-$n.txt"; }; done
+    for n in A B C D E F G H1 H2 I; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; tail -15 "$work/out-$n.txt"; }; done
 fi
 exit $fail

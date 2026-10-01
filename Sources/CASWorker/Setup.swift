@@ -100,8 +100,8 @@ start_casd_service() {
         Darwin)
             agents="$HOME/Library/LaunchAgents"
             plist="$agents/llbuild.casd.plist"
-            mkdir -p "$agents" "$HOME/Library/Logs"
-            cat > "$plist" <<PLIST
+            mkdir -p "$agents" "$HOME/Library/Logs" || { daemon_note="could not create $agents"; return 1; }
+            cat > "$plist" <<PLIST || { daemon_note="could not write $plist"; return 1; }
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -145,8 +145,8 @@ PLIST
                 return 1
             fi
             unit_dir="$HOME/.config/systemd/user"
-            mkdir -p "$unit_dir"
-            cat > "$unit_dir/casd.service" <<UNIT
+            mkdir -p "$unit_dir" || { daemon_note="could not create $unit_dir"; return 1; }
+            cat > "$unit_dir/casd.service" <<UNIT || { daemon_note="could not write $unit_dir/casd.service"; return 1; }
 [Unit]
 Description=llbuild cache daemon (casd)
 After=network-online.target
@@ -183,20 +183,46 @@ stop_casd_service() {
     esac
 }
 
+# Takes the service out altogether (stopped, not enabled, its file gone), for a daemon that was
+# started and did not come up: left in place, the service manager would keep relaunching it.
+remove_casd_service() {
+    stop_casd_service
+    case "$(uname -s)" in
+        Darwin)
+            rm -f "$HOME/Library/LaunchAgents/llbuild.casd.plist"
+            ;;
+        *)
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user disable casd.service >/dev/null 2>&1 || true
+            fi
+            rm -f "$HOME/.config/systemd/user/casd.service"
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user daemon-reload >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+}
+
 # True once something answers HTTP on the daemon's port.
 casd_up() {
     code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$CASD_PORT/" 2>/dev/null) || code=000
     [ "$code" != 000 ]
 }
 
-install_casd() {
+# Every step is checked by hand: this runs as the condition of an `if`, where `set -e` is off.
+do_install_casd() {
     casd_archive="casd-$platform.tar.gz"
     echo "Downloading $casd_archive..."
     if ! fetch "$casd_archive"; then
         daemon_note="the release has no usable $casd_archive"
         return 1
     fi
-    tar -xzf "$tmp/$casd_archive" -C "$tmp"
+    if ! tar -xzf "$tmp/$casd_archive" -C "$tmp" || [ ! -f "$tmp/casd" ]; then
+        daemon_note="$casd_archive could not be unpacked"
+        return 1
+    fi
+    # From here on a failure leaves things changed, so install_casd takes the service out again.
+    casd_touched=1
     # With our own daemon stopped, the port must be free: if it still answers, another program
     # owns it, and whatever answers after the daemon is started could not be taken for ours.
     stop_casd_service
@@ -205,9 +231,10 @@ install_casd() {
         daemon_note="port $CASD_PORT is already in use by another program (set LLBUILD_CASD_PORT to use a different one)"
         return 1
     fi
-    mkdir -p "$(dirname "$CASD_BIN")"
-    mv -f "$tmp/casd" "$CASD_BIN"
-    chmod 755 "$CASD_BIN"
+    if ! mkdir -p "$(dirname "$CASD_BIN")" || ! mv -f "$tmp/casd" "$CASD_BIN" || ! chmod 755 "$CASD_BIN"; then
+        daemon_note="could not install $CASD_BIN"
+        return 1
+    fi
     start_casd_service || return 1
     tries=0
     while [ "$tries" -lt 10 ]; do
@@ -218,6 +245,17 @@ install_casd() {
         sleep 1
     done
     daemon_note="it did not answer on 127.0.0.1:$CASD_PORT"
+    return 1
+}
+
+casd_touched=""
+install_casd() {
+    if do_install_casd; then
+        return 0
+    fi
+    if [ -n "$casd_touched" ]; then
+        remove_casd_service
+    fi
     return 1
 }
 
