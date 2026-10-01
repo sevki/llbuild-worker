@@ -1,0 +1,63 @@
+name: casd static build
+
+# The Linux release build of casd is fully static (musl, Static Linux SDK; see release.yml). A
+# release only builds on a tag, so this checks that it still links statically and runs. The
+# build takes about 11 minutes, so it is a workflow of its own: it runs in parallel with CI
+# rather than inside it, and only when casd, what it is built from, or this check changes.
+on:
+  pull_request:
+    paths:
+      - "Sources/casd/**"
+      - "Sources/CASDaemon/**"
+      - "Sources/CASClient/**"
+      - "Sources/CASProtocol/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/casd-static.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Sources/casd/**"
+      - "Sources/CASDaemon/**"
+      - "Sources/CASClient/**"
+      - "Sources/CASProtocol/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/casd-static.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  casd-static:
+    name: casd is fully static
+    runs-on: ubuntu-24.04
+    container: swift:6.4-noble
+    env:
+      STATIC_SDK_URL: https://download.swift.org/swift-6.4.0-release/static-sdk/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz
+      STATIC_SDK_CHECKSUM: 47d2fd89eebfdf9eb4d536b6710414297f755c17926cdebc4742c08982b40a9e
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build casd (static)
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends curl ca-certificates
+          swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
+          swift build -c release --product casd --swift-sdk x86_64-swift-linux-musl --build-system native
+
+      - name: It is static, and it runs
+        run: |
+          bin=$(swift build -c release --swift-sdk x86_64-swift-linux-musl --build-system native --show-bin-path)
+          if ldd "$bin/casd" 2>&1 | grep -qv 'not a dynamic executable'; then
+              echo "::error::casd is dynamically linked"
+              exit 1
+          fi
+          "$bin/casd" --upstream https://example.invalid --listen 127.0.0.1:4777 &
+          pid=$!
+          sleep 3
+          code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:4777/ || true)
+          kill "$pid" 2>/dev/null || true
+          [ "$code" = 404 ] || { echo "::error::casd did not answer HTTP (got $code)"; exit 1; }
