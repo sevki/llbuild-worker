@@ -35,7 +35,7 @@ stopcasd() {
         for p in $(cat "$work/casd.pids"); do kill "$p" 2>/dev/null || true; done
         : > "$work/casd.pids"
     fi
-    pkill -f "http.server $port" 2>/dev/null || true
+    pkill -f "listen.py 127.0.0.1 $port" 2>/dev/null || true
     if [ "$os" = mac ]; then
         for h in "$work"/home-*; do
             [ -d "$h" ] || continue
@@ -63,12 +63,30 @@ check "installer rendered" "[ -s $work/setup.sh ] && head -1 $work/setup.sh | gr
 check "installer is valid sh" "sh -n $work/setup.sh"
 check "https flags dropped only in the test copy" "! grep -q -- \"--proto\" $work/setup.sh && grep -q -- \"--proto '=https'\" $root/Sources/CASWorker/Setup.swift"
 
+# A tiny HTTP listener (always answers 404). Not http.server: its server_bind does a reverse-DNS
+# lookup (getfqdn) between bind and listen, which hangs for a process run by launchd on a macOS
+# runner, leaving the port bound and not accepting connections.
+cat > "$work/listen.py" <<'PY'
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.listen(16)
+while True:
+    c, _ = s.accept()
+    try:
+        c.recv(4096)
+        c.sendall(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    finally:
+        c.close()
+PY
+
 # A stand-in casd: takes the real flags and serves HTTP on --listen.
 cat > "$work/fakecasd" <<EOF
 #!/bin/sh
 while [ \$# -gt 0 ]; do case "\$1" in --listen) addr="\$2"; shift 2;; *) shift;; esac; done
 echo "fakecasd: listening on \$addr with $py" >&2
-exec "$py" -m http.server "\${addr##*:}" --bind "\${addr%:*}"
+exec "$py" "$work/listen.py" "\${addr%:*}" "\${addr##*:}"
 EOF
 chmod +x "$work/fakecasd"
 mkdir -p "$work/stage"
@@ -163,7 +181,7 @@ check "E: no casd, plugin pointed at the Worker" "[ ! -e $work/home-E/.local/bin
 check "E: says it was skipped" "grep -q 'skipped (LLBUILD_CAS_NO_DAEMON is set)' $work/out-E.txt"
 
 # G: another program already owns the port: it must not be mistaken for the daemon.
-"$py" -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 & other=$!
+"$py" "$work/listen.py" 127.0.0.1 "$port" >/dev/null 2>&1 & other=$!
 pids="$pids $other"
 sleep 1
 run G "$(withsvc)"
