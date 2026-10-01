@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for casd, the local cache daemon (docs/daemon.md).
+
+    install -m 755 casd /usr/local/bin/casd
+    cp service/llbuild.casd.plist ~/Library/LaunchAgents/
+    edit the upstream URL below to your Worker, put the access token in
+    ~/.config/llbuild-cas-remote-token (mode 600; casd reads it itself)
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/llbuild.casd.plist
+
+  Then point the plugin at http://127.0.0.1:4170/<scope> instead of the Worker.
+  Stop it with: launchctl bootout gui/$(id -u)/llbuild.casd
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>llbuild.casd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/casd</string>
+        <string>--upstream</string>
+        <string>https://your-worker.example.workers.dev</string>
+        <string>--max-gb</string>
+        <string>4</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- casd waits up to 30 s for queued uploads when it is told to stop. -->
+    <key>ExitTimeOut</key>
+    <integer>45</integer>
+    <key>StandardErrorPath</key>
+    <string>/tmp/llbuild-casd.log</string>
+</dict>
+</plist>

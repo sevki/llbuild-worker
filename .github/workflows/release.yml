@@ -32,15 +32,24 @@ jobs:
         # The native backend honors the wasi-only dependency conditions; see ci.yml.
         run: swift build -c release --build-system native --product CASPlugin $SWIFT_CACHE_FLAGS
 
+      - name: Build casd
+        run: swift build -c release --build-system native --product casd $SWIFT_CACHE_FLAGS
+
       - name: Package
         run: |
           bin=$(swift build -c release --build-system native --show-bin-path)
           tar -C "$bin" -czf CASPlugin-macos-arm64.tar.gz libCASPlugin.dylib
+          tar -C "$bin" -czf casd-macos-arm64.tar.gz casd
 
       - uses: actions/upload-artifact@v4
         with:
           name: CASPlugin-macos-arm64
           path: CASPlugin-macos-arm64.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: casd-macos-arm64
+          path: casd-macos-arm64.tar.gz
 
   build-linux:
     name: Build CASPlugin (Linux x86_64)
@@ -64,15 +73,24 @@ jobs:
       - name: Build CASPlugin
         run: swift build -c release --product CASPlugin ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
+      - name: Build casd
+        run: swift build -c release --product casd ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
+
       - name: Package
         run: |
           bin=$(swift build -c release ${SWIFT_CACHE_FLAGS:+--build-system native} --show-bin-path)
           tar -C "$bin" -czf CASPlugin-linux-x86_64.tar.gz libCASPlugin.so
+          tar -C "$bin" -czf casd-linux-x86_64.tar.gz casd
 
       - uses: actions/upload-artifact@v4
         with:
           name: CASPlugin-linux-x86_64
           path: CASPlugin-linux-x86_64.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: casd-linux-x86_64
+          path: casd-linux-x86_64.tar.gz
 
   publish:
     name: Publish GitHub Release
@@ -84,8 +102,13 @@ jobs:
           pattern: CASPlugin-*
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: casd-*
+          merge-multiple: true
+
       - name: Checksums
-        run: sha256sum CASPlugin-*.tar.gz > SHA256SUMS
+        run: sha256sum CASPlugin-*.tar.gz casd-*.tar.gz > SHA256SUMS
 
       - name: Create or update release
         env:
@@ -93,7 +116,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber CASPlugin-*.tar.gz SHA256SUMS
+            gh release upload "$GITHUB_REF_NAME" --clobber CASPlugin-*.tar.gz casd-*.tar.gz SHA256SUMS
           else
-            gh release create "$GITHUB_REF_NAME" --generate-notes CASPlugin-*.tar.gz SHA256SUMS
+            gh release create "$GITHUB_REF_NAME" --generate-notes CASPlugin-*.tar.gz casd-*.tar.gz SHA256SUMS
           fi
