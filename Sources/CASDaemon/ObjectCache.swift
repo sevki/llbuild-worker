@@ -55,6 +55,11 @@ public actor ObjectCache {
         for entry in found.sorted(by: { $0.modified < $1.modified }) {
             await cache.index.set(entry.name, value: entry.size)
         }
+        // A smaller cap evicts as it indexes; files that could not be removed still occupy disk.
+        let stuck = cache.leftovers.retry()
+        if stuck > 0, await Int64(cache.index.calculatedSize) + stuck > maxBytes {
+            throw CASDaemonError("the object cache at \(directory.path) is over its limit and files cannot be removed")
+        }
         return cache
     }
 

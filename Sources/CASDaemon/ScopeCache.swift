@@ -40,6 +40,8 @@ public actor ScopeCache {
     /// Actions acknowledged and not yet sent: the markers in `pending`, counted when the scope
     /// opens and kept in step.
     private var pendingActions = 0
+    /// Set when the pending queue could not be counted: new actions are refused until it can be.
+    private var pendingUncounted = false
     /// Bytes in the spool, kept in step with its files and counted afresh when the scope opens.
     private var spoolBytes: Int64 = 0
     /// Set when the spool could not be counted in full: writes are refused until a recount succeeds.
@@ -120,7 +122,7 @@ public actor ScopeCache {
     public func resumePending() async {
         startRetrying()
         recountSpool()
-        pendingActions = ((try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []).count
+        countPending()
         await sweepSpool()
         countActions()
         let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
@@ -549,7 +551,7 @@ public actor ScopeCache {
             atPath: pendingDirectory.appendingPathComponent(key.hex).path)
         // Pending actions are exempt from the action cap (they must not be lost), so they
         // need a cap of their own: a Worker that stays away does not get an unbounded queue.
-        if !alreadyPending, pendingActions >= maxPendingActions { throw PendingFull() }
+        if !alreadyPending, pendingUncounted || pendingActions >= maxPendingActions { throw PendingFull() }
         try writePending(key)
         if !alreadyPending { pendingActions += 1 }
         do {
@@ -654,7 +656,17 @@ public actor ScopeCache {
         }
     }
 
+    private func countPending() {
+        if let listed = try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path) {
+            pendingActions = listed.count
+            pendingUncounted = false
+        } else {
+            pendingUncounted = true
+        }
+    }
+
     private func requeuePending() {
+        if pendingUncounted { countPending() }
         for name in (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? [] {
             guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
                   let value = actions[key] ?? readAction(key) else { continue }
@@ -887,7 +899,11 @@ public actor ScopeCache {
             names = listed
         }
         for name in names {
-            if let key = CASDigest(hex: name), let value = readAction(key) { queue.append(value) }
+            guard let key = CASDigest(hex: name) else { continue }
+            let record = shard(actionDirectory, key.hex).path
+            // A record that exists but cannot be read now: what the action reaches is unknown.
+            if FileManager.default.fileExists(atPath: record), FileManager.default.contents(atPath: record) == nil { return nil }
+            if let value = readAction(key) { queue.append(value) }
         }
         while let digest = queue.popLast() {
             guard seen.insert(digest.hex).inserted else { continue }

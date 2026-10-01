@@ -88,8 +88,12 @@ public actor ClientUpstream: CASUpstream {
 
     private func current() async throws -> CASClient {
         if let client {
-            if transport == .automatic, !usesPost, !upgrading, let at = postRetryAt, Date() >= at { await tryUpgradeToPost() }
-            return self.client ?? client
+            // Looked for in the background: this call goes on with the client it has.
+            if transport == .automatic, !usesPost, !upgrading, let at = postRetryAt, Date() >= at {
+                upgrading = true
+                Task { [self] in await tryUpgradeToPost() }
+            }
+            return client
         }
         // One connection attempt at a time: calls that arrive together wait for it, rather
         // than each opening (and probing) a client of its own.
@@ -149,7 +153,6 @@ public actor ClientUpstream: CASUpstream {
     /// While on the WebSocket by fallback, asks again whether the Worker serves POST, and moves
     /// over if it does. At most one probe at a time, and not more often than the retry delay.
     private func tryUpgradeToPost() async {
-        upgrading = true
         defer { upgrading = false }
         postRetryAt = Date().addingTimeInterval(Double(postRetryDelay.components.seconds)
             + Double(postRetryDelay.components.attoseconds) / 1e18)

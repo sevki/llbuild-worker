@@ -1165,8 +1165,13 @@ final class DaemonTests: XCTestCase {
         let late = CASDaemon(.init(port: freePort, directory: directory.appendingPathComponent("late"), maxBytes: 64 << 20) { _ in fake })
         _ = try await late.start()
         try await Task.sleep(for: .milliseconds(500))
+        // The call that finds the retry time passed goes on with its own client and starts the probe.
         _ = try await client.actionGet(blob("x").digest)
-        let second = await client.usesPost
+        var second = false
+        for _ in 0..<40 where !second {
+            try await Task.sleep(for: .milliseconds(100))
+            second = await client.usesPost
+        }
         XCTAssertTrue(second, "the probe was repeated and POST is now used")
         await late.stop()
     }
