@@ -12,9 +12,11 @@ permissions:
 # next starts. GitHub keeps one pending run per group and cancels an older pending one when
 # a newer queues; as runs are created in push order, the one kept is the newest push, and
 # no run can deploy while another is deploying (which is what makes the tip check in the deploy
-# job sound). A pull request's run gets a group of its own and is not held up.
+# job sound). A pull request's run, and a re-run (attempt 2 and up, which keeps the original
+# push event and would otherwise queue behind newer pushes and evict the newest one), get a
+# group of their own: a re-run is not held up, and the tip check keeps an old one from deploying.
 concurrency:
-  group: ${{ github.event_name == 'push' && 'ci-main' || format('ci-run-{0}', github.run_id) }}
+  group: ${{ github.event_name == 'push' && github.run_attempt == 1 && 'ci-main' || format('ci-run-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: false
 
 jobs:
@@ -201,6 +203,8 @@ jobs:
           path: build/worker
           if-no-files-found: error
           retention-days: 7
+          # A re-run of the workflow (to retry a deploy) uploads the same name again.
+          overwrite: true
 
       - name: Collect crash reproducers
         if: failure()
