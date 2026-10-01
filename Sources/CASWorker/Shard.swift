@@ -176,9 +176,11 @@ distributed actor CASShard {
         let db = try database()
         try db.exec(
             "INSERT INTO traces (key, keys, updated) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET keys = excluded.keys, updated = excluded.updated",
-            key, keys.joined(separator: ","), Int(Date().timeIntervalSince1970))
+            key, keys.joined(separator: ","), Int(Date().timeIntervalSince1970 * 1000))
+        // Milliseconds, with the row id as a tie-break, so writes in one instant still have an
+        // order. (Rows written earlier in seconds are smaller, so they are older here as well.)
         try db.exec(
-            "DELETE FROM traces WHERE key NOT IN (SELECT key FROM traces ORDER BY updated DESC LIMIT ?)", Self.tracesKept)
+            "DELETE FROM traces WHERE key NOT IN (SELECT key FROM traces ORDER BY updated DESC, rowid DESC LIMIT ?)", Self.tracesKept)
     }
 
     distributed func getTrace(key: String) throws -> [String]? {

@@ -125,25 +125,7 @@ public actor ScopeCache {
         countPending()
         await sweepSpool()
         countActions()
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
-        for name in names {
-            if let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
-               FileManager.default.fileExists(atPath: shard(actionDirectory, key.hex).path),
-               FileManager.default.contents(atPath: shard(actionDirectory, key.hex).path) == nil {
-                // The record is there but cannot be read now (a transient error): the marker stays,
-                // and the periodic retry looks again.
-                continue
-            }
-            guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
-                  let value = readAction(key) else {
-                // Not a pending action after all: it goes, and no longer counts as one.
-                if (try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(name))) != nil {
-                    pendingActions = max(0, pendingActions - 1)
-                }
-                continue
-            }
-            forward(key: key, value: value)
-        }
+        requeuePending()
     }
 
     // MARK: Retiring
@@ -673,11 +655,24 @@ public actor ScopeCache {
         }
     }
 
+    /// Sends what is pending, at start and then on every retry tick. A marker with no usable
+    /// record (it was not a pending action after all: a crash between the marker and the record)
+    /// goes, and no longer counts; one whose record exists but cannot be read now stays.
     private func requeuePending() {
         if pendingUncounted { countPending() }
         for name in (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? [] {
+            if let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
+               FileManager.default.fileExists(atPath: shard(actionDirectory, key.hex).path),
+               FileManager.default.contents(atPath: shard(actionDirectory, key.hex).path) == nil {
+                continue
+            }
             guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
-                  let value = actions[key] ?? readAction(key) else { continue }
+                  let value = actions[key] ?? readAction(key) else {
+                if (try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(name))) != nil {
+                    pendingActions = max(0, pendingActions - 1)
+                }
+                continue
+            }
             forward(key: key, value: value)
         }
     }
@@ -939,7 +934,16 @@ public actor ScopeCache {
         }
         while let digest = queue.popLast() {
             guard seen.insert(digest.hex).inserted else { continue }
-            if let blob = await objects.get(digest) ?? readSpool(digest) { queue.append(contentsOf: blob.refs) }
+            if let blob = await objects.get(digest) {
+                queue.append(contentsOf: blob.refs)
+            } else {
+                let file = shard(spoolDirectory, digest.hex)
+                if FileManager.default.fileExists(atPath: file.path) {
+                    // Spooled but unreadable now: what it references is unknown, so nothing is swept.
+                    guard let data = FileManager.default.contents(atPath: file.path) else { return nil }
+                    if let blob = ObjectCache.decode(data), blob.digest == digest { queue.append(contentsOf: blob.refs) }
+                }
+            }
         }
         return seen
     }
