@@ -220,13 +220,14 @@ public actor ScopeCache {
             // and finished while it was being made. Look once more, here, before going
             // upstream.
             if let local = await objects.get(digest) { return local }
+            await fetchSlots.acquire()
+            // Counted once a slot is held: waiting fetches are not "at once".
             objectFetchesNow += 1
             maxObjectFetchesAtOnce = max(maxObjectFetchesAtOnce, objectFetchesNow)
-            await fetchSlots.acquire()
             let started = ContinuousClock.now
             let blob = try? await upstream.get(digest)
-            await fetchSlots.release()
             objectFetchesNow -= 1
+            await fetchSlots.release()
             objectFetches += 1
             objectFetchTime += ContinuousClock.now - started
             objectBytes += blob?.data.count ?? 0
@@ -542,6 +543,13 @@ public actor ScopeCache {
         // repeat of it is fine, a different one is refused.
         if let existing = actions[key] ?? readAction(key), existing != value {
             throw CASServiceError.invalidDigest(key.hex)
+        }
+        // A record that exists but cannot be read now might hold another value: it is not
+        // overwritten blind.
+        let recordPath = shard(actionDirectory, key.hex).path
+        if actions[key] == nil, FileManager.default.fileExists(atPath: recordPath),
+           FileManager.default.contents(atPath: recordPath) == nil {
+            throw CASDaemonError("the action record for \(key.hex) cannot be read")
         }
         // The pending marker first: pruning old records (inside `writeAction`) spares
         // what is pending, and this record must be spared too.

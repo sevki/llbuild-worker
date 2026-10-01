@@ -191,6 +191,11 @@ public actor ObjectCache {
         if stuckNow > 0, await Int64(index.calculatedSize) + stuckNow > maxBytes {
             _ = await index.delete(name)
             verified.remove(name)
+            // The rollback can fail as well; the files it leaves are counted, and the store is
+            // reported as failed rather than complete over the bound.
+            if leftovers.retry() > 0, await Int64(index.calculatedSize) + leftovers.retry() > maxBytes {
+                throw CASDaemonError("the object cache is over its limit and files cannot be removed")
+            }
             return digest
         }
         markVerified(name)
