@@ -1021,6 +1021,39 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testInvalidPendingMarkersDoNotCountAgainstTheQueue() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        // Junk in a scope's pending folder from some earlier run, before the scope is opened.
+        let pending = directory.appendingPathComponent("s/pending")
+        try FileManager.default.createDirectory(at: pending, withIntermediateDirectories: true)
+        for index in 0..<5 { try Data().write(to: pending.appendingPathComponent("not-a-digest-\(index)")) }
+        daemon = CASDaemon(.init(
+            directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600), maxPendingActions: 3) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+        let object = blob("after junk")
+        try await client.put(object)
+        try await client.actionPut(blob("first real action").digest, value: object.digest)
+        await client.close()
+    }
+
+    func testTheInMemoryActionMapIsBoundedOnEveryPath() async throws {
+        let cache = try await ScopeCache(
+            directory: directory.appendingPathComponent("bounded"), maxBytes: 1 << 20, upstream: upstream,
+            maxActionsInMemory: 5)
+        let value = blob("v")
+        try await cache.put(value)
+        for index in 0..<20 { try await cache.actionPut(blob("written \(index)").digest, value: value.digest) }
+        var held = await cache.actionsInMemory
+        XCTAssertLessThanOrEqual(held, 5, "writes")
+        // Read back from disk: each read goes into memory, and must respect the bound too.
+        for index in 0..<20 { _ = await cache.actionGet(blob("written \(index)").digest) }
+        held = await cache.actionsInMemory
+        XCTAssertLessThanOrEqual(held, 5, "reads")
+        await cache.drain()
+    }
+
     func testTheSpoolIsBoundedAndRefusesWritesWhenFull() async throws {
         await daemon.stop()
         let fake = upstream!

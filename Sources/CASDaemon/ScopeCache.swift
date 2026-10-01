@@ -80,11 +80,13 @@ public actor ScopeCache {
     private var uploadedActions = 0
     private var lookupTime = Duration.zero
 
-    static let maxActionsInMemory = 500_000
+    private let maxActionsInMemory: Int
+    /// How many actions are held in memory, for tests.
+    var actionsInMemory: Int { actions.count }
 
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
-        maxSpoolBytes: Int64? = nil, maxPendingActions: Int = 100_000, maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
+        maxSpoolBytes: Int64? = nil, maxPendingActions: Int = 100_000, maxActionsInMemory: Int = 500_000, maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
         sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20), maxObjectFetches: Int = 32,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
@@ -97,6 +99,7 @@ public actor ScopeCache {
         self.spoolDirectory = directory.appendingPathComponent("spool")
         self.maxSpoolBytes = maxSpoolBytes ?? max(maxBytes, 64 << 20)
         self.maxPendingActions = maxPendingActions
+        self.maxActionsInMemory = maxActionsInMemory
         self.maxActionFiles = maxActions
         self.negativeTTL = negativeTTL
         self.retryInterval = retryInterval
@@ -121,7 +124,10 @@ public actor ScopeCache {
         for name in names {
             guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
                   let value = readAction(key) else {
-                try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(name))
+                // Not a pending action after all: it goes, and no longer counts as one.
+                if (try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(name))) != nil {
+                    pendingActions = max(0, pendingActions - 1)
+                }
                 continue
             }
             forward(key: key, value: value)
@@ -263,7 +269,7 @@ public actor ScopeCache {
     public func actionGet(_ key: CASDigest) async -> CASDigest? {
         noteLookup(key)
         if let value = actions[key] ?? readAction(key) {
-            actions[key] = value
+            holdInMemory(key, value)
             return value
         }
         if let since = misses[key], ContinuousClock.now - since < negativeTTL { return nil }
@@ -532,7 +538,7 @@ public actor ScopeCache {
             if !alreadyPending { clearPending(key) }
             throw error
         }
-        actions[key] = value
+        holdInMemory(key, value)
         misses[key] = nil
         pendingGeneration += 1
         forward(key: key, value: value)
@@ -573,9 +579,14 @@ public actor ScopeCache {
         misses[key] = .now
     }
 
-    private func remember(key: CASDigest, value: CASDigest) {
-        if actions.count >= Self.maxActionsInMemory { actions.removeAll(keepingCapacity: true) }
+    /// The one way an action enters the in-memory map, so the bound holds on every path.
+    private func holdInMemory(_ key: CASDigest, _ value: CASDigest) {
+        if actions.count >= maxActionsInMemory, actions[key] == nil { actions.removeAll(keepingCapacity: true) }
         actions[key] = value
+    }
+
+    private func remember(key: CASDigest, value: CASDigest) {
+        holdInMemory(key, value)
         try? writeAction(key, value)
     }
 
@@ -718,7 +729,8 @@ public actor ScopeCache {
         var remaining = excess.count
         excess.removeAll { FileManager.default.fileExists(atPath: pendingDirectory.appendingPathComponent($0.url.lastPathComponent).path) }
         for entry in excess where remaining > target {
-            try? FileManager.default.removeItem(at: entry.url)
+            // Counted, and dropped from memory, only if the file is really gone.
+            guard (try? FileManager.default.removeItem(at: entry.url)) != nil else { continue }
             if let key = CASDigest(hex: entry.url.lastPathComponent) { actions[key] = nil }
             remaining -= 1
         }
