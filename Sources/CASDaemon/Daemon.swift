@@ -84,7 +84,10 @@ public final class CASDaemon: @unchecked Sendable {
         self.log = log
     }
 
-    static let scopePattern = try! NSRegularExpression(pattern: "^[A-Za-z0-9._-]{1,64}$")
+    /// The scope names the Worker accepts (`isValidScope` in Worker.swift): ASCII letters and
+    /// digits, `-` and `_`, up to 63 of them. A scope the Worker would not route could be
+    /// cached here but never reach it.
+    static let scopePattern = try! NSRegularExpression(pattern: "^[A-Za-z0-9_-]{1,63}$")
 
     /// `/{scope}/rest…`, or `/rest…` for the default scope. Nil for a scope name
     /// that is not a plain file name: it becomes a directory.
@@ -94,7 +97,7 @@ public final class CASDaemon: @unchecked Sendable {
         guard let first = parts.first else { return nil }
         if first == "__rpc" || first == "objects" { return ("default", parts) }
         let range = NSRange(first.startIndex..., in: first)
-        guard scopePattern.firstMatch(in: first, range: range) != nil, first != ".", first != ".." else { return nil }
+        guard scopePattern.firstMatch(in: first, range: range) != nil else { return nil }
         return (first, Array(parts.dropFirst()))
     }
 

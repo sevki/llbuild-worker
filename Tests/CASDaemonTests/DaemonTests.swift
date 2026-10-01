@@ -838,6 +838,25 @@ final class DaemonTests: XCTestCase {
         await keep.close()
     }
 
+    func testScopeNamesAreTheWorkersRules() async throws {
+        let digest = String(repeating: "a", count: 64)
+        func code(_ scope: String) async throws -> Int {
+            let url = URL(string: "http://127.0.0.1:\(port)/\(scope)/objects/\(digest)")!
+            let (_, response) = try await URLSession.shared.data(from: url)
+            return (response as? HTTPURLResponse)?.statusCode ?? 0
+        }
+        let accepted = try await code(String(repeating: "a", count: 63))
+        XCTAssertEqual(accepted, 404, "63 characters is a scope (the object is just not there)")
+        for refused in [String(repeating: "a", count: 64), "has.dot", "caf%C3%A9"] {
+            let status = try await code(refused)
+            XCTAssertEqual(status, 404, refused)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(refused).path), refused)
+        }
+        // A refused scope never opened: only the valid one made a directory.
+        let made = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []).count
+        XCTAssertEqual(made, 1)
+    }
+
     func testARequestThePathDoesNotServeOpensNoScope() async throws {
         for path in ["/ghost/bogus", "/ghost/objects/not-a-digest", "/ghost"] {
             let (_, response) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)\(path)")!)
