@@ -478,11 +478,15 @@ public actor ScopeCache {
         }
         // The pending marker first: pruning old records (inside `writeAction`) spares
         // what is pending, and this record must be spared too.
+        // A marker an earlier call left stays whatever happens here: it is the only
+        // durable sign that an acknowledged action still has to be sent.
+        let alreadyPending = FileManager.default.fileExists(
+            atPath: pendingDirectory.appendingPathComponent(key.hex).path)
         try writePending(key)
         do {
             try writeAction(key, value)
         } catch {
-            clearPending(key)
+            if !alreadyPending { clearPending(key) }
             throw error
         }
         actions[key] = value

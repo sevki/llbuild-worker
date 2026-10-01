@@ -235,13 +235,25 @@ public actor ClientUpstream: CASUpstream {
     }
 }
 
-/// Reports the first of two outcomes, once.
+/// Reports the first of two outcomes, once, and retires the timer when it has.
 private final class FirstResult<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<T, Error>?
+    private var timer: Task<Void, Never>?
 
     init(_ continuation: CheckedContinuation<T, Error>) {
         self.continuation = continuation
+    }
+
+    /// The timer that will report a timeout. Cancelled as soon as anything has been
+    /// reported, so a call that finishes does not leave one sleeping for the rest of its
+    /// timeout.
+    func attach(timer: Task<Void, Never>) {
+        lock.lock()
+        let reported = continuation == nil
+        if !reported { self.timer = timer }
+        lock.unlock()
+        if reported { timer.cancel() }
     }
 
     /// True if this result was the one reported.
@@ -250,7 +262,10 @@ private final class FirstResult<T: Sendable>: @unchecked Sendable {
         lock.lock()
         let taken = continuation
         continuation = nil
+        let timer = self.timer
+        self.timer = nil
         lock.unlock()
+        timer?.cancel()
         guard let taken else { return false }
         taken.resume(with: result)
         return true
@@ -274,12 +289,13 @@ func withDeadline<T: Sendable>(
                 first.report(.failure(error))
             }
         }
-        Task {
+        first.attach(timer: Task {
             try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
             if first.report(.failure(UpstreamTimeout())) {
                 work.cancel()
                 await onTimeout()
             }
-        }
+        })
     }
 }
