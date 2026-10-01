@@ -277,6 +277,9 @@ public actor ScopeCache {
         noteLookup(key)
         if let value = actions[key] ?? readAction(key) {
             holdInMemory(key, value)
+            // The action may have outlived its object (cache pressure, a smaller limit after a
+            // restart): then the value and what it references are fetched ahead of the compiler.
+            if !(await objects.contains(value)) { prefetch([value]) }
             return value
         }
         if let since = misses[key], ContinuousClock.now - since < negativeTTL { return nil }
@@ -790,14 +793,21 @@ public actor ScopeCache {
     }
 
     private func recountSpool() {
+        guard FileManager.default.fileExists(atPath: spoolDirectory.path) else { spoolBytes = 0; return }
         var total: Int64 = 0
-        let files = FileManager.default.enumerator(
-            at: spoolDirectory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])
-        while let file = files?.nextObject() as? URL {
-            let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-            if values?.isRegularFile == true { total += Int64(values?.fileSize ?? 0) }
+        // A spool that cannot be counted in full is taken to be full: writes are refused rather
+        // than allowed to grow it past `maxSpoolBytes` unseen.
+        var incomplete = false
+        guard let files = FileManager.default.enumerator(
+            at: spoolDirectory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            errorHandler: { _, _ in incomplete = true; return true }) else { spoolBytes = maxSpoolBytes; return }
+        while let file = files.nextObject() as? URL {
+            guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]) else { incomplete = true; continue }
+            if values.isRegularFile == true {
+                if let size = values.fileSize { total += Int64(size) } else { incomplete = true }
+            }
         }
-        spoolBytes = total
+        spoolBytes = incomplete ? max(total, maxSpoolBytes) : total
     }
 
     private func readSpool(_ digest: CASDigest) -> CASBlob? {
@@ -835,7 +845,8 @@ public actor ScopeCache {
         // and leave it for the next sweep if it keeps happening.
         for _ in 0..<3 {
             let generation = pendingGeneration
-            let keep = await reachableFromPending()
+            // Unknown what pending actions reach: nothing is deleted this time.
+            guard let keep = await reachableFromPending() else { return }
             guard generation == pendingGeneration else { continue }
             for file in old where !keep.contains(file.lastPathComponent) {
                 // Still as old as when it was listed? A PUT since then refreshed it.
@@ -848,10 +859,16 @@ public actor ScopeCache {
     }
 
     /// Hex digests of everything the pending actions' values reach.
-    private func reachableFromPending() async -> Set<String> {
+    /// Nil if the pending directory exists but cannot be listed.
+    private func reachableFromPending() async -> Set<String>? {
         var seen = Set<String>()
         var queue: [CASDigest] = []
-        for name in (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? [] {
+        var names: [String] = []
+        if FileManager.default.fileExists(atPath: pendingDirectory.path) {
+            guard let listed = try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path) else { return nil }
+            names = listed
+        }
+        for name in names {
             if let key = CASDigest(hex: name), let value = readAction(key) { queue.append(value) }
         }
         while let digest = queue.popLast() {
