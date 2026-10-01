@@ -183,6 +183,16 @@ jobs:
         if: env.PREVIEW_URL != ''
         run: Scripts/time-connections.sh "${CAS_REMOTE_URL:-https://xcache.devtoo.ls}" "$PREVIEW_URL"
 
+      # The bundle that passed the end-to-end test above is the one the deploy job ships.
+      - name: Keep the Worker bundle for the production deploy
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-bundle
+          path: build/worker
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Collect crash reproducers
         if: failure()
         run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
@@ -195,3 +205,37 @@ jobs:
           path: ${{ runner.temp }}/crash-artifacts
           if-no-files-found: ignore
           retention-days: 14
+
+  # A merge to main puts the Worker live, once every job above has passed. A pull
+  # request never gets here; its change is only on its preview.
+  deploy:
+    name: Deploy the Worker to production
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [native, macos, worker]
+    runs-on: ubuntu-24.04
+    # One deploy at a time, and a newer merge waits for the one in flight rather than
+    # cancelling it half way.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-bundle
+          path: build/worker
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Same wrangler as the previews. `wrangler deploy` keeps the secrets already on the
+      # Worker (CAS_TOKEN), so none is uploaded here.
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          [ -s build/worker/worker.mjs ] && [ -s build/worker/WorkerKit.wasm ] || { echo "::error::the Worker bundle is missing"; exit 1; }
+          npx --yes wrangler@4.145.0 deploy --message "${GITHUB_SHA} from ${GITHUB_REPOSITORY}"
