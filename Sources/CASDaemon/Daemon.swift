@@ -215,8 +215,16 @@ public final class CASDaemon: @unchecked Sendable {
         directories.sort { $0.used < $1.used }
         var excess = directories.count - room
         for directory in directories where excess > 0 && !protected.contains(directory.url.lastPathComponent) {
-            let pending = (try? FileManager.default.contentsOfDirectory(
-                atPath: directory.url.appendingPathComponent("pending").path)) ?? []
+            // Only a pending directory that is absent counts as empty; one that cannot be
+            // listed may hold acknowledged writes and protects its scope.
+            let pendingPath = directory.url.appendingPathComponent("pending").path
+            let pending: [String]
+            if FileManager.default.fileExists(atPath: pendingPath) {
+                guard let listed = try? FileManager.default.contentsOfDirectory(atPath: pendingPath) else { continue }
+                pending = listed
+            } else {
+                pending = []
+            }
             guard pending.isEmpty, !Self.holdsRecentSpool(directory.url) else { continue }
             // Only a directory that is gone makes room: one that could not be removed (a
             // stuck file, a transient error) leaves the cap unmet.

@@ -49,18 +49,47 @@ public actor ObjectCache {
         return cache
     }
 
+    /// Files the index let go of that could not be removed (an immutable file, a
+    /// transient error). They still occupy disk, so they stay counted against `maxBytes`.
+    final class Leftovers: @unchecked Sendable {
+        private let lock = NSLock()
+        private var files = [String: (url: URL, size: Int64)]()
+
+        /// Removes the file; one that cannot be removed is remembered.
+        func remove(_ name: String, at url: URL, size: Int64) {
+            do { try FileManager.default.removeItem(at: url) } catch {
+                if FileManager.default.fileExists(atPath: url.path) { lock.withLock { files[name] = (url, size) } }
+            }
+        }
+
+        /// Tries again for each, and returns the bytes still held.
+        func retry() -> Int64 {
+            lock.withLock {
+                for (name, file) in files {
+                    if (try? FileManager.default.removeItem(at: file.url)) != nil || !FileManager.default.fileExists(atPath: file.url.path) {
+                        files[name] = nil
+                    }
+                }
+                return files.values.reduce(0) { $0 + $1.size }
+            }
+        }
+
+    }
+    private let leftovers = Leftovers()
+
     private init(directory: URL, maxBytes: Int64) throws {
         self.directory = directory
         self.maxBytes = maxBytes
         var configuration = try Configuration<String, Int64>(maxSize: Int(maxBytes))
         configuration.maxEntrySize = Int(maxBytes)
         configuration.sizeCalculation = { size, _ in Int(size) }
-        configuration.dispose = { _, name, reason in
+        let leftovers = self.leftovers
+        configuration.dispose = { size, name, reason in
             // Evicted for room, or removed because it could not be read: either way
             // the file goes. (A replaced entry is never disposed of here: `put`
             // does not store a digest that is already indexed.)
             if reason == .evict || reason == .delete {
-                try? FileManager.default.removeItem(at: Self.path(of: name, in: directory))
+                leftovers.remove(name, at: Self.path(of: name, in: directory), size: Int64(size))
             }
         }
         self.index = LRUCache(configuration: configuration)
@@ -128,6 +157,10 @@ public actor ObjectCache {
 
         let encoded = Self.encode(blob)
         guard Int64(encoded.count) <= maxBytes else { return digest }
+
+        // Files that could not be removed still take disk: no room is taken from them.
+        let stuck = leftovers.retry()
+        if stuck > 0, await Int64(index.calculatedSize) + stuck + Int64(encoded.count) > maxBytes { return digest }
 
         let file = Self.path(of: name, in: directory)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)

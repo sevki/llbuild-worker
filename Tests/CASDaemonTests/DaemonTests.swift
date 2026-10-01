@@ -774,6 +774,25 @@ final class DaemonTests: XCTestCase {
         XCTAssertTrue(recovered, "the filesystem recovered, and so did the scope")
     }
 
+    func testPruningKeepsAScopeWhosePendingDirectoryCannotBeListed() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        // "pending" is a file, so listing it fails though it exists.
+        let stale = directory.appendingPathComponent("stale")
+        try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: stale.appendingPathComponent("pending"))
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1000)], ofItemAtPath: stale.path)
+        daemon = CASDaemon(.init(
+            directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600),
+            maxScopes: 1, maxScopeDirectories: 2) { _ in fake })
+        port = try await daemon.start()
+        for scope in ["y1", "y2", "y3"] {
+            _ = try? await status(ofScope: scope)
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stale.path), "an unreadable pending directory protects its scope")
+    }
+
     func testPruningNeverDeletesAScopeDirectoryHoldingUnsentWrites() async throws {
         await daemon.stop()
         let fake = upstream!
