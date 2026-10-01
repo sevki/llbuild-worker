@@ -115,20 +115,12 @@ public final class CASDaemon: @unchecked Sendable {
     /// added are one step and a burst cannot overshoot `maxScopes`.
     private let admission = AsyncSemaphore(1)
 
-    /// Runs `body` with the scope held open: one that is in use is never retired.
-    func withScope<T: Sendable>(_ name: String, _ body: @Sendable (ScopeCache) async throws -> T) async throws -> T {
+    /// The scope, marked in use: it is not retired until `release` is called. A caller
+    /// that cannot go on holding it (it failed to open) gets the error.
+    func acquire(_ name: String) async throws -> ScopeCache {
         for _ in 0..<4 {
             let cache = try await scope(name)
-            if await cache.beginUse() {
-                do {
-                    let result = try await body(cache)
-                    await cache.endUse()
-                    return result
-                } catch {
-                    await cache.endUse()
-                    throw error
-                }
-            }
+            if await cache.beginUse() { return cache }
             // Retired just now: wait for the admission that is replacing it, then look again.
             await admission.acquire()
             await admission.release()
@@ -136,12 +128,25 @@ public final class CASDaemon: @unchecked Sendable {
         throw CASDaemonError("scope \(name) is being retired")
     }
 
+    /// Runs `body` with the scope held open: one that is in use is never retired.
+    func withScope<T: Sendable>(_ name: String, _ body: @Sendable (ScopeCache) async throws -> T) async throws -> T {
+        let cache = try await acquire(name)
+        do {
+            let result = try await body(cache)
+            await cache.endUse()
+            return result
+        } catch {
+            await cache.endUse()
+            throw error
+        }
+    }
+
     func scope(_ name: String) async throws -> ScopeCache {
         if let existing = lock.withLock({ () -> Task<ScopeCache, Error>? in
             scopes[name]?.used = .now
             return scopes[name]?.task
         }) {
-            return try await existing.value
+            return try await opened(name, existing)
         }
         await admission.acquire()
         do {
@@ -155,8 +160,11 @@ public final class CASDaemon: @unchecked Sendable {
     }
 
     /// Deletes the scope directories used longest ago until `maxScopeDirectories`
-    /// remain (counting the one about to be opened), never one that is open.
-    private func pruneDirectories(keeping name: String) {
+    /// remain (counting the one about to be opened). Never one that is open, and never
+    /// one that still holds acknowledged writes waiting for the Worker: those are
+    /// retried when the scope is next opened, and deleting them would lose them.
+    /// False if the cap cannot be met without doing either.
+    private func pruneDirectories(keeping name: String) -> Bool {
         let root = configuration.directory
         let open = Set(lock.withLock { scopes.keys.map(Self.directoryName(for:)) })
         let protected = open.union([Self.directoryName(for: name)])
@@ -167,21 +175,28 @@ public final class CASDaemon: @unchecked Sendable {
             guard values?.isDirectory == true else { return nil }
             return (url, values?.contentModificationDate ?? .distantPast)
         }
-        let room = configuration.maxScopeDirectories - (directories.contains { $0.url.lastPathComponent == Self.directoryName(for: name) } ? 0 : 1)
-        guard directories.count > room else { return }
+        let isNew = !directories.contains { $0.url.lastPathComponent == Self.directoryName(for: name) }
+        let room = configuration.maxScopeDirectories - (isNew ? 1 : 0)
+        guard directories.count > room else { return true }
         directories.sort { $0.used < $1.used }
         var excess = directories.count - room
         for directory in directories where excess > 0 && !protected.contains(directory.url.lastPathComponent) {
+            let pending = (try? FileManager.default.contentsOfDirectory(
+                atPath: directory.url.appendingPathComponent("pending").path)) ?? []
+            guard pending.isEmpty else { continue }
             try? FileManager.default.removeItem(at: directory.url)
             excess -= 1
         }
+        return excess <= 0
     }
 
     /// One new scope, with room made for it, as a single step (see `admission`).
     private func admit(_ name: String) async throws -> ScopeCache {
-        if let existing = lock.withLock({ scopes[name]?.task }) { return try await existing.value }
+        if let existing = lock.withLock({ scopes[name]?.task }) { return try await opened(name, existing) }
         try await makeRoom()
-        pruneDirectories(keeping: name)
+        guard pruneDirectories(keeping: name) else {
+            throw CASDaemonError("too many scope directories hold writes not yet sent to the Worker (\(configuration.maxScopeDirectories))")
+        }
         let task: Task<ScopeCache, Error> = lock.withLock {
             if let existing = scopes[name] { return existing.task }
             let created = Task { [configuration, log] in
@@ -196,7 +211,18 @@ public final class CASDaemon: @unchecked Sendable {
             scopes[name] = (created, .now)
             return created
         }
-        return try await task.value
+        return try await opened(name, task)
+    }
+
+    /// The scope a task opens; if it could not be opened (a full or unwritable disk,
+    /// say) the entry is dropped, so the failure is not kept and does not take a place.
+    private func opened(_ name: String, _ task: Task<ScopeCache, Error>) async throws -> ScopeCache {
+        do {
+            return try await task.value
+        } catch {
+            lock.withLock { if scopes[name]?.task == task { scopes[name] = nil } }
+            throw error
+        }
     }
 
     /// Keeps the number of open scopes within `maxScopes`: the one used longest ago

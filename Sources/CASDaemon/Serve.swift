@@ -12,7 +12,26 @@ extension CASDaemon {
 
     func serveWebSocket(_ channel: NIOAsyncChannel<WebSocketFrame, WebSocketFrame>, scope name: String) async throws {
         // The scope stays in use, and so is not retired, for as long as the connection.
-        try await withScope(name) { cache in try await self.serveWebSocket(channel, in: cache) }
+        let cache: ScopeCache
+        do {
+            cache = try await acquire(name)
+        } catch {
+            // The upgrade is done, so the client is waiting for a reply: tell it, and hang up
+            // (1011, an internal error), rather than leave it waiting on a connection that
+            // nobody serves.
+            try? await channel.executeThenClose { _, outbound in
+                try await outbound.write(
+                    WebSocketFrame(fin: true, opcode: .connectionClose, data: ByteBuffer(bytes: [0x03, 0xf3])))
+            }
+            throw error
+        }
+        do {
+            try await serveWebSocket(channel, in: cache)
+            await cache.endUse()
+        } catch {
+            await cache.endUse()
+            throw error
+        }
     }
 
     private func serveWebSocket(_ channel: NIOAsyncChannel<WebSocketFrame, WebSocketFrame>, in cache: ScopeCache) async throws {

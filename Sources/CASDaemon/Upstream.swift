@@ -52,16 +52,57 @@ public actor ClientUpstream: CASUpstream {
     private let url: URL
     private var client: CASClient?
 
-    public init(url: URL, timeout: Duration = .seconds(30)) {
-        self.url = url
-        self.callTimeout = timeout
+    /// How the daemon reaches the Worker.
+    public enum Transport: Sendable {
+        /// POST when the Worker serves it (found by one probe), the WebSocket if not.
+        case automatic
+        case httpPost
+        case webSocket
     }
 
-    private func current() throws -> CASClient {
+    private let transport: Transport
+    /// Whether the Worker serves POST, once known (only asked under `.automatic`).
+    private var postServed: Bool?
+
+    public init(url: URL, timeout: Duration = .seconds(30), transport: Transport = .automatic) {
+        self.url = url
+        self.callTimeout = timeout
+        self.transport = transport
+    }
+
+    private func current() async throws -> CASClient {
         if let client { return client }
-        let created = try CASClient(workerURL: url)
+        let created: CASClient
+        switch transport {
+        case .webSocket:
+            created = try CASClient(workerURL: url)
+        case .httpPost:
+            created = try CASClient(workerURL: url, transport: .httpPost)
+        case .automatic:
+            created = try await automatic()
+        }
+        // Another call may have connected while this one was waiting.
+        if let client { return client }
         client = created
         return created
+    }
+
+    /// POST if the Worker answers it, which is learned once: a stateless call has no
+    /// connection that can go stale. A Worker without the endpoint gets the WebSocket.
+    private func automatic() async throws -> CASClient {
+        if postServed != false {
+            let candidate = try CASClient(workerURL: url, transport: .httpPost)
+            if postServed == true { return candidate }
+            do {
+                _ = try await withDeadline(callTimeout, { try await candidate.status() }, onTimeout: { await candidate.close() })
+                postServed = true
+                return candidate
+            } catch {
+                postServed = false
+                await candidate.close()
+            }
+        }
+        return try CASClient(workerURL: url)
     }
 
     private func discard(_ failed: CASClient) {
@@ -85,12 +126,12 @@ public actor ClientUpstream: CASUpstream {
     }
 
     private func call<T: Sendable>(_ operation: @escaping @Sendable (CASClient) async throws -> T) async throws -> T {
-        let first = try current()
+        let first = try await current()
         do {
             return try await attempt(first, operation)
         } catch {
             discard(first)
-            let second = try current()
+            let second = try await current()
             do {
                 return try await attempt(second, operation)
             } catch {

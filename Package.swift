@@ -25,11 +25,11 @@ let package = Package(
     dependencies: [
         // WorkerKit's native WebSocket transport (PR #12) with the client
         // frame-size fix (PR #13), R2 bindings (PR #14), worker-build's `--`
-        // pass-through (PR #16) and Request.cf (PR #17), pinned at its merge
-        // commit on main.
+        // pass-through (PR #16), Request.cf (PR #17) and the HTTP POST transport
+        // (PR #19), pinned at its merge commit on main.
         .package(
             url: "https://github.com/sevki/WorkerKit.git",
-            revision: "4821611f07708cb4402922b584323dec5668a5b4"
+            revision: "ab5131a25f025ba4dba688443af24f181f53ab85"
         ),
         // The recency index of the daemon's on-disk object cache: O(1) gets and
         // evictions, a byte limit, and a callback when an entry is evicted (to delete

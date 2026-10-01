@@ -111,6 +111,9 @@ public actor ScopeCache {
 
     private var retired = false
     private var users = 0
+    /// Background work started on this scope's behalf (prefetches, uploads of a trace,
+    /// lookups in flight) that has not finished: a scope is not retired under it.
+    private var background = 0
 
     /// Marks the scope as in use (a connection, a request) so it is not retired under
     /// the user; false if it already has been, and the caller must look the scope up
@@ -128,7 +131,7 @@ public actor ScopeCache {
     /// Whether everything acknowledged here has reached upstream: nothing waits on
     /// disk and nothing is being forwarded.
     private var isIdle: Bool {
-        users == 0 && forwarding.isEmpty
+        users == 0 && background == 0 && fetching.isEmpty && uploading.isEmpty && forwarding.isEmpty
             && ((try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path))?.isEmpty ?? true)
     }
 
@@ -203,7 +206,11 @@ public actor ScopeCache {
 
     private func prefetch(_ digests: [CASDigest]) {
         for digest in digests {
-            Task { [self] in _ = await get(digest) }
+            background += 1
+            Task { [self] in
+                _ = await get(digest)
+                background -= 1
+            }
         }
     }
 
@@ -273,7 +280,11 @@ public actor ScopeCache {
     private func noteLookup(_ key: CASDigest) {
         let now = ContinuousClock.now
         if let current = session, now - current.last > sessionGap {
-            Task { [self] in await upload(trace: current) }
+            background += 1
+            Task { [self] in
+                await upload(trace: current)
+                background -= 1
+            }
             session = nil
         }
         if session == nil {
@@ -312,7 +323,9 @@ public actor ScopeCache {
     /// At the start of a build, reads the trace an earlier one left under its first
     /// action and asks for everything in it, in order, ahead of the compiler.
     private func startPrefetch(from first: CASDigest) {
+        background += 1
         Task { [self] in
+            defer { background -= 1 }
             guard let trace = try? await upstream.traceGet(first), !trace.isEmpty else { return }
             session?.loaded = trace
             await prefetch(trace: trace)
@@ -353,7 +366,11 @@ public actor ScopeCache {
     }
 
     private func prefetchObjects(of value: CASDigest) {
-        Task { [self] in _ = await get(value) }
+        background += 1
+        Task { [self] in
+            _ = await get(value)
+            background -= 1
+        }
     }
 
     // MARK: Batched lookups
@@ -383,9 +400,11 @@ public actor ScopeCache {
             for key in waiting.keys.prefix(CASLimits.maxBatchKeys) { batch[key] = waiting.removeValue(forKey: key) }
             callsInFlight += 1
             batches += 1
+            background += 1
             Task { [self] in
                 await send(batch)
                 callsInFlight -= 1
+                background -= 1
                 sendWaiting()
             }
         }

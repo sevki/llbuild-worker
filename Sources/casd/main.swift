@@ -5,6 +5,7 @@ import Foundation
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: casd --upstream <worker-url> [--listen <host:port>] [--cache <dir>] [--max-gb <n>]
+                [--transport auto|post|websocket]
 
     Serves the Worker's protocol on the loopback and forwards to <worker-url>
     (a scope is taken from the request path: <worker-url>/<scope>). Point the
@@ -14,6 +15,8 @@ func usage() -> Never {
       --listen    default 127.0.0.1:4170
       --cache     default ~/.cache/llbuild-casd
       --max-gb    local cache size per scope, default 4
+      --transport how to reach the Worker: post (one request per call, no connection to
+                  go stale), websocket, or auto (post if the Worker serves it), default auto
 
     """.utf8))
     exit(64)
@@ -24,6 +27,7 @@ var host = "127.0.0.1"
 var port = 4170
 var cache = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cache/llbuild-casd")
 var maxGB = 4.0
+var transport = ClientUpstream.Transport.automatic
 
 var arguments = CommandLine.arguments.dropFirst()
 while let flag = arguments.popFirst() {
@@ -37,15 +41,23 @@ while let flag = arguments.popFirst() {
         port = parsed
     case "--cache": cache = URL(fileURLWithPath: value)
     case "--max-gb": maxGB = Double(value) ?? 4
+    case "--transport":
+        switch value {
+        case "auto": transport = .automatic
+        case "post": transport = .httpPost
+        case "websocket": transport = .webSocket
+        default: usage()
+        }
     default: usage()
     }
 }
 guard let upstream, ["http", "https"].contains(upstream.scheme ?? "") else { usage() }
 
+let chosenTransport = transport
 let verbose = ProcessInfo.processInfo.environment["LLBUILD_CAS_DEBUG"] != nil
 let daemon = CASDaemon(
     .init(host: host, port: port, directory: cache, maxBytes: Int64(maxGB * 1_073_741_824)) { scope in
-        ClientUpstream(url: upstream.appendingPathComponent(scope))
+        ClientUpstream(url: upstream.appendingPathComponent(scope), transport: chosenTransport)
     },
     log: { message in
         if verbose { FileHandle.standardError.write(Data("casd: \(message)\n".utf8)) }

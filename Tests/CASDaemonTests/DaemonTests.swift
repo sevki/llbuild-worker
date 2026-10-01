@@ -712,6 +712,93 @@ final class DaemonTests: XCTestCase {
         XCTAssertTrue(scopes.contains("d6"), "the newest is kept")
     }
 
+    func testAScopeThatFailedToOpenIsNotKeptAndCanBeOpenedLater() async throws {
+        try await restart(maxScopes: 2)
+        // A file where the scope's directory should go: opening it fails.
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let blocker = directory.appendingPathComponent("blocked")
+        try Data("in the way".utf8).write(to: blocker)
+        let failed = try await status(ofScope: "blocked")
+        XCTAssertFalse(failed)
+        let stuck = try await status(ofScope: "blocked")
+        XCTAssertFalse(stuck)
+        // Failed openings must not use up the places, nor remember the failure.
+        XCTAssertEqual(daemon.openScopeCount, 0)
+
+        try FileManager.default.removeItem(at: blocker)
+        let recovered = try await status(ofScope: "blocked")
+        XCTAssertTrue(recovered, "the filesystem recovered, and so did the scope")
+    }
+
+    func testPruningNeverDeletesAScopeDirectoryHoldingUnsentWrites() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        func start() async throws {
+            daemon = CASDaemon(.init(
+                directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600),
+                maxScopes: 1, maxScopeDirectories: 2) { _ in fake })
+            port = try await daemon.start()
+        }
+        try await start()
+        await upstream.setDown(true)                     // what is written stays pending
+        let object = blob("acknowledged but unsent")
+        let key = blob("unsent key").digest
+        let writer = try client("keeper")
+        try await writer.put(object)
+        try await writer.actionPut(key, value: object.digest)
+        await writer.close()
+
+        // A restart: "keeper" is no longer open, and is the oldest directory.
+        await daemon.stop()
+        try await start()
+        for scope in ["x1", "x2", "x3"] {
+            let served = try await status(ofScope: scope)
+            _ = served
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        let kept = FileManager.default.fileExists(atPath: directory.appendingPathComponent("keeper/pending").path)
+        XCTAssertTrue(kept, "the directory with unsent writes survives pruning")
+
+        // The Worker comes back and the scope is opened: what was acknowledged is sent.
+        await upstream.setDown(false)
+        let again = try client("keeper")
+        _ = try await again.status()
+        await daemon.drain()
+        let stored = await upstream.actions[key]
+        XCTAssertEqual(stored, object.digest)
+        await again.close()
+    }
+
+    func testANewScopeIsRefusedWhenEveryDirectoryHoldsUnsentWrites() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        func start(maxScopes: Int) async throws {
+            daemon = CASDaemon(.init(
+                directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600),
+                maxScopes: maxScopes, maxScopeDirectories: 2) { _ in fake })
+            port = try await daemon.start()
+        }
+        try await start(maxScopes: 2)
+        await upstream.setDown(true)
+        for scope in ["first", "second"] {
+            let writer = try client(scope)
+            let object = blob("unsent in \(scope)")
+            try await writer.put(object)
+            try await writer.actionPut(blob("key \(scope)").digest, value: object.digest)
+            await writer.close()
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        // After a restart nothing is open, but both directories hold unsent writes.
+        await daemon.stop()
+        try await start(maxScopes: 2)
+        let url = URL(string: "http://127.0.0.1:\(port)/third/objects/\(String(repeating: "a", count: 64))")!
+        let (_, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 503, "no directory can be removed safely")
+        for scope in ["first", "second"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("\(scope)/pending").path), scope)
+        }
+    }
+
     func testAScopeWithAnOpenConnectionIsNotRetiredUnderIt() async throws {
         try await restart(maxScopes: 2)
         let keep = try client("keep")
@@ -734,6 +821,53 @@ final class DaemonTests: XCTestCase {
             XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 404, path)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("ghost").path))
+    }
+
+    // MARK: HTTP POST transport
+
+    func testTheClientCanCallOverOnePostPerCall() async throws {
+        let object = blob("by post")
+        await upstream.seed(object)
+        let key = blob("post key").digest
+        await upstream.seed(action: key, value: object.digest)
+
+        let client = try CASClient(workerURL: URL(string: "http://127.0.0.1:\(port)/s")!, transport: .httpPost)
+        let status = try await client.status()
+        XCTAssertTrue(status.storageConfigured)
+        let value = try await client.actionGet(key)
+        XCTAssertEqual(value, object.digest)
+        let answers = try await client.actionGetMany([key, blob("absent").digest])
+        XCTAssertEqual(answers, [object.digest, nil])
+        let has = try await client.contains(blob("absent").digest)
+        XCTAssertFalse(has)
+        // Many at once: each is its own request.
+        let many = try await withThrowingTaskGroup(of: CASDigest?.self) { group in
+            for _ in 0..<30 { group.addTask { try await client.actionGet(key) } }
+            return try await group.reduce(into: [CASDigest?]()) { $0.append($1) }
+        }
+        XCTAssertEqual(many.count, 30)
+        XCTAssertTrue(many.allSatisfy { $0 == object.digest })
+        await client.close()
+    }
+
+    func testTheDaemonsUpstreamUsesPostWhenTheWorkerServesIt() async throws {
+        // A second daemon in front of the first one, which plays the Worker.
+        let object = blob("through two daemons")
+        await upstream.seed(object)
+        let key = blob("chained key").digest
+        await upstream.seed(action: key, value: object.digest)
+        let workerPort = port
+        let front = CASDaemon(.init(
+            directory: directory.appendingPathComponent("front"), maxBytes: 64 << 20
+        ) { scope in ClientUpstream(url: URL(string: "http://127.0.0.1:\(workerPort)/\(scope)")!, transport: .automatic) })
+        let frontPort = try await front.start()
+        let client = try CASClient(workerURL: URL(string: "http://127.0.0.1:\(frontPort)/s")!)
+        let value = try await client.actionGet(key)
+        XCTAssertEqual(value, object.digest)
+        let blobBack = try await client.get(object.digest)
+        XCTAssertEqual(blobBack, object)
+        await client.close()
+        await front.stop()
     }
 
     func testACallToAWorkerThatNeverAnswersFailsInsteadOfHanging() async throws {
