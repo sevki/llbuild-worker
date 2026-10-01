@@ -309,7 +309,7 @@ public actor ScopeCache {
         if let current = session, now - current.last > sessionGap {
             background += 1
             Task { [self] in
-                await upload(trace: current)
+                _ = await upload(trace: current)
                 background -= 1
             }
             session = nil
@@ -337,14 +337,19 @@ public actor ScopeCache {
     /// the last upload, or what it was prefetched from.
     public func flushTrace() async {
         guard let snapshot = session else { return }
-        await upload(trace: snapshot)
+        let sent = await upload(trace: snapshot)
         // Lookups that arrived while that upload was out are not in it: only a session
-        // that is still what was sent counts as sent.
-        if session?.first == snapshot.first, session?.keys.count == snapshot.keys.count { session?.uploaded = true }
+        // that is still what was sent counts as sent. And one that could not be sent (the
+        // Worker was away) is not marked, so the next flush tries again.
+        if sent, session?.first == snapshot.first, session?.keys.count == snapshot.keys.count {
+            session?.uploaded = true
+        }
     }
 
-    private func upload(trace current: Session) async {
-        guard current.keys.count >= 2, !current.uploaded, current.keys != current.loaded else { return }
+    /// True if there is nothing to send or the trace is now stored (under at least one of
+    /// its anchors); false if it could not be sent.
+    private func upload(trace current: Session) async -> Bool {
+        guard current.keys.count >= 2, !current.uploaded, current.keys != current.loaded else { return true }
         let anchors = Array(current.keys.prefix(Self.traceAnchors))
         var stored = false
         await withTaskGroup(of: String?.self) { group in
@@ -363,6 +368,7 @@ public actor ScopeCache {
             }
         }
         if stored { tracesUploaded += 1 }
+        return stored
     }
 
     /// How many of a build's first lookups a trace is kept under.

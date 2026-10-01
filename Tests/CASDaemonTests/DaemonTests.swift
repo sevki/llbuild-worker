@@ -605,6 +605,27 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testATraceThatCouldNotBeSentIsSentAtTheNextFlush() async throws {
+        let (keys, _) = await seedBuild(6)
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(directory: directory.appendingPathComponent("retry-trace"), maxBytes: 64 << 20) { _ in fake })
+        port = try await daemon.start()
+        let client = try client()
+        for key in keys { _ = try await client.actionGet(key) }
+
+        await upstream.setDown(true)            // the Worker is away at the first flush
+        await daemon.drain()
+        let early = await upstream.traces[keys[0]]
+        XCTAssertNil(early)
+
+        await upstream.setDown(false)           // and back at the next
+        await daemon.drain()
+        let later = await upstream.traces[keys[0]]
+        XCTAssertEqual(later, keys, "the trace was not given up on")
+        await client.close()
+    }
+
     func testAnUnchangedTraceIsNotUploadedAgain() async throws {
         let (keys, _) = await seedBuild(10)
         try await build(keys)
