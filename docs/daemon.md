@@ -99,13 +99,10 @@ The daemon removes the waiting by remembering the build.
 
 `casd` is released with the plugin: `casd-macos-arm64.tar.gz` and `casd-linux-x86_64.tar.gz`
 on each GitHub release (with `SHA256SUMS`), or `swift build -c release --product casd`. The
-Linux binary has the Swift runtime and Foundation linked in (it is about 110 MB, 37 MB
-compressed), so it needs no Swift toolchain; it does need `libcurl.so.4` and the usual system
-libraries on the host. **It is built on Ubuntu 24.04 and needs glibc 2.38 or newer** (Ubuntu
-24.04, Debian 13, Fedora 39 and later); on an older system, such as Ubuntu 22.04 or Debian 12,
-it does not start, and the installer then leaves the plugin talking to the Worker directly.
-The plugin's Linux build has the same requirement. Building the release on an older base image
-would lower it.
+Linux binary is fully static (musl, built with the Static Linux SDK; about 66 MB, 27 MB
+compressed): it needs no libc, libcurl or Swift runtime on the host, so it runs on any x86_64
+Linux, NixOS included. The Linux *plugin* is different: the compiler loads it with `dlopen`, so
+it cannot be static, and it is built on Ubuntu 24.04 and needs glibc 2.38 or newer.
 
 ```
 casd --upstream https://your-worker.example.workers.dev [--listen 127.0.0.1:4170]
