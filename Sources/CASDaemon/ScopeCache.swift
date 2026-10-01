@@ -276,6 +276,10 @@ public actor ScopeCache {
     private var traceLookups = 0
     private var traceHits = 0
     private var tracesUploaded = 0
+    private var traceProbes = 0
+    private var traceFound = 0
+    private var traceErrors = 0
+    private var lastTraceError = ""
 
     private func noteLookup(_ key: CASDigest) {
         let now = ContinuousClock.now
@@ -320,11 +324,20 @@ public actor ScopeCache {
         guard current.keys.count >= 2, !current.uploaded, current.keys != current.loaded else { return }
         let anchors = Array(current.keys.prefix(Self.traceAnchors))
         var stored = false
-        await withTaskGroup(of: Bool.self) { group in
+        await withTaskGroup(of: String?.self) { group in
             for anchor in anchors {
-                group.addTask { (try? await self.upstream.tracePut(anchor, keys: current.keys)) != nil }
+                group.addTask {
+                    do {
+                        try await self.upstream.tracePut(anchor, keys: current.keys)
+                        return nil
+                    } catch {
+                        return "\(error)"
+                    }
+                }
             }
-            for await ok in group where ok { stored = true }
+            for await failure in group {
+                if let failure { traceErrors += 1; lastTraceError = failure } else { stored = true }
+            }
         }
         if stored { tracesUploaded += 1 }
     }
@@ -338,7 +351,17 @@ public actor ScopeCache {
         background += 1
         Task { [self] in
             defer { background -= 1 }
-            guard let trace = try? await upstream.traceGet(first), !trace.isEmpty else { return }
+            traceProbes += 1
+            let found: [CASDigest]?
+            do {
+                found = try await upstream.traceGet(first)
+            } catch {
+                traceErrors += 1
+                lastTraceError = "\(error)"
+                return
+            }
+            guard let trace = found, !trace.isEmpty else { return }
+            traceFound += 1
             // Several probes can find the same trace; only the first is followed.
             guard session?.loaded == nil else { return }
             session?.loaded = trace
@@ -483,7 +506,9 @@ public actor ScopeCache {
     public var summary: String {
         let lookupMean = lookups == 0 ? Duration.zero : lookupTime / lookups
         let fetchMean = objectFetches == 0 ? Duration.zero : objectFetchTime / objectFetches
-        let trace = "trace: \(traceHits) of \(traceLookups) prefetched actions hit, \(tracesUploaded) uploaded; "
+        var trace = "trace: \(traceProbes) probes found \(traceFound); \(traceHits) of \(traceLookups) prefetched actions hit, \(tracesUploaded) uploaded"
+        if traceErrors > 0 { trace += ", \(traceErrors) errors (last: \(lastTraceError))" }
+        trace += "; "
         return trace + "\(lookups) action lookups in \(batches) calls (mean \(lookupMean) each); "
             + "\(objectFetches) objects fetched, \(objectBytes) bytes, mean \(fetchMean) each, at most \(maxObjectFetchesAtOnce) at once"
     }

@@ -41,6 +41,11 @@ extension CASUpstream {
     }
 }
 
+struct UpstreamUnsupported: Error, CustomStringConvertible {
+    var what: String
+    var description: String { "\(what) are not available from the Worker" }
+}
+
 struct UpstreamTimeout: Error, CustomStringConvertible {
     var description: String { "the Worker did not answer in time" }
 }
@@ -162,28 +167,30 @@ public actor ClientUpstream: CASUpstream {
     }
 
     /// A Worker without traces fails these calls; after a few failures in a row they
-    /// are not tried again. Traces are only a hint, so failing quietly is right.
+    /// are not tried again (the caller sees the error, and counts it). Traces are only
+    /// a hint.
     private var traceFailures = 0
 
     public func traceGet(_ key: CASDigest) async throws -> [CASDigest]? {
-        guard traceFailures < 3 else { return nil }
+        guard traceFailures < 3 else { throw UpstreamUnsupported(what: "traces") }
         do {
             let trace = try await call { try await $0.traceGet(key) }
             traceFailures = 0
             return trace
         } catch {
             traceFailures += 1
-            return nil
+            throw error
         }
     }
 
     public func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws {
-        guard traceFailures < 3 else { return }
+        guard traceFailures < 3 else { throw UpstreamUnsupported(what: "traces") }
         do {
             try await call { try await $0.tracePut(key, keys: keys) }
             traceFailures = 0
         } catch {
             traceFailures += 1
+            throw error
         }
     }
 
