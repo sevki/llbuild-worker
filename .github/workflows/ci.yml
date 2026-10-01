@@ -258,9 +258,9 @@ jobs:
             "https://download.swift.org/${lower}/wasm-sdk/${tag}/${tag}_wasm.artifactbundle.tar.gz"
           swift sdk install /tmp/wasm-sdk.artifactbundle.tar.gz
 
-      # After the SDK step, which installs curl.
-      - name: Enable the compile cache
-        run: Scripts/ci-compile-cache.sh
+      # After the SDK step, which installs curl. The wasm compiles are cache hits too, and go
+      # through the same casd binary the native jobs cache.
+      - uses: ./.github/actions/compile-cache
 
       # Everything after `--` goes to worker-build's nested `swift build`.
       - name: Build Worker bundle
@@ -304,6 +304,11 @@ jobs:
           retention-days: 7
           # A re-run of the workflow (to retry a deploy) uploads the same name again.
           overwrite: true
+
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
 
       - name: Collect crash reproducers
         if: failure()
