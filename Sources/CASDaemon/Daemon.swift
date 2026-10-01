@@ -206,8 +206,14 @@ public final class CASDaemon: @unchecked Sendable {
             let pending = (try? FileManager.default.contentsOfDirectory(
                 atPath: directory.url.appendingPathComponent("pending").path)) ?? []
             guard pending.isEmpty, !Self.holdsRecentSpool(directory.url) else { continue }
-            try? FileManager.default.removeItem(at: directory.url)
-            excess -= 1
+            // Only a directory that is gone makes room: one that could not be removed (a
+            // stuck file, a transient error) leaves the cap unmet.
+            do {
+                try FileManager.default.removeItem(at: directory.url)
+                excess -= 1
+            } catch {
+                continue
+            }
         }
         return excess <= 0
     }

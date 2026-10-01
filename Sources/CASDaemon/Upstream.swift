@@ -181,32 +181,35 @@ public actor ClientUpstream: CASUpstream {
         try await call { try await $0.actionPut(key, value: value) }
     }
 
-    /// A Worker without traces fails these calls; after a few failures in a row they
-    /// are not tried again (the caller sees the error, and counts it). Traces are only
-    /// a hint.
-    private var traceFailures = 0
+    /// Until when traces are not asked for, once the Worker has said it has none. Only a
+    /// definitive answer (it does not know the call) counts: a network failure or a
+    /// timeout says nothing about support, and must not switch traces off. The answer is
+    /// asked for again after ten minutes, since a Worker is deployed over time.
+    private var tracesUnsupportedUntil: Date?
 
-    public func traceGet(_ key: CASDigest) async throws -> [CASDigest]? {
-        guard traceFailures < 3 else { throw UpstreamUnsupported(what: "traces") }
+    /// Whether an error says the Worker has no such call (as opposed to not answering).
+    static func saysUnsupported(_ error: Error) -> Bool {
+        let text = "\(error)"
+        return text.contains("targetAccessorNotFound") || text.contains("Failed to locate distributed function accessor")
+            || text.contains("does not serve")
+    }
+
+    private func traceCall<T: Sendable>(_ operation: @escaping @Sendable (CASClient) async throws -> T) async throws -> T {
+        if let until = tracesUnsupportedUntil, Date() < until { throw UpstreamUnsupported(what: "traces") }
         do {
-            let trace = try await call { try await $0.traceGet(key) }
-            traceFailures = 0
-            return trace
+            return try await call(operation)
         } catch {
-            traceFailures += 1
+            if Self.saysUnsupported(error) { tracesUnsupportedUntil = Date().addingTimeInterval(600) }
             throw error
         }
     }
 
+    public func traceGet(_ key: CASDigest) async throws -> [CASDigest]? {
+        try await traceCall { try await $0.traceGet(key) }
+    }
+
     public func tracePut(_ key: CASDigest, keys: [CASDigest]) async throws {
-        guard traceFailures < 3 else { throw UpstreamUnsupported(what: "traces") }
-        do {
-            try await call { try await $0.tracePut(key, keys: keys) }
-            traceFailures = 0
-        } catch {
-            traceFailures += 1
-            throw error
-        }
+        try await traceCall { try await $0.tracePut(key, keys: keys) }
     }
 
     /// A Worker that predates the batch call fails it; after that, lookups go one

@@ -1029,6 +1029,27 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testTracesAreNotSwitchedOffByNetworkTrouble() async throws {
+        struct Said: Error, CustomStringConvertible { var description: String }
+        XCTAssertTrue(ClientUpstream.saysUnsupported(Said(description: "ExecuteDistributedTargetError(errorCode: targetAccessorNotFound)")))
+        XCTAssertTrue(ClientUpstream.saysUnsupported(Said(description: "Failed to locate distributed function accessor")))
+        XCTAssertFalse(ClientUpstream.saysUnsupported(Said(description: "the Worker did not answer in time")))
+        XCTAssertFalse(ClientUpstream.saysUnsupported(Said(description: "The request timed out.")))
+
+        // A Worker that never answers: five trace calls in a row all time out, and none of
+        // them is turned away as "unsupported".
+        let silent = SilentServer()
+        let upstream = ClientUpstream(url: URL(string: "http://127.0.0.1:\(silent.port)/s")!, timeout: .milliseconds(150), transport: .httpPost)
+        for attempt in 1...5 {
+            do {
+                _ = try await upstream.traceGet(blob("k").digest)
+                XCTFail("no answer was expected")
+            } catch {
+                XCTAssertFalse(error is UpstreamUnsupported, "attempt \(attempt): \(error)")
+            }
+        }
+    }
+
     func testACallToAWorkerThatNeverAnswersFailsInsteadOfHanging() async throws {
         let silent = SilentServer()
         let upstream = ClientUpstream(url: URL(string: "http://127.0.0.1:\(silent.port)/s")!, timeout: .milliseconds(400))
