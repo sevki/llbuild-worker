@@ -29,20 +29,29 @@ public actor ObjectCache {
         let cache = try ObjectCache(directory: directory, maxBytes: maxBytes)
 
         var found = [(name: String, size: Int64, modified: Date)]()
-        let files = FileManager.default.enumerator(
-            at: directory, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey])
-        while let file = files?.nextObject() as? URL {
-            let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey])
+        // Files the scan cannot see or measure would occupy disk outside the byte accounting, so
+        // an incomplete scan does not open the cache.
+        var incomplete = false
+        guard let files = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey],
+            errorHandler: { _, _ in incomplete = true; return true })
+        else { throw CASDaemonError("the object cache at \(directory.path) cannot be listed") }
+        while let file = files.nextObject() as? URL {
+            guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]) else {
+                incomplete = true
+                continue
+            }
             let name = file.lastPathComponent
             // A full-length digest: `CASDigest(hex:)` alone would accept the two-digit
             // shard directories' names.
-            guard values?.isRegularFile == true, name.count == CASIdentity.digestSize * 2, CASDigest(hex: name) != nil else {
+            guard values.isRegularFile == true, name.count == CASIdentity.digestSize * 2, CASDigest(hex: name) != nil else {
                 // A temporary file left by a store that never finished.
                 if name.hasSuffix(".tmp") { try? FileManager.default.removeItem(at: file) }
                 continue
             }
-            found.append((name, Int64(values?.fileSize ?? 0), values?.contentModificationDate ?? .distantPast))
+            found.append((name, Int64(values.fileSize ?? 0), values.contentModificationDate ?? .distantPast))
         }
+        if incomplete { throw CASDaemonError("the object cache at \(directory.path) could not be listed in full") }
         for entry in found.sorted(by: { $0.modified < $1.modified }) {
             await cache.index.set(entry.name, value: entry.size)
         }

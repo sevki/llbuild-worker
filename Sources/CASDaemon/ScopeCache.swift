@@ -42,6 +42,9 @@ public actor ScopeCache {
     private var pendingActions = 0
     /// Bytes in the spool, kept in step with its files and counted afresh when the scope opens.
     private var spoolBytes: Int64 = 0
+    /// Set when the spool could not be counted in full: writes are refused until a recount succeeds.
+    private var spoolIncomplete = false
+    private var lastRecount = Date.distantPast
     private let negativeTTL: Duration
     private let retryInterval: Duration
     private let sessionGap: Duration
@@ -122,6 +125,13 @@ public actor ScopeCache {
         countActions()
         let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
         for name in names {
+            if let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
+               FileManager.default.fileExists(atPath: shard(actionDirectory, key.hex).path),
+               FileManager.default.contents(atPath: shard(actionDirectory, key.hex).path) == nil {
+                // The record is there but cannot be read now (a transient error): the marker stays,
+                // and the periodic retry looks again.
+                continue
+            }
             guard let key = CASDigest(hex: name), key.bytes.count == CASIdentity.digestSize,
                   let value = readAction(key) else {
                 // Not a pending action after all: it goes, and no longer counts as one.
@@ -612,9 +622,13 @@ public actor ScopeCache {
                 // Upstream may already hold a different value for this key (another
                 // machine got there first): it wins, and this write is moot.
                 if let held = try? await upstream.actionGet(key), held != value {
-                    remember(key: key, value: held)
-                    clearPending(key)
-                    break
+                    // The marker goes only once the winning value is on disk: otherwise the stale
+                    // local record would be served after a restart. It stays, and is retried.
+                    holdInMemory(key, held)
+                    if (try? writeAction(key, held)) != nil {
+                        clearPending(key)
+                        break
+                    }
                 }
                 if attempt == 3 {
                     log("action \(key.hex) is queued on disk; it will be retried")
@@ -780,7 +794,8 @@ public actor ScopeCache {
         let encoded = ObjectCache.encode(blob)
         // Acknowledging a write promises it will be kept until it is sent, so there must
         // be room for that promise: when the spool is full the write is refused instead.
-        guard spoolBytes + Int64(encoded.count) <= maxSpoolBytes else { throw SpoolFull() }
+        if spoolIncomplete, Date().timeIntervalSince(lastRecount) > 30 { recountSpool() }
+        guard !spoolIncomplete, spoolBytes + Int64(encoded.count) <= maxSpoolBytes else { throw SpoolFull() }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try encoded.write(to: file, options: .atomic)
         spoolBytes += Int64(encoded.count)
@@ -793,6 +808,8 @@ public actor ScopeCache {
     }
 
     private func recountSpool() {
+        lastRecount = Date()
+        spoolIncomplete = false
         guard FileManager.default.fileExists(atPath: spoolDirectory.path) else { spoolBytes = 0; return }
         var total: Int64 = 0
         // A spool that cannot be counted in full is taken to be full: writes are refused rather
@@ -800,14 +817,15 @@ public actor ScopeCache {
         var incomplete = false
         guard let files = FileManager.default.enumerator(
             at: spoolDirectory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
-            errorHandler: { _, _ in incomplete = true; return true }) else { spoolBytes = maxSpoolBytes; return }
+            errorHandler: { _, _ in incomplete = true; return true }) else { spoolBytes = maxSpoolBytes; spoolIncomplete = true; return }
         while let file = files.nextObject() as? URL {
             guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]) else { incomplete = true; continue }
             if values.isRegularFile == true {
                 if let size = values.fileSize { total += Int64(size) } else { incomplete = true }
             }
         }
-        spoolBytes = incomplete ? max(total, maxSpoolBytes) : total
+        spoolBytes = total
+        spoolIncomplete = incomplete
     }
 
     private func readSpool(_ digest: CASDigest) -> CASBlob? {
