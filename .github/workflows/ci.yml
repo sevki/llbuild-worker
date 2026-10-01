@@ -11,8 +11,8 @@ permissions:
 # Runs for pushes to main go one at a time, each whole (build, tests, deploy) before the
 # next starts. GitHub keeps one pending run per group and cancels an older pending one when
 # a newer queues; as runs are created in push order, the one kept is the newest push, and
-# no run can deploy while another is deploying. A pull request's run gets a group of its own
-# and is not held up.
+# no run can deploy while another is deploying (which is what makes the tip check in the deploy
+# job sound). A pull request's run gets a group of its own and is not held up.
 concurrency:
   group: ${{ github.event_name == 'push' && 'ci-main' || format('ci-run-{0}', github.run_id) }}
   cancel-in-progress: false
@@ -236,9 +236,23 @@ jobs:
         with:
           node-version: 22
 
+      # A re-run of an older run keeps that run's commit, so it must not roll production back:
+      # only the commit at the tip of main deploys. The runs for main are serialized (see the
+      # concurrency group at the top), so nothing else deploys between this check and wrangler.
+      - name: Check this commit is still the tip of main
+        id: fresh
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          tip="$(git rev-parse FETCH_HEAD)"
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at $tip, not $GITHUB_SHA: not deploying an older commit"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Same wrangler as the previews. `wrangler deploy` keeps the secrets already on the
       # Worker (CAS_TOKEN), so none is uploaded here.
       - name: Deploy
+        if: steps.fresh.outputs.stale != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
