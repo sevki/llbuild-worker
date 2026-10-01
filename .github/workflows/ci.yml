@@ -365,7 +365,9 @@ jobs:
       - name: Check this commit is still the tip of main
         id: fresh
         run: |
-          git fetch --no-tags --depth=1 origin main
+          # refs/heads/main, not main: a tag named main (the rolling release's) shadows the branch
+          # for a plain `main`, and this check then compared against an old commit and never deployed.
+          git fetch --no-tags --depth=1 origin refs/heads/main
           tip="$(git rev-parse FETCH_HEAD)"
           if [ "$tip" != "$GITHUB_SHA" ]; then
             echo "::notice::main is at $tip, not $GITHUB_SHA: not deploying an older commit"
