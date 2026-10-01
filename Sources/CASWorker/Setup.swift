@@ -203,6 +203,22 @@ remove_casd_service() {
     esac
 }
 
+# What the service manager says about a daemon that was started and did not answer, so the
+# reason is in the installer's output and not only in a log nobody opens.
+casd_diagnostics() {
+    echo "The daemon was started and did not answer. What the service manager says:" >&2
+    case "$(uname -s)" in
+        Darwin)
+            { launchctl print "gui/$(id -u)/llbuild.casd" 2>&1 || launchctl print "user/$(id -u)/llbuild.casd" 2>&1; } | head -n 30 >&2 || true
+            echo "Its log ($HOME/Library/Logs/llbuild-casd.log):" >&2
+            tail -n 15 "$HOME/Library/Logs/llbuild-casd.log" >&2 2>&1 || true
+            ;;
+        *)
+            systemctl --user status casd.service --no-pager 2>&1 | tail -n 15 >&2 || true
+            ;;
+    esac
+}
+
 # True once something answers HTTP on the daemon's port.
 casd_up() {
     code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$CASD_PORT/" 2>/dev/null) || code=000
@@ -245,6 +261,7 @@ do_install_casd() {
         sleep 1
     done
     daemon_note="it did not answer on 127.0.0.1:$CASD_PORT"
+    casd_diagnostics
     return 1
 }
 
