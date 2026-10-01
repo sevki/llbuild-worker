@@ -101,7 +101,7 @@ public final class CASDaemon: @unchecked Sendable {
         guard let first = parts.first else { return nil }
         // The default scope's own routes: `/__rpc` and `/objects/{digest}`. Anything longer is a scope
         // that happens to be called `__rpc` or `objects`, as the Worker reads it.
-        if (first == "__rpc" && parts.count == 1) || (first == "objects" && parts.count == 2) { return ("default", parts) }
+        if (first == "__rpc" && parts.count == 1) || (first == "objects" && parts.count == 2 && parts[1] != "__rpc") { return ("default", parts) }
         let range = NSRange(first.startIndex..., in: first)
         guard scopePattern.firstMatch(in: first, range: range) != nil else { return nil }
         return (first, Array(parts.dropFirst()))

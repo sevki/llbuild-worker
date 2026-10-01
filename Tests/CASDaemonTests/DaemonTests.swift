@@ -780,6 +780,7 @@ final class DaemonTests: XCTestCase {
         let nested = CASDaemon.route("/objects/objects/abc")
         XCTAssertEqual(nested?.scope, "objects")
         XCTAssertEqual(nested?.rest, ["objects", "abc"])
+        XCTAssertEqual(CASDaemon.route("/objects/__rpc")?.scope, "objects")
         let rpc = CASDaemon.route("/__rpc/__rpc")
         XCTAssertEqual(rpc?.scope, "__rpc")
         XCTAssertEqual(rpc?.rest, ["__rpc"])

@@ -78,6 +78,9 @@ public actor ObjectCache {
         }
 
         /// Tries again for each, and returns the bytes still held.
+        /// The file at `name` is being replaced: a record of the old one must not act on the new.
+        func forget(_ name: String) { lock.withLock { files[name] = nil } }
+
         func retry() -> Int64 {
             lock.withLock {
                 for (name, file) in files {
@@ -184,6 +187,9 @@ public actor ObjectCache {
         // `.atomic` renames the data into `temporary`; this second rename makes the
         // entry appear under its real name only once it is whole.
         try? FileManager.default.removeItem(at: file)
+        // Whatever an earlier eviction left at this path is gone now, and a retry must not delete
+        // the file installed next. (If it is still there, it stays on the books and the move fails.)
+        if !FileManager.default.fileExists(atPath: file.path) { leftovers.forget(name) }
         try FileManager.default.moveItem(at: temporary, to: file)
         await index.set(name, value: Int64(encoded.count))
         // Making room may have let go of entries whose files could not be removed. If those now
