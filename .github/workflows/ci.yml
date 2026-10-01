@@ -230,9 +230,23 @@ jobs:
         with:
           node-version: 22
 
+      # Runs for consecutive merges can reach this point out of order (a concurrency group
+      # does not order its waiting runs), and an older one deploying last would roll
+      # production back. Only the run for the tip of main deploys.
+      - name: Check this commit is still the tip of main
+        id: fresh
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          tip="$(git rev-parse FETCH_HEAD)"
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at $tip, not $GITHUB_SHA: the run for that commit deploys, not this one"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Same wrangler as the previews. `wrangler deploy` keeps the secrets already on the
       # Worker (CAS_TOKEN), so none is uploaded here.
       - name: Deploy
+        if: steps.fresh.outputs.stale != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
