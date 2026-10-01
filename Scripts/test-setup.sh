@@ -203,6 +203,9 @@ check "I: no service was left behind" "[ ! -e $work/home-I/.config/systemd/user/
 
 if [ "$fail" = 0 ]; then echo "ALL OK"; else
     echo "SOME FAILED"
-    for n in A B C D E F G H1 H2 I; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; tail -15 "$work/out-$n.txt"; }; done
+    for n in A B C D E F G H1 H2 I; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; cat "$work/out-$n.txt"; }; done
+    if [ "$(uname -s)" = Darwin ]; then
+        echo "--- launchd"; id -u; launchctl managername 2>&1; launchctl print "gui/$(id -u)" 2>&1 | head -5; launchctl print "user/$(id -u)" 2>&1 | head -5
+    fi
 fi
 exit $fail
