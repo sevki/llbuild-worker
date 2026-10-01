@@ -17,6 +17,10 @@ import Foundation
 ///   slower, not broken.
 /// The write-behind spool is full: nothing more can be acknowledged until what it holds
 /// has been sent to the Worker.
+struct PendingFull: Error, CustomStringConvertible {
+    var description: String { "the daemon's queue of actions for the Worker is full" }
+}
+
 struct SpoolFull: Error, CustomStringConvertible {
     var description: String { "the daemon's queue of writes for the Worker is full" }
 }
@@ -32,6 +36,10 @@ public actor ScopeCache {
     /// waits in: a file here stays until it has been uploaded.
     private let spoolDirectory: URL
     private let maxSpoolBytes: Int64
+    private let maxPendingActions: Int
+    /// Actions acknowledged and not yet sent: the markers in `pending`, counted when the scope
+    /// opens and kept in step.
+    private var pendingActions = 0
     /// Bytes in the spool, kept in step with its files and counted afresh when the scope opens.
     private var spoolBytes: Int64 = 0
     private let negativeTTL: Duration
@@ -76,7 +84,7 @@ public actor ScopeCache {
 
     public init(
         directory: URL, maxBytes: Int64, upstream: any CASUpstream,
-        maxSpoolBytes: Int64? = nil, maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
+        maxSpoolBytes: Int64? = nil, maxPendingActions: Int = 100_000, maxActions: Int = 1_000_000, negativeTTL: Duration = .seconds(5), retryInterval: Duration = .seconds(60),
         sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20), maxObjectFetches: Int = 32,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws {
@@ -88,6 +96,7 @@ public actor ScopeCache {
         self.pendingDirectory = directory.appendingPathComponent("pending")
         self.spoolDirectory = directory.appendingPathComponent("spool")
         self.maxSpoolBytes = maxSpoolBytes ?? max(maxBytes, 64 << 20)
+        self.maxPendingActions = maxPendingActions
         self.maxActionFiles = maxActions
         self.negativeTTL = negativeTTL
         self.retryInterval = retryInterval
@@ -105,6 +114,7 @@ public actor ScopeCache {
     public func resumePending() async {
         startRetrying()
         recountSpool()
+        pendingActions = ((try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []).count
         await sweepSpool()
         countActions()
         let names = (try? FileManager.default.contentsOfDirectory(atPath: pendingDirectory.path)) ?? []
@@ -511,7 +521,11 @@ public actor ScopeCache {
         // durable sign that an acknowledged action still has to be sent.
         let alreadyPending = FileManager.default.fileExists(
             atPath: pendingDirectory.appendingPathComponent(key.hex).path)
+        // Pending actions are exempt from the action cap (they must not be lost), so they
+        // need a cap of their own: a Worker that stays away does not get an unbounded queue.
+        if !alreadyPending, pendingActions >= maxPendingActions { throw PendingFull() }
         try writePending(key)
+        if !alreadyPending { pendingActions += 1 }
         do {
             try writeAction(key, value)
         } catch {
@@ -716,7 +730,9 @@ public actor ScopeCache {
     }
 
     private func clearPending(_ key: CASDigest) {
-        try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(key.hex))
+        if (try? FileManager.default.removeItem(at: pendingDirectory.appendingPathComponent(key.hex))) != nil {
+            pendingActions = max(0, pendingActions - 1)
+        }
     }
 
     // The spool

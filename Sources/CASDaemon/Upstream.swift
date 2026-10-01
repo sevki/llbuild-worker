@@ -212,19 +212,20 @@ public actor ClientUpstream: CASUpstream {
         try await traceCall { try await $0.tracePut(key, keys: keys) }
     }
 
-    /// A Worker that predates the batch call fails it; after that, lookups go one
-    /// at a time, as before.
-    private var batchSupported = true
+    /// Until when batches are not asked for, once the Worker has said it does not know the
+    /// call. Only that definitive answer counts (a failure to reach the Worker says nothing
+    /// about support), and it holds for ten minutes, since a Worker is deployed over time.
+    private var batchUnsupportedUntil: Date?
 
     public func actionGetMany(_ keys: [CASDigest]) async throws -> [CASDigest?] {
-        if batchSupported {
+        if let until = batchUnsupportedUntil, Date() < until {
+            // known not to be served: lookups go one at a time
+        } else {
             do {
                 return try await call { try await $0.actionGetMany(keys) }
             } catch {
-                // If a plain lookup fails too, the trouble is real; if it works, the
-                // Worker just does not have the batch call.
-                if let first = keys.first { _ = try await actionGet(first) }
-                batchSupported = false
+                guard Self.saysUnsupported(error) else { throw error }
+                batchUnsupportedUntil = Date().addingTimeInterval(600)
             }
         }
         return try await withThrowingTaskGroup(of: (Int, CASDigest?).self) { group in

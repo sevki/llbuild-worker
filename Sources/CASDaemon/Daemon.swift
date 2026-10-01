@@ -37,6 +37,9 @@ public final class CASDaemon: @unchecked Sendable {
         /// Most bytes of acknowledged-but-unsent objects a scope keeps; a PUT that would pass
         /// it is refused (507). Defaults to `maxBytes`, and at least 64 MiB.
         public var maxSpoolBytes: Int64?
+        /// Most acknowledged actions waiting for the Worker per scope; a new one past it is
+        /// refused until some have been sent.
+        public var maxPendingActions: Int
         /// Most scope directories kept on disk, open or not: beyond it the ones unused
         /// for longest are deleted, so the disk the daemon can use is bounded by this
         /// times `maxBytes` (plus what is spooled and recorded per scope).
@@ -49,7 +52,7 @@ public final class CASDaemon: @unchecked Sendable {
 
         public init(
             host: String = "127.0.0.1", port: Int = 0, directory: URL, maxBytes: Int64 = 4 << 30,
-            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60), maxScopes: Int = 32, maxScopeDirectories: Int = 128, maxSpoolBytes: Int64? = nil,
+            maxActions: Int = 1_000_000, retryInterval: Duration = .seconds(60), maxScopes: Int = 32, maxScopeDirectories: Int = 128, maxSpoolBytes: Int64? = nil, maxPendingActions: Int = 100_000,
             sessionGap: Duration = .seconds(300), traceDebounce: Duration = .seconds(20),
             makeUpstream: @escaping @Sendable (String) -> any CASUpstream
         ) {
@@ -61,6 +64,7 @@ public final class CASDaemon: @unchecked Sendable {
             self.retryInterval = retryInterval
             self.maxScopes = maxScopes
             self.maxSpoolBytes = maxSpoolBytes
+            self.maxPendingActions = maxPendingActions
             self.maxScopeDirectories = maxScopeDirectories
             self.sessionGap = sessionGap
             self.traceDebounce = traceDebounce
@@ -231,7 +235,7 @@ public final class CASDaemon: @unchecked Sendable {
                 let cache = try await ScopeCache(
                     directory: configuration.directory.appendingPathComponent(Self.directoryName(for: name)),
                     maxBytes: configuration.maxBytes, upstream: configuration.makeUpstream(name),
-                    maxSpoolBytes: configuration.maxSpoolBytes, maxActions: configuration.maxActions, retryInterval: configuration.retryInterval,
+                    maxSpoolBytes: configuration.maxSpoolBytes, maxPendingActions: configuration.maxPendingActions, maxActions: configuration.maxActions, retryInterval: configuration.retryInterval,
                     sessionGap: configuration.sessionGap, traceDebounce: configuration.traceDebounce, log: log)
                 await cache.resumePending()
                 return cache

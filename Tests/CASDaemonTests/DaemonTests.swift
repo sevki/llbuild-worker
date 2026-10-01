@@ -996,6 +996,31 @@ final class DaemonTests: XCTestCase {
         await client.close()
     }
 
+    func testPendingActionsAreBoundedAndRefusedWhenTheQueueIsFull() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        daemon = CASDaemon(.init(
+            directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600), maxPendingActions: 3) { _ in fake })
+        port = try await daemon.start()
+        await upstream.setDown(true)                      // nothing can be sent
+        let client = try client()
+        let object = blob("queued value")
+        try await client.put(object)
+
+        var refused = 0
+        for index in 0..<6 {
+            do { try await client.actionPut(blob("queued \(index)").digest, value: object.digest) } catch { refused += 1 }
+        }
+        XCTAssertEqual(refused, 3, "room for three pending actions")
+        // A repeat of one already pending is not a new one.
+        try await client.actionPut(blob("queued 0").digest, value: object.digest)
+
+        await upstream.setDown(false)
+        await daemon.drain()                              // they are sent, which makes room
+        try await client.actionPut(blob("after the queue drained").digest, value: object.digest)
+        await client.close()
+    }
+
     func testTheSpoolIsBoundedAndRefusesWritesWhenFull() async throws {
         await daemon.stop()
         let fake = upstream!
