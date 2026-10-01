@@ -16,9 +16,10 @@ private let indexDocument: Node = .document(
             .p("A remote content-addressable store for swiftc's compilation caching, hosted on Cloudflare Workers®."),
             .p("Native clients (", .code("castool"), ", the swiftc plugin) speak to ", .code("/__rpc"), " over a WebSocket."),
 
-            .p("Install the prebuilt plugin (macOS arm64, Linux x86_64) and point it at this cache:"),
+            .p("Install the prebuilt plugin and the local cache daemon (macOS arm64, Linux x86_64) and point the plugin at it:"),
             .pre(.code("curl --proto '=https' --tlsv1.2 -sSf https://xcache.devtoo.ls/setup | sh")),
-            .p("The cache requires an access token. The installer asks for it (or reads ", .code("LLBUILD_CAS_TOKEN"), ") and saves it to ", .code("~/.config/llbuild-cas-remote-token"), ", where the plugin and ", .code("castool"), " look for it."),
+            .p("The daemon (", .code("casd"), ") listens on ", .code("127.0.0.1:4170"), " and keeps one connection to this cache, so a build does not open one per compiler process; without it builds are much slower. The installer starts it as a user service and uses it only once it answers; if it cannot (no systemd user session, no release yet), it points the plugin at this cache directly and says so. ", .code("LLBUILD_CAS_NO_DAEMON=1"), " skips it."),
+            .p("The cache requires an access token. The installer asks for it (or reads ", .code("LLBUILD_CAS_TOKEN"), ") and saves it to ", .code("~/.config/llbuild-cas-remote-token"), ", where the plugin, the daemon and ", .code("castool"), " look for it."),
 
             .h2("swiftc"),
             .pre(.code(

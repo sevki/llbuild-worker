@@ -20,6 +20,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The installer the Worker serves at /setup: installs casd, starts it as a user service, and
+  # falls back to the Worker when it cannot. It needs no Swift build, so it is a job of its own
+  # and finishes in a minute or two. Linux uses a stub systemctl for the service manager; macOS
+  # loads the real launchd agent with the real launchctl.
+  installer:
+    name: Installer sets up casd (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: Scripts/test-setup.sh
+
   native:
     name: Native Swift build and tests
     runs-on: ubuntu-24.04
@@ -247,7 +262,7 @@ jobs:
   deploy:
     name: Deploy the Worker to production
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [native, macos, worker]
+    needs: [native, macos, worker, installer]
     runs-on: ubuntu-24.04
     # Ordered by the workflow's own concurrency group above, not one here: a job-level
     # group would queue jobs in the order they become ready, not in push order.
