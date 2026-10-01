@@ -159,6 +159,21 @@ public final class CASDaemon: @unchecked Sendable {
         }
     }
 
+    /// Whether the scope directory holds objects a client was told were stored but that
+    /// no action has claimed yet: their only copy is in the spool, until the spool's
+    /// own expiry (a day), and deleting the directory would lose them.
+    static func holdsRecentSpool(_ scopeDirectory: URL) -> Bool {
+        let cutoff = Date().addingTimeInterval(-ScopeCache.spoolMaxAge)
+        let files = FileManager.default.enumerator(
+            at: scopeDirectory.appendingPathComponent("spool"),
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+        while let file = files?.nextObject() as? URL {
+            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+            if values?.isRegularFile == true, (values?.contentModificationDate ?? .distantPast) > cutoff { return true }
+        }
+        return false
+    }
+
     /// Deletes the scope directories used longest ago until `maxScopeDirectories`
     /// remain (counting the one about to be opened). Never one that is open, and never
     /// one that still holds acknowledged writes waiting for the Worker: those are
@@ -183,7 +198,7 @@ public final class CASDaemon: @unchecked Sendable {
         for directory in directories where excess > 0 && !protected.contains(directory.url.lastPathComponent) {
             let pending = (try? FileManager.default.contentsOfDirectory(
                 atPath: directory.url.appendingPathComponent("pending").path)) ?? []
-            guard pending.isEmpty else { continue }
+            guard pending.isEmpty, !Self.holdsRecentSpool(directory.url) else { continue }
             try? FileManager.default.removeItem(at: directory.url)
             excess -= 1
         }
@@ -269,6 +284,16 @@ public final class CASDaemon: @unchecked Sendable {
     }
 
     // MARK: Serving
+
+    /// `host:port`, `[v6]:port` or a bare v6 address followed by `:port`: the port is after
+    /// the last colon, and a v6 host may be bracketed.
+    public static func parseListenAddress(_ text: String) -> (host: String, port: Int)? {
+        guard let colon = text.lastIndex(of: ":"), let port = Int(text[text.index(after: colon)...]),
+              (0...65535).contains(port) else { return nil }
+        var host = String(text[..<colon])
+        if host.hasPrefix("["), host.hasSuffix("]") { host = String(host.dropFirst().dropLast()) }
+        return host.isEmpty ? nil : (host, port)
+    }
 
     /// Whether `host` is an address only this machine can reach.
     static func isLoopback(_ host: String) -> Bool {

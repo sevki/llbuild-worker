@@ -721,7 +721,7 @@ public actor ScopeCache {
     }
 
     private var lastSweep = Date()
-    private static let spoolMaxAge: TimeInterval = 24 * 3600
+    static let spoolMaxAge: TimeInterval = 24 * 3600
 
     /// Spooled objects that no action ever claimed (the client died between storing
     /// and recording) are dropped after a day, at start-up and then hourly while the

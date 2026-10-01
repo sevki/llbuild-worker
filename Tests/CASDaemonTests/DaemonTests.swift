@@ -893,6 +893,56 @@ final class DaemonTests: XCTestCase {
         await front.stop()
     }
 
+    func testCallsThatArriveTogetherShareOneClient() async throws {
+        let upstreamClient = ClientUpstream(url: URL(string: "http://127.0.0.1:\(port)/s")!, transport: .automatic)
+        let key = blob("shared client").digest
+        _ = try await withThrowingTaskGroup(of: CASDigest?.self) { group in
+            for _ in 0..<25 { group.addTask { try await upstreamClient.actionGet(key) } }
+            return try await group.reduce(into: [CASDigest?]()) { $0.append($1) }
+        }
+        let made = await upstreamClient.clientsCreated
+        XCTAssertEqual(made, 1, "25 calls at once opened \(made) clients")
+    }
+
+    func testListenAddressesAreParsedIncludingIPv6() {
+        XCTAssertEqual(CASDaemon.parseListenAddress("127.0.0.1:4170")?.host, "127.0.0.1")
+        XCTAssertEqual(CASDaemon.parseListenAddress("127.0.0.1:4170")?.port, 4170)
+        XCTAssertEqual(CASDaemon.parseListenAddress("[::1]:4170")?.host, "::1")
+        XCTAssertEqual(CASDaemon.parseListenAddress("[::1]:4170")?.port, 4170)
+        XCTAssertEqual(CASDaemon.parseListenAddress("::1:4170")?.host, "::1")
+        XCTAssertEqual(CASDaemon.parseListenAddress("localhost:80")?.port, 80)
+        XCTAssertNil(CASDaemon.parseListenAddress("nonsense"))
+        XCTAssertNil(CASDaemon.parseListenAddress("1.2.3.4:abc"))
+        XCTAssertNil(CASDaemon.parseListenAddress(":4170"))
+        XCTAssertNil(CASDaemon.parseListenAddress("127.0.0.1:99999"))
+    }
+
+    func testPruningNeverDeletesAScopeHoldingObjectsNoActionHasClaimedYet() async throws {
+        await daemon.stop()
+        let fake = upstream!
+        func start() async throws {
+            daemon = CASDaemon(.init(
+                directory: directory, maxBytes: 1 << 20, retryInterval: .seconds(3600),
+                maxScopes: 1, maxScopeDirectories: 2) { _ in fake })
+            port = try await daemon.start()
+        }
+        try await start()
+        let writer = try client("holder")
+        let object = blob("stored, not yet claimed")
+        try await writer.put(object)          // acknowledged: its only copy may be the spool
+        await writer.close()
+        await daemon.stop()
+        try await start()
+        for scope in ["y1", "y2", "y3"] {
+            let served = try await status(ofScope: scope)
+            _ = served
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        let spooled = directory.appendingPathComponent("holder/spool")
+            .appendingPathComponent(String(object.digest.hex.prefix(2))).appendingPathComponent(object.digest.hex)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: spooled.path), "the unclaimed object survived pruning")
+    }
+
     func testACallToAWorkerThatNeverAnswersFailsInsteadOfHanging() async throws {
         let silent = SilentServer()
         let upstream = ClientUpstream(url: URL(string: "http://127.0.0.1:\(silent.port)/s")!, timeout: .milliseconds(400))

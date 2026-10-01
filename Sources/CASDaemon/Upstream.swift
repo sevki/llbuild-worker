@@ -75,21 +75,36 @@ public actor ClientUpstream: CASUpstream {
         self.transport = transport
     }
 
+    private var connecting: Task<CASClient, Error>?
+    /// How many clients this upstream has made, for tests: calls that arrive together
+    /// must share one.
+    private(set) var clientsCreated = 0
+
     private func current() async throws -> CASClient {
         if let client { return client }
-        let created: CASClient
-        switch transport {
-        case .webSocket:
-            created = try CASClient(workerURL: url)
-        case .httpPost:
-            created = try CASClient(workerURL: url, transport: .httpPost)
-        case .automatic:
-            created = try await automatic()
+        // One connection attempt at a time: calls that arrive together wait for it, rather
+        // than each opening (and probing) a client of its own.
+        if let connecting { return try await connecting.value }
+        let attempt = Task { [self] () -> CASClient in
+            let created: CASClient
+            switch transport {
+            case .webSocket: created = try CASClient(workerURL: url)
+            case .httpPost: created = try CASClient(workerURL: url, transport: .httpPost)
+            case .automatic: created = try await automatic()
+            }
+            return created
         }
-        // Another call may have connected while this one was waiting.
-        if let client { return client }
-        client = created
-        return created
+        connecting = attempt
+        do {
+            let created = try await attempt.value
+            clientsCreated += 1
+            client = created
+            connecting = nil
+            return created
+        } catch {
+            connecting = nil
+            throw error
+        }
     }
 
     /// POST if the Worker answers it, which is learned once: a stateless call has no

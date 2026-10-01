@@ -35,10 +35,9 @@ while let flag = arguments.popFirst() {
     switch flag {
     case "--upstream": upstream = URL(string: value)
     case "--listen":
-        let parts = value.split(separator: ":")
-        guard parts.count == 2, let parsed = Int(parts[1]) else { usage() }
-        host = String(parts[0])
-        port = parsed
+        guard let parsed = CASDaemon.parseListenAddress(value) else { usage() }
+        host = parsed.host
+        port = parsed.port
     case "--cache": cache = URL(fileURLWithPath: value)
     case "--max-gb": maxGB = Double(value) ?? 4
     case "--transport":
