@@ -27,6 +27,9 @@ jobs:
     # know Swift 6.4.0, so use the official image instead.
     container: swift:6.4-noble
     env:
+      # The Static Linux SDK for the fully static casd; also in release.yml.
+      STATIC_SDK_URL: https://download.swift.org/swift-6.4.0-release/static-sdk/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz
+      STATIC_SDK_CHECKSUM: 47d2fd89eebfdf9eb4d536b6710414297f755c17926cdebc4742c08982b40a9e
       # This repo's own compile cache, https://xcache.devtoo.ls: the compiles
       # below go through it (see Scripts/ci-compile-cache.sh). A fork's pull
       # request gets no secret and builds without it. Scoped to this lane
@@ -59,6 +62,24 @@ jobs:
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
+
+      # The Linux release build of casd is fully static (musl, Static Linux SDK). A release only
+      # builds on a tag, so check the link, and that it runs, here.
+      - name: casd is fully static
+        run: |
+          swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
+          swift build -c release --product casd --swift-sdk x86_64-swift-linux-musl --build-system native
+          bin=$(swift build -c release --swift-sdk x86_64-swift-linux-musl --build-system native --show-bin-path)
+          if ldd "$bin/casd" 2>&1 | grep -qv 'not a dynamic executable'; then
+              echo "::error::casd is dynamically linked"
+              exit 1
+          fi
+          "$bin/casd" --upstream https://example.invalid --listen 127.0.0.1:4777 &
+          pid=$!
+          sleep 3
+          code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:4777/ || true)
+          kill "$pid" 2>/dev/null || true
+          [ "$code" = 404 ] || { echo "::error::casd did not answer HTTP (got $code)"; exit 1; }
 
       - name: Collect crash reproducers
         if: failure()

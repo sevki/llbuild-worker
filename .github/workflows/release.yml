@@ -11,6 +11,8 @@ permissions:
 jobs:
   build-macos:
     name: Build CASPlugin (macOS arm64)
+    # The artifacts inherit the package's deployment target (.macOS(.v15) in
+    # Package.swift), so they need macOS 15 or later.
     runs-on: macos-latest
     env:
       # Builds through the previous release's plugin and the live cache; see
@@ -32,15 +34,24 @@ jobs:
         # The native backend honors the wasi-only dependency conditions; see ci.yml.
         run: swift build -c release --build-system native --product CASPlugin $SWIFT_CACHE_FLAGS
 
+      - name: Build casd
+        run: swift build -c release --build-system native --product casd $SWIFT_CACHE_FLAGS
+
       - name: Package
         run: |
           bin=$(swift build -c release --build-system native --show-bin-path)
           tar -C "$bin" -czf CASPlugin-macos-arm64.tar.gz libCASPlugin.dylib
+          tar -C "$bin" -czf casd-macos-arm64.tar.gz casd
 
       - uses: actions/upload-artifact@v4
         with:
           name: CASPlugin-macos-arm64
           path: CASPlugin-macos-arm64.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: casd-macos-arm64
+          path: casd-macos-arm64.tar.gz
 
   build-linux:
     name: Build CASPlugin (Linux x86_64)
@@ -50,6 +61,8 @@ jobs:
     env:
       # See the macOS job.
       LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
+      STATIC_SDK_URL: https://download.swift.org/swift-6.4.0-release/static-sdk/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz
+      STATIC_SDK_CHECKSUM: 47d2fd89eebfdf9eb4d536b6710414297f755c17926cdebc4742c08982b40a9e
     steps:
       - uses: actions/checkout@v4
 
@@ -64,15 +77,33 @@ jobs:
       - name: Build CASPlugin
         run: swift build -c release --product CASPlugin ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
 
+      # casd is fully static: built against musl with the Static Linux SDK, so it needs no libc,
+      # no libcurl and no Swift runtime on the host and runs anywhere on x86_64 Linux, NixOS
+      # included. (The plugin cannot be: the compiler loads it with dlopen.) ci.yml builds it the
+      # same way on every pull request.
+      - name: Build casd (static)
+        run: |
+          swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
+          swift build -c release --product casd --swift-sdk x86_64-swift-linux-musl --build-system native
+          bin=$(swift build -c release --swift-sdk x86_64-swift-linux-musl --build-system native --show-bin-path)
+          strip -s "$bin/casd"
+          cp "$bin/casd" casd
+
       - name: Package
         run: |
           bin=$(swift build -c release ${SWIFT_CACHE_FLAGS:+--build-system native} --show-bin-path)
           tar -C "$bin" -czf CASPlugin-linux-x86_64.tar.gz libCASPlugin.so
+          tar -czf casd-linux-x86_64.tar.gz casd
 
       - uses: actions/upload-artifact@v4
         with:
           name: CASPlugin-linux-x86_64
           path: CASPlugin-linux-x86_64.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: casd-linux-x86_64
+          path: casd-linux-x86_64.tar.gz
 
   publish:
     name: Publish GitHub Release
@@ -84,8 +115,13 @@ jobs:
           pattern: CASPlugin-*
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: casd-*
+          merge-multiple: true
+
       - name: Checksums
-        run: sha256sum CASPlugin-*.tar.gz > SHA256SUMS
+        run: sha256sum CASPlugin-*.tar.gz casd-*.tar.gz > SHA256SUMS
 
       - name: Create or update release
         env:
@@ -93,7 +129,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber CASPlugin-*.tar.gz SHA256SUMS
+            gh release upload "$GITHUB_REF_NAME" --clobber CASPlugin-*.tar.gz casd-*.tar.gz SHA256SUMS
           else
-            gh release create "$GITHUB_REF_NAME" --generate-notes CASPlugin-*.tar.gz SHA256SUMS
+            gh release create "$GITHUB_REF_NAME" --generate-notes CASPlugin-*.tar.gz casd-*.tar.gz SHA256SUMS
           fi

@@ -65,7 +65,11 @@ let daemon = CASDaemon(
     })
 
 do {
-    let bound = try await daemon.start()
+    // A listener that dies under a running process must end it, so that the service manager restarts it.
+    let bound = try await daemon.start { error in
+        FileHandle.standardError.write(Data("casd: the server stopped: \(error)\n".utf8))
+        exit(1)
+    }
     FileHandle.standardOutput.write(Data("casd listening on \(host):\(bound), upstream \(upstream.absoluteString)\n".utf8))
 } catch {
     FileHandle.standardError.write(Data("casd: cannot listen on \(host):\(port): \(error)\n".utf8))
