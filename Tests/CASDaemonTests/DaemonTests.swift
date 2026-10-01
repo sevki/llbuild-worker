@@ -944,6 +944,14 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(made, 1, "25 calls at once opened \(made) clients")
     }
 
+    func testCacheSizesThatCannotBeHeldAreUsageErrorsNotCrashes() {
+        XCTAssertEqual(CASDaemon.cacheBytes(gigabytes: "4"), 4 << 30)
+        XCTAssertEqual(CASDaemon.cacheBytes(gigabytes: "0.5"), 1 << 29)
+        for bad in ["nan", "inf", "-inf", "-1", "0", "1e300", "abc", "", "9999999999999999"] {
+            XCTAssertNil(CASDaemon.cacheBytes(gigabytes: bad), bad)
+        }
+    }
+
     func testListenAddressesAreParsedIncludingIPv6() {
         XCTAssertEqual(CASDaemon.parseListenAddress("127.0.0.1:4170")?.host, "127.0.0.1")
         XCTAssertEqual(CASDaemon.parseListenAddress("127.0.0.1:4170")?.port, 4170)

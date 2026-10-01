@@ -26,7 +26,7 @@ var upstream: URL?
 var host = "127.0.0.1"
 var port = 4170
 var cache = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cache/llbuild-casd")
-var maxGB = 4.0
+var cacheBytes: Int64 = 4 << 30
 var transport = ClientUpstream.Transport.automatic
 
 var arguments = CommandLine.arguments.dropFirst()
@@ -39,7 +39,9 @@ while let flag = arguments.popFirst() {
         host = parsed.host
         port = parsed.port
     case "--cache": cache = URL(fileURLWithPath: value)
-    case "--max-gb": maxGB = Double(value) ?? 4
+    case "--max-gb":
+        guard let bytes = CASDaemon.cacheBytes(gigabytes: value) else { usage() }
+        cacheBytes = bytes
     case "--transport":
         switch value {
         case "auto": transport = .automatic
@@ -55,7 +57,7 @@ guard let upstream, ["http", "https"].contains(upstream.scheme ?? "") else { usa
 let chosenTransport = transport
 let verbose = ProcessInfo.processInfo.environment["LLBUILD_CAS_DEBUG"] != nil
 let daemon = CASDaemon(
-    .init(host: host, port: port, directory: cache, maxBytes: Int64(maxGB * 1_073_741_824)) { scope in
+    .init(host: host, port: port, directory: cache, maxBytes: cacheBytes) { scope in
         ClientUpstream(url: upstream.appendingPathComponent(scope), transport: chosenTransport)
     },
     log: { message in

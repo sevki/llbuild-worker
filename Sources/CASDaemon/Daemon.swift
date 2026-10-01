@@ -194,8 +194,16 @@ public final class CASDaemon: @unchecked Sendable {
         let root = configuration.directory
         let open = Set(lock.withLock { scopes.keys.map(Self.directoryName(for:)) })
         let protected = open.union([Self.directoryName(for: name)])
-        let entries = (try? FileManager.default.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey])) ?? []
+        // A root that is not there yet has nothing to prune; one that is there but cannot be
+        // listed is not "empty", and nothing may be admitted without being able to count.
+        let entries: [URL]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey])
+        } catch {
+            guard !FileManager.default.fileExists(atPath: root.path) else { return false }
+            entries = []
+        }
         var directories = entries.compactMap { url -> (url: URL, used: Date)? in
             let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey])
             guard values?.isDirectory == true else { return nil }
@@ -301,6 +309,15 @@ public final class CASDaemon: @unchecked Sendable {
     }
 
     // MARK: Serving
+
+    /// A cache size given in gigabytes, as bytes: finite, positive and small enough to hold
+    /// as a byte count (`nil` otherwise, which is a usage error, not a crash).
+    public static func cacheBytes(gigabytes text: String) -> Int64? {
+        guard let gigabytes = Double(text), gigabytes.isFinite, gigabytes > 0 else { return nil }
+        let bytes = gigabytes * 1_073_741_824
+        guard bytes >= 1, bytes < Double(Int64.max) / 2 else { return nil }
+        return Int64(bytes)
+    }
 
     /// `host:port`, `[v6]:port` or a bare v6 address followed by `:port`: the port is after
     /// the last colon, and a v6 host may be bracketed.
