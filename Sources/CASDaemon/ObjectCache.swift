@@ -171,6 +171,14 @@ public actor ObjectCache {
         try? FileManager.default.removeItem(at: file)
         try FileManager.default.moveItem(at: temporary, to: file)
         await index.set(name, value: Int64(encoded.count))
+        // Making room may have let go of entries whose files could not be removed. If those now
+        // leave the cache over its bound, this entry is the one to give up.
+        let stuckNow = leftovers.retry()
+        if stuckNow > 0, await Int64(index.calculatedSize) + stuckNow > maxBytes {
+            _ = await index.delete(name)
+            verified.remove(name)
+            return digest
+        }
         markVerified(name)
         return digest
     }

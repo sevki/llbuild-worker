@@ -44,6 +44,15 @@ if [ -n "$casd" ]; then
     remote="http://127.0.0.1:$port/$scope"
 fi
 modes=("$@"); [ "${#modes[@]}" -gt 0 ] || modes=(nocache cold remote warm)
+# remote and warm measure what an earlier mode of this run left behind (the scope is fresh).
+seen=" "
+for mode in "${modes[@]}"; do
+    case "$mode" in
+        remote) case "$seen" in *" cold "*) ;; *) echo "remote needs cold before it in the same run (the scope is fresh)" >&2; exit 2 ;; esac ;;
+        warm) case "$seen" in *" cold "*|*" remote "*) ;; *) echo "warm needs cold or remote before it in the same run" >&2; exit 2 ;; esac ;;
+    esac
+    seen="$seen$mode "
+done
 
 export RUNNER_TEMP="${BENCH_TEMP:-/tmp/bench-rt-$scope}"
 export GITHUB_ENV="$RUNNER_TEMP/env"
@@ -84,7 +93,9 @@ print(*[sum(day.get(x, 0) for day in d) for x in k])'
 echo "project $project, ${select[*]}, scope $scope, C through ${cc:-no wrapper}"
 printf '%-8s %8s %8s %8s %8s %8s %8s %8s %8s\n' mode "wall s" "drain s" hits misses conns actions gets puts
 for mode in "${modes[@]}"; do
-    rm -rf "$project/.build/x86_64-unknown-linux-gnu"
+    # The active platform's build directory (the triple differs between Linux and macOS).
+    bin="$(cd "$project" && swift build --build-system native "${select[@]}" --show-bin-path 2>/dev/null | tail -1)"
+    [ -z "$bin" ] || rm -rf "$(dirname "$bin")"
     flags=(); env_cc=()
     case "$mode" in
         nocache) ;;

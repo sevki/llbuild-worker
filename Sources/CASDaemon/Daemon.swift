@@ -175,13 +175,18 @@ public final class CASDaemon: @unchecked Sendable {
     /// own expiry (a day), and deleting the directory would lose them.
     static func holdsRecentSpool(_ scopeDirectory: URL) -> Bool {
         let cutoff = Date().addingTimeInterval(-ScopeCache.spoolMaxAge)
-        let files = FileManager.default.enumerator(
-            at: scopeDirectory.appendingPathComponent("spool"),
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
-        while let file = files?.nextObject() as? URL {
-            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
-            if values?.isRegularFile == true, (values?.contentModificationDate ?? .distantPast) > cutoff { return true }
+        let spool = scopeDirectory.appendingPathComponent("spool")
+        guard FileManager.default.fileExists(atPath: spool.path) else { return false }
+        // A spool that exists but cannot be read through is protected: what is in it is unknown.
+        var unreadable = false
+        guard let files = FileManager.default.enumerator(
+            at: spool, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            errorHandler: { _, _ in unreadable = true; return true }) else { return true }
+        while let file = files.nextObject() as? URL {
+            guard let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]) else { return true }
+            if values.isRegularFile == true, (values.contentModificationDate ?? .distantPast) > cutoff { return true }
         }
+        if unreadable { return true }
         return false
     }
 
