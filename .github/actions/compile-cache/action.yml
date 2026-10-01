@@ -1,0 +1,36 @@
+name: Compile cache through casd
+description: >
+  Sets a job up to compile through this repo's own cache (https://xcache.devtoo.ls), by way of a
+  local cache daemon (casd, docs/daemon.md) built from this checkout. The calling job needs
+  LLBUILD_CAS_TOKEN and LLBUILD_CAS_REMOTE_URL in its env, and must stop the daemon at the end
+  with Scripts/ci-stop-casd.sh. A fork's pull request has no token: the compiles then run without
+  the cache and without the daemon.
+runs:
+  using: composite
+  steps:
+    # No release has casd yet, so it is built here, and cached by what it is built from: it is
+    # rebuilt only when casd, what it depends on, or the package manifest changes.
+    - name: Restore casd
+      id: casd-cache
+      if: env.LLBUILD_CAS_TOKEN != ''
+      uses: actions/cache@v4
+      with:
+        path: .casd-bin
+        key: casd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Sources/casd/**', 'Sources/CASDaemon/**', 'Sources/CASClient/**', 'Sources/CASProtocol/**', 'Package.swift', 'Package.resolved') }}
+
+    - name: Build casd
+      if: env.LLBUILD_CAS_TOKEN != '' && steps.casd-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        swift build -c release --product casd --build-system native
+        mkdir -p .casd-bin
+        cp "$(swift build -c release --build-system native --show-bin-path)/casd" .casd-bin/casd
+
+    - name: Point the compile cache at casd
+      if: env.LLBUILD_CAS_TOKEN != ''
+      shell: bash
+      run: echo "LLBUILD_CASD_BIN=$PWD/.casd-bin/casd" >> "$GITHUB_ENV"
+
+    - name: Enable the compile cache
+      shell: bash
+      run: Scripts/ci-compile-cache.sh

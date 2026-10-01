@@ -53,14 +53,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable the compile cache
+      - name: Install curl
         run: |
           apt-get update -q
           apt-get install -y -q --no-install-recommends curl ca-certificates
-          Scripts/ci-compile-cache.sh
+
+      - uses: ./.github/actions/compile-cache
 
       - name: Run tests
         run: swift test ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
+
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
+
+      - name: Collect crash reproducers
+        if: failure()
+        run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-reproducers-${{ github.job }}
+          path: ${{ runner.temp }}/crash-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # What does not depend on the tests passing, on a runner of its own, in parallel with them: each
+  # step builds a different target (castool, the C shim, the plugin), and the compile cache makes
+  # the shared dependencies cheap to build again.
+  native-checks:
+    name: Native Swift checks
+    runs-on: ubuntu-24.04
+    # -noble matches the ubuntu-24.04 host's glibc. setup-swift@v2 does not
+    # know Swift 6.4.0, so use the official image instead.
+    container: swift:6.4-noble
+    env:
+      # This repo's own compile cache, https://xcache.devtoo.ls: the compiles
+      # below go through it (see Scripts/ci-compile-cache.sh). A fork's pull
+      # request gets no secret and builds without it. Scoped to this lane
+      # (ci-native-linux, distinct from the worker job's ci-wasm below, even
+      # though both run on Linux) so CI's own churn never shares storage with
+      # real users' default scope or another lane's.
+      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
+      LLBUILD_CAS_REMOTE_URL: https://xcache.devtoo.ls/ci-native-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install curl
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends curl ca-certificates
+
+      - uses: ./.github/actions/compile-cache
 
       - name: Build castool
         run: swift build --product castool ${SWIFT_CACHE_FLAGS:+--build-system native $SWIFT_CACHE_FLAGS}
@@ -74,6 +121,11 @@ jobs:
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
+
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
 
       - name: Collect crash reproducers
         if: failure()
@@ -109,11 +161,51 @@ jobs:
           sudo xcode-select -s "$xcode"
           swift --version
 
-      - name: Enable the compile cache
-        run: Scripts/ci-compile-cache.sh
+      - uses: ./.github/actions/compile-cache
 
       - name: Run tests
         run: swift test $BUILD_FLAGS $SWIFT_CACHE_FLAGS
+
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
+
+      - name: Collect crash reproducers
+        if: failure()
+        run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-reproducers-${{ github.job }}
+          path: ${{ runner.temp }}/crash-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
+  macos-checks:
+    name: Native Swift checks (macOS)
+    runs-on: macos-latest
+    env:
+      # SwiftPM's default swiftbuild backend compiles JavaScriptKit on macOS
+      # even though only wasm needs it, and that fails (its custom-executor
+      # code needs a newer SDK). The native backend honors the wasi-only
+      # dependency conditions.
+      BUILD_FLAGS: --build-system native
+      # See the native job.
+      LLBUILD_CAS_TOKEN: ${{ secrets.XCACHE_TOKEN }}
+      LLBUILD_CAS_REMOTE_URL: https://xcache.devtoo.ls/ci-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          sudo xcode-select -s "$xcode"
+          swift --version
+
+      - uses: ./.github/actions/compile-cache
 
       - name: Build castool
         run: swift build $BUILD_FLAGS --product castool $SWIFT_CACHE_FLAGS
@@ -127,6 +219,11 @@ jobs:
       # Deliberately not cached: it asserts a first compile misses.
       - name: Compilation caching through CASPlugin
         run: Scripts/test-compilation-cache.sh
+
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
 
       - name: Collect crash reproducers
         if: failure()
@@ -176,9 +273,9 @@ jobs:
             "https://download.swift.org/${lower}/wasm-sdk/${tag}/${tag}_wasm.artifactbundle.tar.gz"
           swift sdk install /tmp/wasm-sdk.artifactbundle.tar.gz
 
-      # After the SDK step, which installs curl.
-      - name: Enable the compile cache
-        run: Scripts/ci-compile-cache.sh
+      # After the SDK step, which installs curl. The wasm compiles are cache hits too, and go
+      # through the same casd binary the native jobs cache.
+      - uses: ./.github/actions/compile-cache
 
       # Everything after `--` goes to worker-build's nested `swift build`.
       - name: Build Worker bundle
@@ -223,6 +320,11 @@ jobs:
           # A re-run of the workflow (to retry a deploy) uploads the same name again.
           overwrite: true
 
+      # Lets casd send its queued results to the Worker before the job ends.
+      - name: Stop casd
+        if: always()
+        run: Scripts/ci-stop-casd.sh
+
       - name: Collect crash reproducers
         if: failure()
         run: Scripts/collect-crash-artifacts.sh "$RUNNER_TEMP/crash-artifacts"
@@ -241,7 +343,7 @@ jobs:
   deploy:
     name: Deploy the Worker to production
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [native, macos, worker, installer]
+    needs: [native, native-checks, macos, macos-checks, worker, installer]
     runs-on: ubuntu-24.04
     # Ordered by the workflow's own concurrency group above, not one here: a job-level
     # group would queue jobs in the order they become ready, not in push order.
