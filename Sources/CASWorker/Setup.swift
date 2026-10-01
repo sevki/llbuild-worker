@@ -168,6 +168,21 @@ UNIT
     esac
 }
 
+# Stops a daemon this installer started before (a re-run), so the port is ours to check.
+stop_casd_service() {
+    case "$(uname -s)" in
+        Darwin)
+            launchctl bootout "gui/$(id -u)/llbuild.casd" >/dev/null 2>&1 || true
+            launchctl bootout "user/$(id -u)/llbuild.casd" >/dev/null 2>&1 || true
+            ;;
+        *)
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user stop casd.service >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+}
+
 # True once something answers HTTP on the daemon's port.
 casd_up() {
     code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$CASD_PORT/" 2>/dev/null) || code=000
@@ -182,6 +197,14 @@ install_casd() {
         return 1
     fi
     tar -xzf "$tmp/$casd_archive" -C "$tmp"
+    # With our own daemon stopped, the port must be free: if it still answers, another program
+    # owns it, and whatever answers after the daemon is started could not be taken for ours.
+    stop_casd_service
+    sleep 1
+    if casd_up; then
+        daemon_note="port $CASD_PORT is already in use by another program (set LLBUILD_CASD_PORT to use a different one)"
+        return 1
+    fi
     mkdir -p "$(dirname "$CASD_BIN")"
     mv -f "$tmp/casd" "$CASD_BIN"
     chmod 755 "$CASD_BIN"

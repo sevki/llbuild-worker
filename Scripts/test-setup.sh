@@ -92,6 +92,9 @@ case "\$1" in
     eval "nohup \$cmd >/dev/null 2>&1 &"
     echo \$! >> "$work/casd.pids"
     ;;
+  stop)
+    if [ -f "$work/casd.pids" ]; then for p in \$(cat "$work/casd.pids"); do kill "\$p" 2>/dev/null; done; : > "$work/casd.pids"; fi
+    ;;
 esac
 exit 0
 EOF
@@ -155,6 +158,23 @@ check "E: exit 0" "[ \$(cat $work/rc-E) = 0 ]"
 check "E: no casd, plugin pointed at the Worker" "[ ! -e $work/home-E/.local/bin/casd ] && [ \"\$(cfg E)\" = https://cache.example/default ]"
 check "E: says it was skipped" "grep -q 'skipped (LLBUILD_CAS_NO_DAEMON is set)' $work/out-E.txt"
 
+# G: another program already owns the port: it must not be mistaken for the daemon.
+"$py" -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 & other=$!
+pids="$pids $other"
+sleep 1
+run G "$(withsvc)"
+check "G: exit 0" "[ \$(cat $work/rc-G) = 0 ]"
+check "G: the plugin is pointed at the Worker" "[ \"\$(cfg G)\" = https://cache.example/default ]"
+check "G: says the port is in use by another program" "grep -q 'is already in use by another program' $work/out-G.txt"
+kill "$other" 2>/dev/null || true; sleep 1
+
+# H: running the installer again replaces the daemon it started before and still works.
+run H1 "$(withsvc)"
+run H2 "$(withsvc)"
+check "H: both runs exit 0" "[ \$(cat $work/rc-H1) = 0 ] && [ \$(cat $work/rc-H2) = 0 ]"
+check "H: the second run still ends up on the daemon" "[ \"\$(cfg H2)\" = http://127.0.0.1:$port/default ]"
+stopcasd
+
 # F: the service is started but the daemon never answers.
 mkdir -p "$work/dead"; printf '#!/bin/sh\nexit 1\n' > "$work/dead/casd"; chmod +x "$work/dead/casd"
 tar -C "$work/dead" -czf "$work/rel/casd-$platform.tar.gz" casd
@@ -166,6 +186,6 @@ check "F: says it did not answer" "grep -q 'did not answer on 127.0.0.1:$port' $
 
 if [ "$fail" = 0 ]; then echo "ALL OK"; else
     echo "SOME FAILED"
-    for n in A B C D E F; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; tail -15 "$work/out-$n.txt"; }; done
+    for n in A B C D E F G H1 H2; do [ -f "$work/out-$n.txt" ] && { echo "--- out-$n"; tail -15 "$work/out-$n.txt"; }; done
 fi
 exit $fail
