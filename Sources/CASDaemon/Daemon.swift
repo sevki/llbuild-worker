@@ -355,7 +355,7 @@ public final class CASDaemon: @unchecked Sendable {
 
     /// Binds and starts serving; returns the port. Only a loopback address is
     /// accepted: the daemon does not authenticate, and holds the upstream token.
-    public func start() async throws -> Int {
+    public func start(onFailure: (@Sendable (Error) -> Void)? = nil) async throws -> Int {
         guard Self.isLoopback(configuration.host) else {
             throw CASDaemonError("refusing to listen on \(configuration.host): the daemon does no authentication, so it only serves the loopback")
         }
@@ -402,6 +402,8 @@ public final class CASDaemon: @unchecked Sendable {
                 }
             } catch {
                 log("server stopped: \(error)")
+                // Not on a stop() (which cancels): the listener died under a running process.
+                if !Task.isCancelled { onFailure?(error) }
             }
         }
         return port

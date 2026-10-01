@@ -1,0 +1,22 @@
+# systemd user unit for casd, the local cache daemon (docs/daemon.md).
+#
+#   install -D -m 755 casd ~/.local/bin/casd
+#   install -D -m 644 service/casd.service ~/.config/systemd/user/casd.service
+#   edit --upstream below to your Worker, put the access token in
+#   ~/.config/llbuild-cas-remote-token (mode 600; casd reads it itself)
+#   systemctl --user daemon-reload && systemctl --user enable --now casd
+#
+# Then point the plugin at http://127.0.0.1:4170/<scope> instead of the Worker.
+[Unit]
+Description=llbuild cache daemon (casd)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/casd --upstream https://your-worker.example.workers.dev --max-gb 4
+Restart=on-failure
+# On SIGTERM casd waits up to 30 s for queued uploads before it exits; queued writes that
+# are still unsent stay on disk and go out the next time it runs.
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
